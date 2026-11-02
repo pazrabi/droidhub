@@ -1,8 +1,8 @@
-# Phone Hub
+# DroidHub
 
 Серверное приложение для централизованного удалённого управления домашними Android-смартфонами через защищённую сеть Tailscale.
 
-Phone Hub позволяет:
+DroidHub позволяет:
 - **Управлять телефонами через веб-браузер** в режиме реального времени: просмотр экрана, тапы, свайпы, ввод текста (включая русский язык), нажатия системных клавиш, открытие приложений и ссылок.
 - **Предоставлять доступ к телефонам для нейросетей** (Claude, Gemini pool) через стандартный протокол **MCP (Model Context Protocol)** как к набору инструментов.
 - **Использовать ресурсы телефонов** (домашний IP-адрес, мобильный Chrome) для внешних сервисов и ботов (например, парсинга цен авиабилетов в `aviaticket`).
@@ -23,7 +23,7 @@ Phone Hub позволяет:
                              │ reverse_proxy (127.0.0.1:8090)
                              ▼
               ┌─────────────────────────────┐
-              │   Phone Hub (FastAPI)       │
+              │   DroidHub (FastAPI)       │
               │  systemd-сервис, user 'hub' │
               │  MemoryMax=600M, hardening  │
               └──────────────┬──────────────┘
@@ -83,23 +83,23 @@ python -m pytest -q
    sudo ./deploy/install.sh
    ```
    Скрипт установки идемпотентен:
-   - создаёт системного пользователя `hub` и каталог `/opt/phone-hub`;
+   - создаёт системного пользователя `hub` и каталог `/opt/droidhub`;
    - разворачивает виртуальное окружение и ставит зависимости;
-   - регистрирует и активирует systemd-сервис `/etc/systemd/system/phone-hub.service`;
+   - регистрирует и активирует systemd-сервис `/etc/systemd/system/droidhub.service`;
    - добавляет блок домена `hub.193-41-86-92.sslip.io` в `/etc/caddy/Caddyfile`, **не затрагивая** существующий блок gemini-pool;
    - **не перезаписывает** существующие `.env` и `devices.yaml`.
 
 3. **Настройка секретов и запуск**:
    ```bash
    # Отредактируйте переменные окружения
-   sudo nano /opt/phone-hub/.env
+   sudo nano /opt/droidhub/.env
 
    # Запустите сервис
-   sudo systemctl start phone-hub
+   sudo systemctl start droidhub
 
    # Проверьте статус и логи
-   sudo systemctl status phone-hub
-   sudo journalctl -u phone-hub -f
+   sudo systemctl status droidhub
+   sudo journalctl -u droidhub -f
    ```
 
 ---
@@ -124,7 +124,7 @@ python -m pytest -q
    adb shell ime enable com.android.adbkeyboard/.AdbIME
    adb shell ime set com.android.adbkeyboard/.AdbIME
    ```
-7. Добавьте телефон в файл конфигурации `config/devices.yaml` (или `/opt/phone-hub/config/devices.yaml` на сервере):
+7. Добавьте телефон в файл конфигурации `config/devices.yaml` (или `/opt/droidhub/config/devices.yaml` на сервере):
    ```yaml
    devices:
      - id: redmi
@@ -141,7 +141,7 @@ python -m pytest -q
 
 ## Подключение MCP
 
-Phone Hub предоставляет сервер стандартного протокола **Model Context Protocol (MCP)** (FastMCP, streamable HTTP) для прямого управления смартфонами нейросетями (Claude Code, claude.ai, Claude Desktop, Gemini pool).
+DroidHub предоставляет сервер стандартного протокола **Model Context Protocol (MCP)** (FastMCP, streamable HTTP) для прямого управления смартфонами нейросетями (Claude Code, claude.ai, Claude Desktop, Gemini pool).
 
 ### Авторизация
 Поддерживается два способа авторизации:
@@ -156,22 +156,22 @@ Phone Hub предоставляет сервер стандартного пр�
 
 **С заголовком Authorization:**
 ```bash
-claude mcp add --transport http phone-hub https://hub.193-41-86-92.sslip.io/mcp -H "Authorization: Bearer <HUB_MCP_TOKEN>"
+claude mcp add --transport http droidhub https://hub.193-41-86-92.sslip.io/mcp -H "Authorization: Bearer <HUB_MCP_TOKEN>"
 ```
 
 **С секретным путем в URL:**
 ```bash
-claude mcp add --transport http phone-hub https://hub.193-41-86-92.sslip.io/mcp/<HUB_MCP_TOKEN>
+claude mcp add --transport http droidhub https://hub.193-41-86-92.sslip.io/mcp/<HUB_MCP_TOKEN>
 ```
 
 Для локальной разработки:
 ```bash
-claude mcp add --transport http phone-hub http://127.0.0.1:8090/mcp -H "Authorization: Bearer <HUB_MCP_TOKEN>"
+claude mcp add --transport http droidhub http://127.0.0.1:8090/mcp -H "Authorization: Bearer <HUB_MCP_TOKEN>"
 ```
 
 ### 2. Коннектор claude.ai (веб)
 В веб-версии [claude.ai](https://claude.ai) (в настройках Connectors / Custom MCP Server):
-- **Name**: `Phone Hub`
+- **Name**: `DroidHub`
 - **URL**: `https://hub.193-41-86-92.sslip.io/mcp` (укажите заголовок `Authorization: Bearer <HUB_MCP_TOKEN>`)  
   ИЛИ укажите секретный путь: `https://hub.193-41-86-92.sslip.io/mcp/<HUB_MCP_TOKEN>`
 
@@ -180,7 +180,7 @@ claude mcp add --transport http phone-hub http://127.0.0.1:8090/mcp -H "Authoriz
 ```json
 {
   "mcpServers": {
-    "phone-hub": {
+    "droidhub": {
       "url": "https://hub.193-41-86-92.sslip.io/mcp",
       "headers": {
         "Authorization": "Bearer <HUB_MCP_TOKEN>"
@@ -193,7 +193,7 @@ claude mcp add --transport http phone-hub http://127.0.0.1:8090/mcp -H "Authoriz
 ```json
 {
   "mcpServers": {
-    "phone-hub": {
+    "droidhub": {
       "url": "https://hub.193-41-86-92.sslip.io/mcp/<HUB_MCP_TOKEN>"
     }
   }
@@ -236,12 +236,12 @@ claude mcp add --transport http phone-hub http://127.0.0.1:8090/mcp -H "Authoriz
 ## Структура репозитория
 
 ```
-phone-hub/
+droidhub/
 ├── config/
 │   └── devices.yaml          # Список подключённых устройств
 ├── data/                     # SQLite-база аудита (hub.db)
 ├── deploy/
-│   ├── phone-hub.service     # Systemd-юнит с харденингом и MemoryMax=600M
+│   ├── droidhub.service     # Systemd-юнит с харденингом и MemoryMax=600M
 │   ├── Caddyfile.snippet     # Блок reverse_proxy для Caddy
 │   └── install.sh            # Идемпотентный скрипт установки (--dry-run)
 ├── docs/

@@ -1,5 +1,5 @@
 [Unit]
-Description=Phone Hub Service
+Description=DroidHub Service
 After=network.target tailscaled.service
 Wants=network.target
 
@@ -7,12 +7,12 @@ Wants=network.target
 Type=exec
 User=hub
 Group=hub
-WorkingDirectory=/opt/phone-hub
-EnvironmentFile=/opt/phone-hub/.env
+WorkingDirectory=/opt/droidhub
+EnvironmentFile=/opt/droidhub/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
-Environment=HOME=/opt/phone-hub
-ExecStart=/opt/phone-hub/venv/bin/uvicorn hub.main:create_app --factory --host 127.0.0.1 --port 8090
+Environment=HOME=/opt/droidhub
+ExecStart=/opt/droidhub/venv/bin/uvicorn hub.main:create_app --factory --host 127.0.0.1 --port 8090
 Restart=always
 RestartSec=5
 MemoryMax=600M
@@ -32,7 +32,7 @@ RestrictSUIDSGID=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 LockPersonality=true
-ReadWritePaths=/opt/phone-hub/data /opt/phone-hub/config /opt/phone-hub/.android
+ReadWritePaths=/opt/droidhub/data /opt/droidhub/config /opt/droidhub/.android
 
 [Install]
 WantedBy=multi-user.target

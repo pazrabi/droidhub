@@ -55,7 +55,7 @@ async def setup_cli() -> Any:
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m hub.cli",
-        description="CLI для управления Android-устройствами в Phone Hub",
+        description="CLI для управления Android-устройствами в DroidHub",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

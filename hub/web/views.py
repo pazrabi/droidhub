@@ -73,7 +73,7 @@ web_router = APIRouter()
 
 @web_router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request, error: Optional[str] = None) -> Response:
-    """Страница входа в панель Phone Hub."""
+    """Страница входа в панель DroidHub."""
     user = get_user_from_request(request)
     if user:
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)

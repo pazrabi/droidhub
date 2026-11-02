@@ -35,7 +35,7 @@ def test_app_factory_creates_app(monkeypatch: pytest.MonkeyPatch) -> None:
 
     app = app_factory()
     assert isinstance(app, FastAPI)
-    assert app.title == "Phone Hub"
+    assert app.title == "DroidHub"
 
 
 def test_create_app_with_custom_settings(tmp_path: Path) -> None:

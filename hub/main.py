@@ -42,7 +42,7 @@ def _get_static_dir() -> Path:
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    """Создает и настраивает приложение FastAPI Phone Hub по контракту."""
+    """Создает и настраивает приложение FastAPI DroidHub по контракту."""
     if settings is None:
         settings = get_settings()
 
@@ -82,7 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await monitor.stop()
             await manager.stop()
 
-    app = FastAPI(title="Phone Hub", lifespan=lifespan)
+    app = FastAPI(title="DroidHub", lifespan=lifespan)
     app.state.settings = settings
     app.state.manager = manager
     app.state.monitor = monitor

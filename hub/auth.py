@@ -332,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI интерфейс модуля hub.auth."""
     parser = argparse.ArgumentParser(
         prog="python -m hub.auth",
-        description="CLI авторизации Phone Hub",
+        description="CLI авторизации DroidHub",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("hash", help="Спросить пароль через getpass и напечатать хэш для .env")

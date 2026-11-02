@@ -1,4 +1,4 @@
-// Phone Hub — Клиентский скрипт управления устройствами (Vanilla JS, без CDN)
+// DroidHub — Клиентский скрипт управления устройствами (Vanilla JS, без CDN)
 
 (function () {
   'use strict';

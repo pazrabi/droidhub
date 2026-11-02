@@ -61,7 +61,7 @@ def mock_manager(sample_devices: list[DeviceConfig]) -> DeviceManager:
 
 
 def create_web_app(manager: DeviceManager | None = None) -> FastAPI:
-    app = FastAPI(title="Phone Hub Web Test")
+    app = FastAPI(title="DroidHub Web Test")
     app.add_middleware(SessionMiddleware, secret_key="test-web-secret-key-12345")
 
     if manager is not None:
@@ -115,7 +115,7 @@ def test_index_unauthorized_follow_redirects_shows_login_page(mock_manager: Devi
 
     response = client.get("/", follow_redirects=True)
     assert response.status_code == 200
-    assert "Вход в Phone Hub" in response.text
+    assert "Вход в DroidHub" in response.text
     assert 'name="username"' in response.text
     assert 'name="password"' in response.text
 
@@ -133,7 +133,7 @@ def test_login_page_renders_form() -> None:
     response = client.get("/login")
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
-    assert "Вход в Phone Hub" in response.text
+    assert "Вход в DroidHub" in response.text
     assert '<form action="/login" method="post"' in response.text
     assert 'id="username"' in response.text
     assert 'id="password"' in response.text

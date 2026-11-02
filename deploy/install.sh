@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Idempotent deployment script for Phone Hub.
+# Idempotent deployment script for DroidHub.
 #
 # Usage:
 #   sudo ./deploy/install.sh            # Run installation
@@ -52,13 +52,13 @@ run_cmd() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TARGET_DIR="/opt/phone-hub"
-SERVICE_NAME="phone-hub.service"
+TARGET_DIR="/opt/droidhub"
+SERVICE_NAME="droidhub.service"
 CADDYFILE="/etc/caddy/Caddyfile"
 HUB_DOMAIN="hub.193-41-86-92.sslip.io"
 
 echo "=========================================="
-echo "Phone Hub Deployment"
+echo "DroidHub Deployment"
 if [ "$DRY_RUN" = true ]; then
     echo "Mode: DRY RUN (no modifications will be made)"
 else
@@ -174,7 +174,7 @@ run_cmd chmod 700 "$TARGET_DIR/.android"
 # 4. Systemd service installation
 log "4. Installing systemd service..."
 SYSTEMD_DEST="/etc/systemd/system/$SERVICE_NAME"
-run_cmd cp "$SCRIPT_DIR/phone-hub.service" "$SYSTEMD_DEST"
+run_cmd cp "$SCRIPT_DIR/droidhub.service" "$SYSTEMD_DEST"
 run_cmd chmod 644 "$SYSTEMD_DEST"
 
 if command -v systemctl >/dev/null 2>&1; then
