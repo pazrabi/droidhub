@@ -99,6 +99,21 @@ def test_parse_battery_dumpsys():
     assert batt == 50
     assert temp == 28.4
 
+    # Низкая температура <= 10.0°C (например, 9.5°C -> 95 в dumpsys)
+    batt, temp = parse_battery_dumpsys("level: 70\ntemperature: 95\n")
+    assert batt == 70
+    assert temp == 9.5
+
+    # 0.0°C -> 0
+    batt, temp = parse_battery_dumpsys("level: 70\ntemperature: 0\n")
+    assert batt == 70
+    assert temp == 0.0
+
+    # Отрицательная температура
+    batt, temp = parse_battery_dumpsys("level: 70\ntemperature: -50\n")
+    assert batt == 70
+    assert temp == -5.0
+
     # Отсутствуют данные или пустая строка
     assert parse_battery_dumpsys("") == (None, None)
     assert parse_battery_dumpsys("some unrelated text") == (None, None)
@@ -343,3 +358,53 @@ async def test_manager_end_to_end_mock_process(monkeypatch):
     assert status.battery == 82
     assert status.temperature == 29.5
     assert status.screen_on is True
+
+
+async def test_manager_refresh_isolated_power_failure(monkeypatch):
+    dev = DeviceConfig(id="realme", name="Realme C21Y", host="100.64.0.1", port=5555)
+    mgr = DeviceManager([dev])
+
+    async def _mock_shell(serial: str | None, cmd: str, timeout: float = 15.0) -> str:
+        if cmd == "dumpsys battery":
+            return DUMPSYS_BATTERY_SAMPLE
+        if cmd == "dumpsys power":
+            raise AdbError("dumpsys power failed: Permission denied")
+        return ""
+
+    monkeypatch.setattr("hub.devices.manager.adb_shell", _mock_shell)
+
+    status = await mgr.refresh("realme")
+    assert status.id == "realme"
+    assert status.online is True
+    assert status.battery == 82
+    assert status.temperature == 29.5
+    assert status.screen_on is None
+    assert status.error is None
+
+
+async def test_manager_parallel_poll(monkeypatch):
+    dev1 = DeviceConfig(id="dev1", name="Device 1", host="100.64.0.1", port=5555)
+    dev2 = DeviceConfig(id="dev2", name="Device 2", host="100.64.0.2", port=5555)
+    dev3 = DeviceConfig(id="dev3", name="Device 3", host="100.64.0.3", port=5555)
+    mgr = DeviceManager([dev1, dev2, dev3], interval=0.01)
+
+    concurrent_count = 0
+    max_concurrent = 0
+
+    async def _mock_check(dev_id: str) -> DeviceStatus:
+        nonlocal concurrent_count, max_concurrent
+        concurrent_count += 1
+        if concurrent_count > max_concurrent:
+            max_concurrent = concurrent_count
+        await asyncio.sleep(0.02)
+        concurrent_count -= 1
+        return DeviceStatus(id=dev_id, name=dev_id, online=True)
+
+    monkeypatch.setattr(mgr, "check_device", _mock_check)
+
+    await mgr.start()
+    await asyncio.sleep(0.05)
+    await mgr.stop()
+
+    assert max_concurrent > 1
+

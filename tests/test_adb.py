@@ -223,3 +223,38 @@ async def test_connect_exception(monkeypatch):
 
     monkeypatch.setattr("hub.devices.adb.run_adb", _failing)
     assert await connect("100.64.0.1", 5555) is False
+
+
+async def test_run_adb_cancelled(mock_exec):
+    setter, _ = mock_exec
+    proc = setter(delay=5.0)
+
+    task = asyncio.create_task(run_adb(["shell", "sleep 10"]))
+    await asyncio.sleep(0.01)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert proc.killed is True
+
+
+async def test_run_adb_binary_offline_error(mock_exec):
+    setter, _ = mock_exec
+    setter(stdout=b"error: device offline\n", returncode=0)
+
+    with pytest.raises(DeviceOffline) as exc_info:
+        await run_adb(["exec-out", "screencap", "-p"], serial="100.64.0.1:5555", binary=True)
+
+    assert "оффлайн или не найдено" in str(exc_info.value)
+
+
+async def test_run_adb_device_not_found_with_serial(mock_exec):
+    setter, _ = mock_exec
+    setter(stdout=b"error: device '100.64.0.1:5555' not found\n", returncode=0)
+
+    with pytest.raises(DeviceOffline) as exc_info:
+        await run_adb(["shell", "dumpsys"], serial="100.64.0.1:5555")
+
+    assert "оффлайн или не найдено" in str(exc_info.value)
+

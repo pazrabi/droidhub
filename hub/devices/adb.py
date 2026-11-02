@@ -76,6 +76,16 @@ async def run_adb(
         except Exception:
             pass
         raise AdbTimeout(f"Превышено время ожидания команды ADB ({timeout} с)")
+    except asyncio.CancelledError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        raise
 
     if proc.returncode != 0:
         err_text = stderr.decode("utf-8", errors="replace").strip()
@@ -94,14 +104,22 @@ async def run_adb(
 
         raise AdbError(f"Ошибка выполнения ADB (код {proc.returncode}): {msg}")
 
+    text = stdout.decode("utf-8", errors="replace")
+    err_text = stderr.decode("utf-8", errors="replace").strip()
+    check_text = f"{text} {err_text}".strip()
+    check_lower = check_text.lower()
+    if (
+        "offline" in check_lower
+        or "device not found" in check_lower
+        or ("device" in check_lower and "not found" in check_lower)
+        or "no devices/emulators found" in check_lower
+    ):
+        target_str = f" '{serial}'" if serial else ""
+        msg = text.strip() or err_text
+        raise DeviceOffline(f"Устройство{target_str} оффлайн или не найдено: {msg}")
+
     if binary:
         return stdout
-
-    text = stdout.decode("utf-8", errors="replace")
-    text_lower = text.lower()
-    if text_lower.startswith("error: device offline") or text_lower.startswith("error: device not found"):
-        target_str = f" '{serial}'" if serial else ""
-        raise DeviceOffline(f"Устройство{target_str} оффлайн или не найдено: {text.strip()}")
 
     return text
 

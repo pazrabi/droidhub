@@ -46,11 +46,10 @@ def parse_battery_dumpsys(dumpsys_output: str) -> tuple[int | None, float | None
     temp_match = re.search(r"\btemperature:\s*([-\d.]+)", dumpsys_output, re.IGNORECASE)
     if temp_match:
         try:
-            raw_temp = float(temp_match.group(1))
-            if abs(raw_temp) > 100:
-                temperature = round(raw_temp / 10.0, 1)
+            if "." in temp_match.group(1):
+                temperature = round(float(temp_match.group(1)), 1)
             else:
-                temperature = round(raw_temp, 1)
+                temperature = round(float(temp_match.group(1)) / 10.0, 1)
         except ValueError:
             temperature = None
 
@@ -131,9 +130,14 @@ class DeviceManager:
 
         try:
             battery_out = await adb_shell(target, "dumpsys battery")
-            power_out = await adb_shell(target, "dumpsys power")
             battery, temp = parse_battery_dumpsys(battery_out)
-            screen_on = parse_screen_dumpsys(power_out)
+
+            screen_on: bool | None = None
+            try:
+                power_out = await adb_shell(target, "dumpsys power")
+                screen_on = parse_screen_dumpsys(power_out)
+            except (AdbError, AdbTimeout, Exception):
+                screen_on = None
 
             status = DeviceStatus(
                 id=cfg.id,
@@ -174,13 +178,14 @@ class DeviceManager:
     async def _poll_loop(self) -> None:
         """Фоновый цикл проверки каждые self._interval секунд."""
         while self._running:
-            for device_id in list(self._devices.keys()):
-                if not self._running:
-                    break
+            if self._devices:
                 try:
-                    await self.check_device(device_id)
-                except Exception:
-                    pass
+                    await asyncio.gather(
+                        *(self.check_device(dev_id) for dev_id in list(self._devices.keys())),
+                        return_exceptions=True,
+                    )
+                except asyncio.CancelledError:
+                    break
             try:
                 await asyncio.sleep(self._interval)
             except asyncio.CancelledError:
