@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
+from hub.alerts import AlertMonitor
 from hub.api.routes import api_router, public_router
 from hub.audit import init_audit
 from hub.config import Settings, get_settings, load_devices
@@ -55,6 +56,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     init_audit(settings.db_path)
     manager = DeviceManager(devices)
     actions.set_manager(manager)
+    monitor = AlertMonitor(manager=manager, settings=settings)
 
     mcp_app = None
     mcp_lifespan_ctx = None
@@ -69,6 +71,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await manager.start()
+        await monitor.start()
         try:
             if mcp_lifespan_ctx is not None:
                 async with mcp_lifespan_ctx():
@@ -76,11 +79,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 yield
         finally:
+            await monitor.stop()
             await manager.stop()
 
     app = FastAPI(title="Phone Hub", lifespan=lifespan)
     app.state.settings = settings
     app.state.manager = manager
+    app.state.monitor = monitor
 
     # SessionMiddleware
     cookie_secure = os.getenv("HUB_COOKIE_SECURE", "false").lower() in ("true", "1", "yes")

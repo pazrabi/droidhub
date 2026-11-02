@@ -13,6 +13,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 # Заглушки параллельных модулей hub.auth и hub.web.views
 import hub.main as main_module
+from hub.alerts import AlertMonitor
 from hub.config import DeviceConfig, Settings
 from hub.devices import actions
 from hub.devices.adb import AdbError
@@ -59,6 +60,25 @@ def test_lifespan_starts_and_stops_manager(monkeypatch: pytest.MonkeyPatch) -> N
 
     settings = Settings(db_path=":memory:", devices_file="")
     app = create_app(settings)
+
+    with TestClient(app):
+        mock_start.assert_called_once()
+        mock_stop.assert_not_called()
+
+    mock_stop.assert_called_once()
+
+
+def test_lifespan_starts_and_stops_monitor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Контракт: lifespan запускает и останавливает AlertMonitor."""
+    mock_start = AsyncMock()
+    mock_stop = AsyncMock()
+    monkeypatch.setattr(AlertMonitor, "start", mock_start)
+    monkeypatch.setattr(AlertMonitor, "stop", mock_stop)
+
+    settings = Settings(db_path=":memory:", devices_file="")
+    app = create_app(settings)
+    assert hasattr(app.state, "monitor")
+    assert isinstance(app.state.monitor, AlertMonitor)
 
     with TestClient(app):
         mock_start.assert_called_once()

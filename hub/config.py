@@ -33,6 +33,14 @@ class Settings:
     adb_path: str = "adb"
     allow_shell: bool = False
     rate_limit_per_min: int = 60
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
+    temp_warn_c: float = 40.0
+    temp_alert_c: float = 45.0
+    temp_shutdown_c: float = 50.0
+    full_charge_hours: float = 6.0
+    offline_alert_min: float = 10.0
+    alert_cooldown_min: float = 30.0
 
 
 def load_devices(path: str | Path = "config/devices.yaml") -> list[DeviceConfig]:
@@ -144,6 +152,22 @@ def get_settings(env_file: str | Path | None = None) -> Settings:
     except (ValueError, TypeError):
         rate_limit_per_min = 60
 
+    def parse_float(key: str, default: float) -> float:
+        val_str = get_val(key, str(default)).strip()
+        try:
+            return float(val_str)
+        except (ValueError, TypeError):
+            return default
+
+    telegram_token = get_val("HUB_TELEGRAM_TOKEN", "").strip()
+    telegram_chat_id = get_val("HUB_TELEGRAM_CHAT_ID", "").strip()
+    temp_warn_c = parse_float("HUB_TEMP_WARN_C", 40.0)
+    temp_alert_c = parse_float("HUB_TEMP_ALERT_C", 45.0)
+    temp_shutdown_c = parse_float("HUB_TEMP_SHUTDOWN_C", 50.0)
+    full_charge_hours = parse_float("HUB_FULL_CHARGE_HOURS", 6.0)
+    offline_alert_min = parse_float("HUB_OFFLINE_ALERT_MIN", 10.0)
+    alert_cooldown_min = parse_float("HUB_ALERT_COOLDOWN_MIN", 30.0)
+
     return Settings(
         devices_file=get_val("HUB_DEVICES_FILE", "config/devices.yaml"),
         db_path=get_val("HUB_DB_PATH", "data/hub.db"),
@@ -155,6 +179,14 @@ def get_settings(env_file: str | Path | None = None) -> Settings:
         adb_path=get_val("HUB_ADB_PATH", "adb"),
         allow_shell=allow_shell,
         rate_limit_per_min=rate_limit_per_min,
+        telegram_token=telegram_token,
+        telegram_chat_id=telegram_chat_id,
+        temp_warn_c=temp_warn_c,
+        temp_alert_c=temp_alert_c,
+        temp_shutdown_c=temp_shutdown_c,
+        full_charge_hours=full_charge_hours,
+        offline_alert_min=offline_alert_min,
+        alert_cooldown_min=alert_cooldown_min,
     )
 
 
