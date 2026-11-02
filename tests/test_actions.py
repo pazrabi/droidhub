@@ -5,6 +5,7 @@ import base64
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+import shlex
 import sys
 import types
 from typing import Any
@@ -444,6 +445,29 @@ async def test_type_text_cyrillic(monkeypatch: pytest.MonkeyPatch, setup_actions
     assert setup_actions.entries[0]["ok"] is True
 
 
+@pytest.mark.asyncio
+async def test_type_text_special_characters(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    calls: list[str] = []
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    # Текст со спецсимволами shell: &, $, кавычки, точка с запятой, перенаправления
+    special_text = 'test & id; echo "hello $USER" && rm -rf / < > `whoami`'
+    await actions.type_text("realme", special_text)
+    assert len(calls) == 1
+    # Должен направляться через ADBKeyBoard broadcast с base64 (полная защита от injection)
+    assert "am broadcast -a ADB_INPUT_B64 --es msg" in calls[0]
+    b64_part = calls[0].split("--es msg")[-1].strip().strip("'\"")
+    decoded = base64.b64decode(b64_part).decode("utf-8")
+    assert decoded == special_text
+    assert setup_actions.entries[0]["action"] == "type_text"
+    assert setup_actions.entries[0]["ok"] is True
+
+
 # --- ТЕСТ KEY ---
 
 @pytest.mark.asyncio
@@ -477,6 +501,29 @@ async def test_key_invalid(monkeypatch: pytest.MonkeyPatch):
         await actions.key("realme", "super_unknown_key")
 
 
+@pytest.mark.asyncio
+async def test_key_injection_and_validation(monkeypatch: pytest.MonkeyPatch):
+    with pytest.raises(ValueError, match="Неизвестная клавиша"):
+        await actions.key("realme", "KEYCODE_BACK; reboot")
+
+    with pytest.raises(ValueError, match="Неизвестная клавиша"):
+        await actions.key("realme", "KEYCODE_HOME && id")
+
+
+@pytest.mark.asyncio
+async def test_key_valid_keycode(monkeypatch: pytest.MonkeyPatch):
+    calls: list[str] = []
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    await actions.key("realme", "KEYCODE_VOLUME_UP")
+    assert calls == ["input keyevent KEYCODE_VOLUME_UP"]
+
+
 # --- ТЕСТ OPEN_APP ---
 
 @pytest.mark.asyncio
@@ -498,6 +545,26 @@ async def test_open_app(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudi
 
     assert setup_actions.entries[-1]["action"] == "open_app"
     assert setup_actions.entries[-1]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_open_app_escaping(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    calls: list[str] = []
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    pkg_with_inject = "com.example.app; reboot"
+    await actions.open_app("realme", pkg_with_inject)
+    assert calls == [f"monkey -p {shlex.quote(pkg_with_inject)} -c android.intent.category.LAUNCHER 1"]
+
+    calls.clear()
+    comp_with_inject = "com.example/MainActivity; reboot"
+    await actions.open_app("realme", comp_with_inject)
+    assert calls == [f"am start -n {shlex.quote(comp_with_inject)}"]
 
 
 # --- ТЕСТ LIST_APPS ---
@@ -539,7 +606,26 @@ async def test_open_url(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudi
     monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
 
     await actions.open_url("realme", "https://github.com")
-    assert calls == ["am start -a android.intent.action.VIEW -d 'https://github.com'"]
+    assert calls == [f"am start -a android.intent.action.VIEW -d {shlex.quote('https://github.com')}"]
+    assert setup_actions.entries[0]["action"] == "open_url"
+    assert setup_actions.entries[0]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_open_url_special_characters(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    calls: list[str] = []
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    url_with_specials = "https://example.com/search?q=it's+a+test&foo=bar$baz;id"
+    await actions.open_url("realme", url_with_specials)
+    assert calls == [f"am start -a android.intent.action.VIEW -d {shlex.quote(url_with_specials)}"]
+    # Проверяем, что выход из кавычек и инъекция не произошли
+    assert ";id" not in calls[0].split(shlex.quote(url_with_specials))[0]
     assert setup_actions.entries[0]["action"] == "open_url"
     assert setup_actions.entries[0]["ok"] is True
 
@@ -627,6 +713,94 @@ async def test_tap_element_not_found(monkeypatch: pytest.MonkeyPatch):
 async def test_tap_element_no_args():
     with pytest.raises(ValueError, match="Необходимо указать text или resource_id"):
         await actions.tap_element("realme")
+
+
+@pytest.mark.asyncio
+async def test_ui_dump_idle_error(monkeypatch: pytest.MonkeyPatch):
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        if "uiautomator dump" in cmd:
+            return "ERROR: could not get idle state"
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    with pytest.raises(RuntimeError, match="Не удалось получить дамп UI: ERROR: could not get idle state"):
+        await actions.ui_dump("realme")
+
+
+@pytest.mark.asyncio
+async def test_ui_dump_no_hierarchy(monkeypatch: pytest.MonkeyPatch):
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        if "cat" in cmd:
+            return "cat: /sdcard/window_dump.xml: No such file or directory"
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    with pytest.raises(RuntimeError, match="Не удалось получить дамп UI"):
+        await actions.ui_dump("realme")
+
+
+@pytest.mark.asyncio
+async def test_ui_dump_cleans_control_chars(monkeypatch: pytest.MonkeyPatch):
+    xml_with_ctrl = SAMPLE_UI_XML.replace("Search or type URL", "Search\x00\x08\x0b\x0c URL")
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        if "cat" in cmd or "dump" in cmd:
+            return xml_with_ctrl
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    elems = await actions.ui_dump("realme")
+    assert len(elems) == 4
+    assert elems[0]["text"] == "Search URL"
+
+
+@pytest.mark.asyncio
+async def test_tap_element_empty_string(monkeypatch: pytest.MonkeyPatch):
+    calls: list[str] = []
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        if "cat" in cmd or "dump" in cmd:
+            return SAMPLE_UI_XML
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    # Передача text="" не должна ломать поиск по resource_id
+    elem = await actions.tap_element("realme", text="", resource_id="btn_login")
+    assert elem["resource_id"] == "com.android.chrome:id/btn_login"
+    assert elem["text"] == "Войти"
+    assert calls == ["input tap 250 550"]
+
+
+@pytest.mark.asyncio
+async def test_tap_element_prioritizes_visible(monkeypatch: pytest.MonkeyPatch):
+    calls: list[str] = []
+
+    xml_with_invisible_first = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout" clickable="false" bounds="[0,0][1080,2400]">
+    <node index="0" text="Submit" resource-id="com.app:id/submit" class="android.widget.Button" clickable="true" bounds="[0,0][0,0]" />
+    <node index="1" text="Submit" resource-id="com.app:id/submit" class="android.widget.Button" clickable="true" bounds="[100,200][300,300]" />
+  </node>
+</hierarchy>
+"""
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        if "cat" in cmd or "dump" in cmd:
+            return xml_with_invisible_first
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    # Должен выбрать видимый элемент с center=[200, 250], а не шаблонный [0, 0]
+    elem = await actions.tap_element("realme", text="Submit")
+    assert elem["center"] == [200, 250]
+    assert calls == ["input tap 200 250"]
 
 
 # --- ТЕСТ WAKE_AND_UNLOCK ---
@@ -798,3 +972,84 @@ async def test_cli_error_handling(monkeypatch: pytest.MonkeyPatch, capsys: pytes
     assert exit_code == 1
     captured = capsys.readouterr()
     assert "Ошибка: Устройство оффлайн" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_cli_key(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    calls: list[str] = []
+
+    async def mock_key(device: str, name: str, **kwargs):
+        calls.append(name)
+
+    monkeypatch.setattr(actions, "key", mock_key)
+
+    exit_code = await cli.async_main(["key", "realme", "home"])
+    assert exit_code == 0
+    assert calls == ["home"]
+    captured = capsys.readouterr()
+    assert "Клавиша 'home' нажата на realme" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_cli_swipe(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    calls: list[Any] = []
+
+    async def mock_swipe(device: str, x1: int, y1: int, x2: int, y2: int, ms: int = 300, **kwargs):
+        calls.append((x1, y1, x2, y2, ms))
+
+    monkeypatch.setattr(actions, "swipe", mock_swipe)
+
+    exit_code = await cli.async_main(["swipe", "realme", "100", "200", "300", "400", "--ms", "500"])
+    assert exit_code == 0
+    assert calls == [(100, 200, 300, 400, 500)]
+    captured = capsys.readouterr()
+    assert "Свайп выполнен на realme: (100, 200) -> (300, 400)" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_cli_open_app(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    calls: list[str] = []
+
+    async def mock_open_app(device: str, package: str, **kwargs):
+        calls.append(package)
+
+    monkeypatch.setattr(actions, "open_app", mock_open_app)
+
+    exit_code = await cli.async_main(["open_app", "realme", "com.android.chrome"])
+    assert exit_code == 0
+    assert calls == ["com.android.chrome"]
+    captured = capsys.readouterr()
+    assert "Приложение 'com.android.chrome' запущено на realme" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_cli_open_url(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture):
+    calls: list[str] = []
+
+    async def mock_open_url(device: str, url: str, **kwargs):
+        calls.append(url)
+
+    monkeypatch.setattr(actions, "open_url", mock_open_url)
+
+    exit_code = await cli.async_main(["open_url", "realme", "https://github.com"])
+    assert exit_code == 0
+    assert calls == ["https://github.com"]
+    captured = capsys.readouterr()
+    assert "URL 'https://github.com' открыт на realme" in captured.out
+
+
+@pytest.mark.asyncio
+async def test_cli_devices_empty_statuses(capsys: pytest.CaptureFixture):
+    class EmptyStatusManager(DummyManager):
+        def statuses(self) -> list[Any]:
+            return []
+
+    mgr = EmptyStatusManager()
+    actions.set_manager(mgr)
+
+    exit_code = await cli.async_main(["devices"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "realme: Realme C21Y" in captured.out
+    assert "redmi: Redmi Note 11" in captured.out
+    assert "Нет доступных устройств" not in captured.out

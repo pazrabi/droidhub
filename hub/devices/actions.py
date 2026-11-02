@@ -4,6 +4,7 @@ import asyncio
 import base64
 from io import BytesIO
 import re
+import shlex
 from typing import Any
 import xml.etree.ElementTree as ET
 
@@ -42,6 +43,8 @@ KEY_CODES: dict[str, str] = {
     "volume_down": "KEYCODE_VOLUME_DOWN",
     "volume": "KEYCODE_VOLUME_UP",
 }
+
+_SHELL_UNSAFE_CHARS = set(';&|`$"\'()<>\\!*?#~=\n\r\t')
 
 
 def set_manager(manager: Any) -> None:
@@ -184,7 +187,7 @@ async def long_press(
 
 
 async def type_text(device_id: str, text: str, *, actor: str = "system") -> None:
-    """Вводит текст: латиница через input text, кириллица/эмодзи через ADBKeyBoard broadcast ADB_INPUT_B64."""
+    """Вводит текст: латиница через input text, кириллица/эмодзи/спецсимволы через ADBKeyBoard broadcast ADB_INPUT_B64."""
     params = {"text": text}
     try:
         serial = _get_serial(device_id)
@@ -192,9 +195,12 @@ async def type_text(device_id: str, text: str, *, actor: str = "system") -> None
             raise RuntimeError("Функция adb_shell не доступна")
 
         if text:
-            if text.isascii():
+            # Если текст содержит не-ASCII символы (кириллица, эмодзи) или спецсимволы shell (&, $, кавычки и т.д.),
+            # направляем ввод через ADBKeyBoard broadcast ADB_INPUT_B64 (base64 полностью безопасен к инъекциям).
+            is_safe_ascii = text.isascii() and not any(c in _SHELL_UNSAFE_CHARS for c in text)
+            if is_safe_ascii:
                 escaped = text.replace(" ", "%s")
-                await adb_shell(serial, f"input text {escaped}")
+                await adb_shell(serial, f"input text {shlex.quote(escaped)}")
             else:
                 b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
                 await adb_shell(serial, f"am broadcast -a ADB_INPUT_B64 --es msg '{b64}'")
@@ -209,11 +215,12 @@ async def key(device_id: str, name: str, *, actor: str = "system") -> None:
     """Нажимает аппаратную клавишу (back, home, recents, enter, power, volume_up, volume_down)."""
     params = {"name": name}
     try:
-        key_lower = name.strip().lower()
+        clean_name = name.strip()
+        key_lower = clean_name.lower()
         if key_lower in KEY_CODES:
             keycode = KEY_CODES[key_lower]
-        elif name.strip().upper().startswith("KEYCODE_"):
-            keycode = name.strip().upper()
+        elif re.fullmatch(r"KEYCODE_[A-Z0-9_]+", clean_name.upper()):
+            keycode = clean_name.upper()
         else:
             raise ValueError(f"Неизвестная клавиша: {name}")
 
@@ -235,10 +242,11 @@ async def open_app(device_id: str, package: str, *, actor: str = "system") -> No
         if adb_shell is None:
             raise RuntimeError("Функция adb_shell не доступна")
 
+        quoted_pkg = shlex.quote(package)
         if "/" in package:
-            cmd = f"am start -n {package}"
+            cmd = f"am start -n {quoted_pkg}"
         else:
-            cmd = f"monkey -p {package} -c android.intent.category.LAUNCHER 1"
+            cmd = f"monkey -p {quoted_pkg} -c android.intent.category.LAUNCHER 1"
 
         await adb_shell(serial, cmd)
         await _record_audit(device_id, "open_app", params, ok=True, actor=actor)
@@ -281,7 +289,7 @@ async def open_url(device_id: str, url: str, *, actor: str = "system") -> None:
         serial = _get_serial(device_id)
         if adb_shell is None:
             raise RuntimeError("Функция adb_shell не доступна")
-        await adb_shell(serial, f"am start -a android.intent.action.VIEW -d '{url}'")
+        await adb_shell(serial, f"am start -a android.intent.action.VIEW -d {shlex.quote(url)}")
         await _record_audit(device_id, "open_url", params, ok=True, actor=actor)
     except Exception as e:
         await _record_audit(device_id, "open_url", params, ok=False, error=str(e), actor=actor)
@@ -296,11 +304,24 @@ async def ui_dump(device_id: str, *, actor: str = "system") -> list[dict]:
         if adb_shell is None:
             raise RuntimeError("Функция adb_shell не доступна")
 
+        # 1. Удаляем старый файл перед дампом, чтобы не вернуть устаревший интерфейс при сбое
+        await adb_shell(serial, "rm -f /sdcard/window_dump.xml")
+
+        # 2. Выполняем uiautomator dump
         dump_out = await adb_shell(serial, "uiautomator dump /sdcard/window_dump.xml")
+        dump_clean = dump_out.strip()
+        if "ERROR:" in dump_out or "Error:" in dump_out or "could not get idle state" in dump_out.lower():
+            raise RuntimeError(f"Не удалось получить дамп UI: {dump_clean}")
+
         if "<hierarchy" in dump_out or "<node" in dump_out:
             xml_text = dump_out
         else:
             xml_text = await adb_shell(serial, "cat /sdcard/window_dump.xml")
+
+        # Проверяем наличие корневого тега <hierarchy до вызова парсера
+        if "<hierarchy" not in xml_text:
+            err_msg = xml_text.strip() or dump_clean or "не удалось прочитать файл дампа"
+            raise RuntimeError(f"Не удалось получить дамп UI: {err_msg}")
 
         start_idx = xml_text.find("<hierarchy")
         if start_idx != -1:
@@ -310,7 +331,14 @@ async def ui_dump(device_id: str, *, actor: str = "system") -> list[dict]:
             else:
                 xml_text = xml_text[start_idx:]
 
-        root = ET.fromstring(xml_text)
+        # Очищаем невалидные управляющие XML-символы (\x00-\x08, \x0b, \x0c, \x0e-\x1f)
+        xml_text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", xml_text)
+
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as pe:
+            raise RuntimeError(f"Не удалось получить дамп UI: ошибка разбора XML ({pe})") from pe
+
         elements: list[dict] = []
         for node in root.iter("node"):
             text = node.attrib.get("text", "")
@@ -358,15 +386,18 @@ async def tap_element(
     actor: str = "system",
 ) -> dict:
     """Находит элемент по text или resource_id через ui_dump, нажимает на его центр и возвращает элемент."""
+    # Приводим пустые строки к None
+    text = text or None
+    resource_id = resource_id or None
     if not text and not resource_id:
         raise ValueError("Необходимо указать text или resource_id для поиска элемента")
 
     params = {"text": text, "resource_id": resource_id}
     try:
         elements = await ui_dump(device_id, actor=actor)
-        matched: dict | None = None
 
         # 1. Точный поиск
+        exact_matches: list[dict] = []
         for elem in elements:
             text_match = (text is None) or (elem["text"] == text or elem["content_desc"] == text)
             id_match = (resource_id is None) or (
@@ -374,21 +405,34 @@ async def tap_element(
                 or elem["resource_id"].endswith(f":id/{resource_id}")
             )
             if text_match and id_match:
-                matched = elem
-                break
+                exact_matches.append(elem)
+
+        matched: dict | None = None
+        # Отдаем приоритет видимым элементам (center != [0, 0])
+        visible_exact = [e for e in exact_matches if e.get("center") != [0, 0]]
+        if visible_exact:
+            matched = visible_exact[0]
+        elif exact_matches:
+            matched = exact_matches[0]
 
         # 2. Нестрогий поиск (подстрока, без учета регистра)
         if matched is None:
             t_low = text.lower() if text else None
             r_low = resource_id.lower() if resource_id else None
+            fuzzy_matches: list[dict] = []
             for elem in elements:
                 text_match = (t_low is None) or (
                     t_low in elem["text"].lower() or t_low in elem["content_desc"].lower()
                 )
                 id_match = (r_low is None) or (r_low in elem["resource_id"].lower())
                 if text_match and id_match:
-                    matched = elem
-                    break
+                    fuzzy_matches.append(elem)
+
+            visible_fuzzy = [e for e in fuzzy_matches if e.get("center") != [0, 0]]
+            if visible_fuzzy:
+                matched = visible_fuzzy[0]
+            elif fuzzy_matches:
+                matched = fuzzy_matches[0]
 
         if matched is None:
             raise ValueError(f"Элемент не найден: text={text!r}, resource_id={resource_id!r}")

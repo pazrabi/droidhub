@@ -132,15 +132,32 @@ async def async_main(argv: list[str] | None = None) -> int:
         if args.command == "devices":
             manager = await setup_cli()
             devices_found = False
-            if hasattr(manager, "statuses"):
-                for s in manager.statuses():
-                    status_text = "online" if s.online else "offline"
-                    bat_text = f", батарея: {s.battery}%" if s.battery is not None else ""
+            statuses = manager.statuses() if hasattr(manager, "statuses") else []
+            if statuses:
+                for s in statuses:
+                    status_text = "online" if getattr(s, "online", False) else "offline"
+                    bat = getattr(s, "battery", None)
+                    bat_text = f", батарея: {bat}%" if bat is not None else ""
                     print(f"- {s.id}: {s.name} [{status_text}{bat_text}]")
                     devices_found = True
-            elif hasattr(manager, "_devices"):
-                for d in manager._devices.values():
-                    print(f"- {d.id}: {d.name} ({d.host}:{d.port})")
+            else:
+                devs: list[Any] = []
+                if hasattr(manager, "_devices"):
+                    devs = list(manager._devices.values()) if isinstance(manager._devices, dict) else list(manager._devices)
+                elif hasattr(manager, "devices"):
+                    devs = list(manager.devices.values()) if isinstance(manager.devices, dict) else list(manager.devices)
+                elif get_settings is not None and load_devices is not None:
+                    try:
+                        settings = get_settings()
+                        devs = load_devices(settings.devices_file)
+                    except Exception:
+                        devs = []
+
+                for d in devs:
+                    host = getattr(d, "host", "")
+                    port = getattr(d, "port", "")
+                    addr = f" ({host}:{port})" if host else ""
+                    print(f"- {d.id}: {d.name}{addr}")
                     devices_found = True
 
             if not devices_found:
