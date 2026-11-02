@@ -12,6 +12,23 @@
       <h1 class="device-title">{{ device.name if device else device_id }}</h1>
       <span class="device-id-badge">{{ device_id }}</span>
     </div>
+    <div class="device-telemetry-bar" id="device-telemetry">
+      <div class="telemetry-item" id="telemetry-battery">
+        <span class="telemetry-label">Заряд:</span>
+        <span class="telemetry-value battery-value" id="device-battery-val">
+          {% if device_status and device_status.battery is not none %}{{ device_status.battery }}%{% else %}—{% endif %}
+        </span>
+      </div>
+      <div class="telemetry-item" id="telemetry-temp">
+        <span class="telemetry-label">Температура:</span>
+        <div class="temp-wrap">
+          <span class="telemetry-value temp-value {% if device_status and device_status.temperature is not none %}{% if device_status.temperature >= 45 %}temp-danger{% elif device_status.temperature >= 40 %}temp-warning{% else %}temp-neutral{% endif %}{% endif %}" id="device-temp-val">
+            {% if device_status and device_status.temperature is not none %}{{ device_status.temperature }}°C{% else %}—{% endif %}
+          </span>
+          <span class="badge badge-overheat badge-danger" id="device-overheat-badge" style="{% if not (device_status and device_status.temperature is not none and device_status.temperature >= 45) %}display: none;{% endif %}">ПЕРЕГРЕВ</span>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="device-layout">
@@ -92,6 +109,25 @@
             </button>
           </div>
         </form>
+      </div>
+
+      <!-- Power Management Card -->
+      <div class="control-card power-card" id="power-card">
+        <h2 class="card-title">Питание</h2>
+        <div class="power-buttons-grid">
+          <button type="button" class="btn btn-sm btn-outline btn-power-action" id="btn-power-wake" data-power="wake" title="Разбудить">
+            Разбудить
+          </button>
+          <button type="button" class="btn btn-sm btn-outline btn-power-action" id="btn-power-sleep" data-power="sleep" title="Экран выкл.">
+            Экран выкл.
+          </button>
+          <button type="button" class="btn btn-sm btn-outline btn-power-action" id="btn-power-reboot" data-power="reboot" title="Перезагрузить">
+            Перезагрузить
+          </button>
+          <button type="button" class="btn btn-sm btn-danger btn-power-action" id="btn-power-shutdown" data-power="shutdown" title="Выключить телефон">
+            Выключить телефон
+          </button>
+        </div>
       </div>
 
       <!-- Quick Actions / Keys Card -->

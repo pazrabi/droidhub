@@ -3,35 +3,298 @@
 (function () {
   'use strict';
 
+  // Интервал опроса статусов устройств (совпадает для списка и страницы устройства)
+  const DEVICES_POLL_INTERVAL_MS = 5000;
+
+  // Тексты предупреждений при опасных операциях питания
+  const SHUTDOWN_WARNING = 'Выключенный телефон нельзя включить удалённо. Зарядка при подключённом кабеле продолжится. Выключить?';
+  const REBOOT_WARNING = 'Телефон будет перезагружен и временно станет недоступен. Перезагрузить?';
+
   // Инициализация при загрузке DOM
   document.addEventListener('DOMContentLoaded', () => {
+    PowerModal.init();
     initDeviceControlPage();
     initDevicesListPage();
   });
+
+  /* =========================================================================
+     Модальное окно подтверждения (Перезагрузка / Выключение)
+     ========================================================================= */
+  const PowerModal = {
+    modalEl: null,
+    titleEl: null,
+    textEl: null,
+    confirmBtn: null,
+    cancelBtn: null,
+    closeBtn: null,
+    onConfirmCallback: null,
+
+    init() {
+      this.modalEl = document.getElementById('power-modal');
+      if (!this.modalEl) return;
+      this.titleEl = document.getElementById('modal-title');
+      this.textEl = document.getElementById('modal-warning-text');
+      this.confirmBtn = document.getElementById('modal-btn-confirm');
+      this.cancelBtn = document.getElementById('modal-btn-cancel');
+      this.closeBtn = document.getElementById('modal-btn-close');
+
+      const hide = () => this.hide();
+
+      if (this.cancelBtn) this.cancelBtn.addEventListener('click', hide);
+      if (this.closeBtn) this.closeBtn.addEventListener('click', hide);
+
+      this.modalEl.addEventListener('click', (e) => {
+        if (e.target === this.modalEl) hide();
+      });
+
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && this.modalEl.style.display !== 'none') {
+          hide();
+        }
+      });
+
+      if (this.confirmBtn) {
+        this.confirmBtn.addEventListener('click', async () => {
+          if (this.onConfirmCallback) {
+            const cb = this.onConfirmCallback;
+            this.hide();
+            await cb();
+          } else {
+            this.hide();
+          }
+        });
+      }
+    },
+
+    show({ title, text, confirmText, confirmClass, onConfirm }) {
+      if (!this.modalEl) return;
+      if (this.titleEl) this.titleEl.textContent = title || 'Подтверждение';
+      if (this.textEl) this.textEl.textContent = text || '';
+      if (this.confirmBtn) {
+        this.confirmBtn.textContent = confirmText || 'Подтвердить';
+        this.confirmBtn.className = confirmClass || 'btn btn-danger';
+      }
+      this.onConfirmCallback = onConfirm;
+      this.modalEl.style.display = 'flex';
+    },
+
+    hide() {
+      if (!this.modalEl) return;
+      this.modalEl.style.display = 'none';
+      this.onConfirmCallback = null;
+    },
+  };
+
+  /* =========================================================================
+     Отправка команд питания (POST /api/devices/{id}/power)
+     ========================================================================= */
+  async function sendPowerAction(deviceId, action, confirm = true) {
+    if (!deviceId || !action) return false;
+    try {
+      const resp = await fetch(`/api/devices/${encodeURIComponent(deviceId)}/power`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: action, confirm: Boolean(confirm) }),
+      });
+      if (!resp.ok) {
+        let msg = `Ошибка ${resp.status}`;
+        try {
+          const data = await resp.json();
+          if (data && data.detail) msg = data.detail;
+        } catch (_) {}
+        alert(`Ошибка управления питанием: ${msg}`);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.warn(`Power action "${action}" failed:`, err);
+      alert(`Сетевая ошибка при выполнении действия питания: ${err}`);
+      return false;
+    }
+  }
+
+  /* =========================================================================
+     Форматирование температуры и заряда с цветами
+     ========================================================================= */
+  function formatTemperature(temp) {
+    if (temp === null || temp === undefined || isNaN(temp)) {
+      return { text: '—', className: '', isOverheat: false };
+    }
+    const val = Number(temp);
+    const rounded = Math.round(val * 10) / 10;
+    const text = `${rounded}°C`;
+    if (val >= 45) {
+      return { text, className: 'temp-danger', isOverheat: true };
+    }
+    if (val >= 40) {
+      return { text, className: 'temp-warning', isOverheat: false };
+    }
+    return { text, className: 'temp-neutral', isOverheat: false };
+  }
+
+  function formatBattery(batt) {
+    if (batt === null || batt === undefined || isNaN(batt)) {
+      return { text: '—', className: '' };
+    }
+    const val = Number(batt);
+    const text = `${Math.round(val)}%`;
+    let className = 'battery-neutral';
+    if (val <= 15) {
+      className = 'battery-danger';
+    } else if (val <= 30) {
+      className = 'battery-warning';
+    }
+    return { text, className };
+  }
 
   /* =========================================================================
      Страница списка устройств (/)
      ========================================================================= */
   function initDevicesListPage() {
     const refreshBtn = document.getElementById('btn-refresh-devices');
-    if (!refreshBtn) return;
+    const container = document.getElementById('devices-container');
+    if (!refreshBtn && !container) return;
 
-    refreshBtn.addEventListener('click', async () => {
-      refreshBtn.disabled = true;
-      const originalText = refreshBtn.textContent;
-      refreshBtn.textContent = 'Обновление...';
+    let isUpdatingDevices = false;
+    let pollTimer = null;
+
+    async function fetchDevicesList(manual = false) {
+      if (isUpdatingDevices || (document.hidden && !manual)) {
+        return;
+      }
+      isUpdatingDevices = true;
+      if (manual && refreshBtn) {
+        refreshBtn.disabled = true;
+        refreshBtn.textContent = 'Обновление...';
+      }
+
       try {
         const resp = await fetch('/api/devices', { cache: 'no-store' });
         if (resp.ok) {
-          window.location.reload();
+          const devices = await resp.json();
+          if (Array.isArray(devices)) {
+            updateDevicesListDOM(devices);
+          }
         }
       } catch (e) {
         console.warn('Ошибка обновления списка устройств:', e);
       } finally {
-        refreshBtn.disabled = false;
-        refreshBtn.textContent = originalText;
+        isUpdatingDevices = false;
+        if (manual && refreshBtn) {
+          refreshBtn.disabled = false;
+          refreshBtn.textContent = '↻ Обновить';
+        }
+        if (!document.hidden) {
+          scheduleNextDevicesPoll();
+        }
+      }
+    }
+
+    function scheduleNextDevicesPoll() {
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = setTimeout(() => fetchDevicesList(false), DEVICES_POLL_INTERVAL_MS);
+    }
+
+    function updateDevicesListDOM(devices) {
+      devices.forEach((d) => {
+        const card = document.getElementById(`card-${d.id}`);
+        if (!card) return;
+
+        // Онлайн / оффлайн статус
+        const badge = card.querySelector('.device-card-header .badge');
+        if (badge) {
+          if (d.online) {
+            badge.className = 'badge badge-success';
+            badge.textContent = 'В сети';
+          } else {
+            badge.className = 'badge badge-danger';
+            badge.textContent = 'Не в сети';
+          }
+        }
+
+        // Батарея
+        const batteryEl = document.getElementById(`battery-${d.id}`);
+        if (batteryEl) {
+          const bInfo = formatBattery(d.battery);
+          batteryEl.textContent = bInfo.text;
+          batteryEl.className = `meta-value battery-value ${bInfo.className}`;
+        }
+
+        // Температура
+        const tempEl = document.getElementById(`temp-${d.id}`);
+        const tInfo = formatTemperature(d.temperature);
+        if (tempEl) {
+          tempEl.textContent = tInfo.text;
+          tempEl.className = `meta-value temp-value ${tInfo.className}`;
+        }
+
+        // Бейдж «ПЕРЕГРЕВ»
+        const overheatBadge = document.getElementById(`overheat-${d.id}`);
+        if (overheatBadge) {
+          overheatBadge.style.display = tInfo.isOverheat ? 'inline-block' : 'none';
+        }
+
+        // Кнопка «Выключить» в карточке (видна только при перегреве)
+        const shutdownBtn = document.getElementById(`btn-shutdown-${d.id}`);
+        if (shutdownBtn) {
+          shutdownBtn.style.display = tInfo.isOverheat ? 'block' : 'none';
+        }
+
+        // Статус экрана
+        const screenEl = document.getElementById(`screen-status-${d.id}`);
+        if (screenEl) {
+          if (d.screen_on === true) screenEl.textContent = 'Включен';
+          else if (d.screen_on === false) screenEl.textContent = 'Выключен';
+          else screenEl.textContent = '—';
+        }
+      });
+    }
+
+    if (refreshBtn) {
+      refreshBtn.addEventListener('click', () => {
+        if (pollTimer) clearTimeout(pollTimer);
+        fetchDevicesList(true);
+      });
+    }
+
+    // Обработка кнопки выключения в карточке устройства
+    if (container) {
+      container.addEventListener('click', (e) => {
+        const target = e.target.closest('.btn-shutdown-card');
+        if (!target) return;
+        const devId = target.dataset.deviceId;
+        const devName = target.dataset.deviceName || devId;
+        if (!devId) return;
+
+        PowerModal.show({
+          title: `Выключение ${devName}`,
+          text: SHUTDOWN_WARNING,
+          confirmText: 'Выключить',
+          confirmClass: 'btn btn-danger',
+          onConfirm: async () => {
+            const ok = await sendPowerAction(devId, 'shutdown', true);
+            if (ok) {
+              fetchDevicesList(true);
+            }
+          },
+        });
+      });
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        if (pollTimer) {
+          clearTimeout(pollTimer);
+          pollTimer = null;
+        }
+      } else {
+        if (!isUpdatingDevices) {
+          fetchDevicesList(false);
+        }
       }
     });
+
+    scheduleNextDevicesPoll();
   }
 
   /* =========================================================================
@@ -610,5 +873,136 @@
 
     // Загружаем приложения при открытии страницы
     loadApps();
+
+    /* -----------------------------------------------------------------------
+       6. Управление питанием (Разбудить / Экран выкл. / Перезагрузить / Выключить)
+       ----------------------------------------------------------------------- */
+    const powerCard = document.getElementById('power-card');
+    if (powerCard) {
+      powerCard.querySelectorAll('[data-power]').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.preventDefault();
+          const action = btn.dataset.power;
+          if (!action) return;
+
+          if (action === 'wake') {
+            sendPowerAction(deviceId, 'wake', true).then((ok) => {
+              if (ok) {
+                requestImmediateFrame();
+                fetchDeviceStatus();
+              }
+            });
+          } else if (action === 'sleep') {
+            sendPowerAction(deviceId, 'sleep', true).then((ok) => {
+              if (ok) {
+                requestImmediateFrame();
+                fetchDeviceStatus();
+              }
+            });
+          } else if (action === 'reboot') {
+            PowerModal.show({
+              title: 'Перезагрузка телефона',
+              text: REBOOT_WARNING,
+              confirmText: 'Перезагрузить',
+              confirmClass: 'btn btn-danger',
+              onConfirm: async () => {
+                const ok = await sendPowerAction(deviceId, 'reboot', true);
+                if (ok) {
+                  setStatus('warning', 'Перезагрузка...');
+                  setTimeout(requestImmediateFrame, 2000);
+                  fetchDeviceStatus();
+                }
+              },
+            });
+          } else if (action === 'shutdown') {
+            PowerModal.show({
+              title: 'Выключение телефона',
+              text: SHUTDOWN_WARNING,
+              confirmText: 'Выключить',
+              confirmClass: 'btn btn-danger',
+              onConfirm: async () => {
+                const ok = await sendPowerAction(deviceId, 'shutdown', true);
+                if (ok) {
+                  setStatus('error', 'Телефон выключен');
+                  fetchDeviceStatus();
+                }
+              },
+            });
+          }
+        });
+      });
+    }
+
+    /* -----------------------------------------------------------------------
+       7. Телеметрия (температура и заряд) без накладывания запросов
+       ----------------------------------------------------------------------- */
+    let isFetchingStatus = false;
+    let statusPollTimer = null;
+
+    async function fetchDeviceStatus() {
+      if (isFetchingStatus || document.hidden) return;
+      isFetchingStatus = true;
+
+      try {
+        const resp = await fetch('/api/devices', { cache: 'no-store' });
+        if (resp.ok) {
+          const list = await resp.json();
+          if (Array.isArray(list)) {
+            const current = list.find((d) => d.id === deviceId);
+            if (current) {
+              updateDevicePageStatus(current);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Ошибка обновления телеметрии устройства:', err);
+      } finally {
+        isFetchingStatus = false;
+        if (!document.hidden) {
+          scheduleNextStatusPoll();
+        }
+      }
+    }
+
+    function scheduleNextStatusPoll() {
+      if (statusPollTimer) clearTimeout(statusPollTimer);
+      statusPollTimer = setTimeout(fetchDeviceStatus, DEVICES_POLL_INTERVAL_MS);
+    }
+
+    function updateDevicePageStatus(status) {
+      const batteryEl = document.getElementById('device-battery-val');
+      if (batteryEl) {
+        const bInfo = formatBattery(status.battery);
+        batteryEl.textContent = bInfo.text;
+        batteryEl.className = `telemetry-value battery-value ${bInfo.className}`;
+      }
+
+      const tempEl = document.getElementById('device-temp-val');
+      const tInfo = formatTemperature(status.temperature);
+      if (tempEl) {
+        tempEl.textContent = tInfo.text;
+        tempEl.className = `telemetry-value temp-value ${tInfo.className}`;
+      }
+
+      const overheatBadge = document.getElementById('device-overheat-badge');
+      if (overheatBadge) {
+        overheatBadge.style.display = tInfo.isOverheat ? 'inline-block' : 'none';
+      }
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        if (statusPollTimer) {
+          clearTimeout(statusPollTimer);
+          statusPollTimer = null;
+        }
+      } else {
+        if (!isFetchingStatus) {
+          fetchDeviceStatus();
+        }
+      }
+    });
+
+    scheduleNextStatusPoll();
   }
 })();
