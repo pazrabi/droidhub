@@ -24,9 +24,9 @@
 - 2026-11-02 — По требованию владельца целевой Python повышен до 3.11+ (было 3.9-совместимо из-за системного питона Mac): pyproject requires-python >=3.11, правило в CLAUDE.md обновлено (локально, не запушено до конца задачи пула). Локальные тесты перевести на uv-python 3.11+ (нужно согласие владельца на скачивание). На сервере уже 3.14.4.
 - 2026-11-02 — С согласия владельца uv скачал Python 3.13.16; venv для тестов: /private/tmp/claude-501/venv313 (полный requirements, включая mcp). Тесты на 3.13: 164 passed, 0 skipped.
 - 2026-11-02 — Все зависимости ставятся на Python 3.14, 164 теста зелёные. Тестовое окружение теперь совпадает с сервером (3.14.4): venv /private/tmp/claude-501/venv314 (создание: `uv venv --python 3.14 <путь>` + `uv pip install -r requirements.txt`). Старые venv (3.9, 3.13) удалены.
+- 2026-11-02 — Принята `7170e1160c4b` (mcp_server.py, mount /mcp в main.py, тесты, README; 2 раунда, approved). `shell` в MCP не зарегистрирован. 190 тестов зелёные на Python 3.14. Живой smoke-тест локально (uvicorn, фиктивный adb): /api/health 200, /api/devices без токена 401, с Bearer 200, /login 200, /mcp без токена 401. Этапы 1–3 по коду готовы, push в main.
 
 ## Дальше
-- Волна 3: mcp_server.py + тесты, раздел MCP в README.
 - Деплой этапа 2 на сервер (по согласию владельца): install.sh, .env, Caddy. Этап 0: Tailscale и телефоны.
 - Этап 2: auth.py, веб-панель, API routes, main.py, deploy-файлы. Этап 3: mcp_server.py, README.
 - Этап 0 с владельцем: ОС сервера, домен, Tailscale, подготовка телефонов (docs/phone-setup.md).
