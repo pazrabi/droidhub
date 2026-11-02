@@ -17,6 +17,7 @@
 - 2026-11-02 — Принята и слита локально `ae865ad8364a` (ветка pool/1ee9b0dbe39f: actions.py, cli.py, тесты; 2 раунда, approved). Все тесты локально: 59 passed. Остаётся `bf8d57bd94e0` (adb+manager); после неё — интеграционная проверка и один push в main.
 - 2026-11-02 — Принята `bf8d57bd94e0` (ветка pool/f04a997c2182: adb.py, manager.py, тесты; 3 раунда, approved). Все 3 модуля слиты, общий прогон: 94 passed, сигнатуры adb/manager совпадают с вызовами actions. Волна 1 (этап 1) готова, push в main.
 - 2026-11-02 — Волна 2 (этап 2) поставлена в пул (flash-high, review): `34221236efd9` auth.py; `5e9af5a1ba7e` routes.py+main.py; `d585dc44992c` веб-панель hub/web; `55c69ee603ab` deploy/ + docs/phone-setup.md + README. В CLAUDE.md добавлены контракты этапа 2 (запушены до постановки, коммит 2c040d3). Пока задачи идут, в main не пушить.
+- 2026-11-02 — Принята и слита локально `5e9af5a1ba7e` (routes.py, main.py, тесты; 1 раунд, approved). Всего 119 тестов зелёные. Ждём auth, web, deploy.
 
 ## Дальше
 - Волна 2 (этап 2): auth.py, API routes + main.py, веб-панель (HTML/JS), deploy-файлы, docs/phone-setup.md. Волна 3: mcp_server.py + README.
