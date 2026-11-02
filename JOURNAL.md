@@ -48,6 +48,7 @@
 - 2026-11-03 — Слиты локально `aab594922403` (POST /api/devices/{id}/power; 1 раунд) и `396857c6e904` (alerts.py, config, main; 2 раунда). 233 теста зелёные. alerts.py написан под long polling и callback-кнопки — НЕ годится для общего бота: после завершения `28e27607755f` и `bee7d2bea260` запушить main и поставить доработку (убрать _poll_loop/handle_update/callback, префикс [HUB_ALERT_TAG], URL-кнопка на HUB_PUBLIC_URL/device/<id>, поля alert_tag/public_url в Settings). До доработки на сервер alerts НЕ выкладывать (иначе polling сломает общий бот).
 - 2026-11-03 — Слита `28e27607755f` (actions: ensure_awake, power; 2 раунда). Все 4 задачи этапа 3.5 в main, 273 теста. Контракт alerts.py изменён в CLAUDE.md (только sendMessage, префикс, URL-кнопка) и поставлена доработка.
 - 2026-11-03 — Поставлена доработка оповещений под общий бот: `6df2d5f1342f` (убрать polling/callback, префикс [droidhub], URL-кнопка, поля alert_tag/public_url). main запушен (d0dbca0). После её приёмки: push, деплой на сервер (в .env уже есть токен, chat id, HUB_ALERT_TAG, HUB_PUBLIC_URL), проверка уведомлений. Деплой ДО приёмки запрещён (polling).
+- 2026-11-03 — Принята `6df2d5f1342f` (alerts: send-only, префикс, URL-кнопка; 1 раунд). 274 теста. В коде getUpdates/callback нет (проверено grep: только комментарии). Push main и деплой на сервер.
 
 ## Дальше
 - Этап 0 (с владельцем): установить adb и Tailscale на сервер (спросить), Tailscale на Mac и телефоны, подготовка телефонов по docs/phone-setup.md, прописать реальные IP в /opt/phone-hub/config/devices.yaml.
