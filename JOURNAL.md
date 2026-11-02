@@ -25,8 +25,10 @@
 - 2026-11-02 — С согласия владельца uv скачал Python 3.13.16; venv для тестов: /private/tmp/claude-501/venv313 (полный requirements, включая mcp). Тесты на 3.13: 164 passed, 0 skipped.
 - 2026-11-02 — Все зависимости ставятся на Python 3.14, 164 теста зелёные. Тестовое окружение теперь совпадает с сервером (3.14.4): venv /private/tmp/claude-501/venv314 (создание: `uv venv --python 3.14 <путь>` + `uv pip install -r requirements.txt`). Старые venv (3.9, 3.13) удалены.
 - 2026-11-02 — Принята `7170e1160c4b` (mcp_server.py, mount /mcp в main.py, тесты, README; 2 раунда, approved). `shell` в MCP не зарегистрирован. 190 тестов зелёные на Python 3.14. Живой smoke-тест локально (uvicorn, фиктивный adb): /api/health 200, /api/devices без токена 401, с Bearer 200, /login 200, /mcp без токена 401. Этапы 1–3 по коду готовы, push в main.
+- 2026-11-02 — ДЕПЛОЙ ЭТАПОВ 1–3 НА СЕРВЕР (по согласию владельца, после dry-run). Исходники залиты tar по ssh в /root/phone-hub-src (rsync с Mac зависает — не использовать). install.sh: пользователь hub, /opt/phone-hub, venv (py3.14), systemd phone-hub.service (enabled, active), в /etc/caddy/Caddyfile добавлен блок hub.193-41-86-92.sslip.io -> 127.0.0.1:8090 (бэкап /etc/caddy/Caddyfile.bak.20261102193925, validate прошёл). Секреты сгенерированы на сервере в /opt/phone-hub/.env (600, владелец hub); логин и пароль админа лежат в /root/hub-admin-login.txt (600) — в репозиторий и чат не попадают. Проверка снаружи: https://hub.193-41-86-92.sslip.io/api/health ok, /login 200, /mcp без токена 401; панель пула (https://193-41-86-92.sslip.io) 200, gemini-pool/caddy/phone-hub active; RAM занято ~620 МБ из 3,9 ГБ. НЕ установлены: adb, Tailscale (телефоны пока оффлайн). Токены MCP/API лежат только в .env на сервере.
 
 ## Дальше
-- Деплой этапа 2 на сервер (по согласию владельца): install.sh, .env, Caddy. Этап 0: Tailscale и телефоны.
+- Этап 0 (с владельцем): установить adb и Tailscale на сервер (спросить), Tailscale на Mac и телефоны, подготовка телефонов по docs/phone-setup.md, прописать реальные IP в /opt/phone-hub/config/devices.yaml.
+- Подключить MCP хаба к Claude (токен из /opt/phone-hub/.env).
 - Этап 2: auth.py, веб-панель, API routes, main.py, deploy-файлы. Этап 3: mcp_server.py, README.
 - Этап 0 с владельцем: ОС сервера, домен, Tailscale, подготовка телефонов (docs/phone-setup.md).
