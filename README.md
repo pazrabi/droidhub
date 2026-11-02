@@ -139,13 +139,44 @@ python -m pytest -q
 
 ---
 
-## Как подключить MCP позже (Этап 3)
+## Подключение MCP
 
-После включения этапа 3 Phone Hub будет предоставлять стандартный эндпоинт протокола **Model Context Protocol (MCP)**:  
-`https://hub.193-41-86-92.sslip.io/mcp`
+Phone Hub предоставляет сервер стандартного протокола **Model Context Protocol (MCP)** (FastMCP, streamable HTTP) для прямого управления смартфонами нейросетями (Claude Code, claude.ai, Claude Desktop, Gemini pool).
 
-### Подключение к Claude Desktop
-В файле конфигурации Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json` на macOS):
+### Авторизация
+Поддерживается два способа авторизации:
+1. **Заголовок Authorization**: `Authorization: Bearer <HUB_MCP_TOKEN>`
+2. **Секретный путь URL**: `https://<домен>/mcp/<HUB_MCP_TOKEN>` (удобно для клиентов и коннекторов, не поддерживающих кастомные HTTP-заголовки).
+
+Сравнение токенов производится за постоянное время через `hmac.compare_digest`.  
+> **Безопасность**: если переменная `HUB_MCP_TOKEN` в `.env` пустая или не задана, MCP-сервер полностью отключён (любой запрос возвращает `503 Service Unavailable`).
+
+### 1. Claude Code (CLI)
+Для подключения к Claude Code используйте официальную команду с параметром `--transport http`:
+
+**С заголовком Authorization:**
+```bash
+claude mcp add --transport http phone-hub https://hub.193-41-86-92.sslip.io/mcp -H "Authorization: Bearer <HUB_MCP_TOKEN>"
+```
+
+**С секретным путем в URL:**
+```bash
+claude mcp add --transport http phone-hub https://hub.193-41-86-92.sslip.io/mcp/<HUB_MCP_TOKEN>
+```
+
+Для локальной разработки:
+```bash
+claude mcp add --transport http phone-hub http://127.0.0.1:8090/mcp -H "Authorization: Bearer <HUB_MCP_TOKEN>"
+```
+
+### 2. Коннектор claude.ai (веб)
+В веб-версии [claude.ai](https://claude.ai) (в настройках Connectors / Custom MCP Server):
+- **Name**: `Phone Hub`
+- **URL**: `https://hub.193-41-86-92.sslip.io/mcp` (укажите заголовок `Authorization: Bearer <HUB_MCP_TOKEN>`)  
+  ИЛИ укажите секретный путь: `https://hub.193-41-86-92.sslip.io/mcp/<HUB_MCP_TOKEN>`
+
+### 3. Claude Desktop
+В файле `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
 ```json
 {
   "mcpServers": {
@@ -158,21 +189,36 @@ python -m pytest -q
   }
 }
 ```
+Или через секретный путь:
+```json
+{
+  "mcpServers": {
+    "phone-hub": {
+      "url": "https://hub.193-41-86-92.sslip.io/mcp/<HUB_MCP_TOKEN>"
+    }
+  }
+}
+```
 
-### Подключение к Claude Code / claude.ai
-Укажите URL эндпоинта `https://hub.193-41-86-92.sslip.io/mcp` и токен доступа из переменной `HUB_MCP_TOKEN`.
+### Доступные инструменты MCP
+Каждый инструмент принимает обязательный идентификатор устройства `device_id` (например, `"realme"`, `"redmi"`). Для надежной работы ИИ-агента рекомендуется сначала проанализировать экран (`ui_dump` или `screenshot`), а затем выполнять действия (все координаты указываются в пикселях экрана).
 
-### Доступные инструменты для ИИ
-- `list_devices()` — список доступных телефонов и их статус подключения.
-- `device_status(device_id)` — уровень заряда батареи, температура, состояние экрана.
-- `screenshot(device_id)` — снимок экрана в формате JPEG.
-- `ui_dump(device_id)` — детальное дерево элементов интерфейса (тексты, id, координаты центров для клика).
-- `tap(device_id, x, y)` / `tap_element(device_id, text, resource_id)` — клик по экрану или элементу.
-- `swipe(device_id, x1, y1, x2, y2, ms)` — свайп.
-- `type_text(device_id, text)` — ввод любого текста (включая русский язык).
-- `press_key(device_id, name)` — нажатие клавиш (`back`, `home`, `recents`, `power`, `enter`).
-- `open_app(device_id, package)` / `list_apps(device_id)` — запуск и список приложений.
+- `list_devices()` — список подключенных телефонов и их текущие статусы (онлайн, батарея, температура, экран).
+- `device_status(device_id)` — детальный статус устройства (заряд %, температура °C, включен ли экран).
+- `screenshot(device_id, max_width=720)` — снимок экрана устройства в формате JPEG (возвращает картинку).
+- `ui_dump(device_id)` — дамп дерева элементов интерфейса (тексты, resource_id, границы bounds и центры элементов в пикселях). Рекомендуется вызывать перед тапом.
+- `tap(device_id, x, y)` — нажатие по экрану в пиксельных координатах.
+- `tap_element(device_id, text=None, resource_id=None)` — поиск элемента по тексту или resource_id и нажатие на его центр.
+- `swipe(device_id, x1, y1, x2, y2, ms=300)` — свайп между точками в пикселях.
+- `type_text(device_id, text)` — ввод любого текста (латиница, кириллица, спецсимволы, эмодзи).
+- `press_key(device_id, key)` — нажатие системных клавиш (`back`, `home`, `recents`, `enter`, `power`, `volume_up`, `volume_down`).
+- `open_app(device_id, package)` — запуск приложения по пакету (например, `com.android.chrome`).
+- `list_apps(device_id)` — список установленных приложений.
 - `open_url(device_id, url)` — открытие ссылки в мобильном браузере.
+- `wait(device_id, seconds=1.0)` — пауза для ожидания прогрузки интерфейса или завершения анимаций.
+
+*Произвольное выполнение команд shell в MCP не регистрируется в целях безопасности.*  
+Все вызовы инструментов фиксируются в журнале аудита с пометкой `actor="mcp"`, а частота действий защищена общим лимитом `rate_limit_per_min`.
 
 ---
 

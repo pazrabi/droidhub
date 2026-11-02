@@ -162,3 +162,11 @@ def test_exception_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
     res_key = client.get("/trigger-key-error")
     assert res_key.status_code == 404
     assert "device_missing" in res_key.json()["detail"]
+
+
+def test_mcp_mounted_on_mcp_path() -> None:
+    """Контракт: MCP-сервер монтируется на путь /mcp."""
+    settings = Settings(db_path=":memory:", devices_file="")
+    app = create_app(settings)
+    route_paths = [getattr(r, "path", None) for r in app.routes]
+    assert "/mcp" in route_paths
