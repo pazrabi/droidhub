@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -28,7 +28,7 @@ except (ImportError, ModuleNotFoundError):
         )
 
 
-def get_user_from_request(request: Request) -> str | None:
+def get_user_from_request(request: Request) -> Optional[str]:
     """
     Проверяет наличие авторизованного пользователя в сессии через require_user
     (с поддержкой переопределения через app.dependency_overrides в тестах).
@@ -72,7 +72,7 @@ web_router = APIRouter()
 
 
 @web_router.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request, error: str | None = None) -> Response:
+async def login_page(request: Request, error: Optional[str] = None) -> Response:
     """Страница входа в панель Phone Hub."""
     user = get_user_from_request(request)
     if user:

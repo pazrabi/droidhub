@@ -12,27 +12,6 @@ import pytest
 
 TEST_ACTOR = "test-user"
 
-# Заглушки параллельных модулей hub.auth и hub.web.views
-if "hub.auth" not in sys.modules:
-    auth_mod = types.ModuleType("hub.auth")
-    auth_mod.auth_router = APIRouter()
-
-    async def require_api() -> str:
-        return TEST_ACTOR
-
-    auth_mod.require_api = require_api  # type: ignore
-    sys.modules["hub.auth"] = auth_mod
-else:
-    async def require_api() -> str:
-        return TEST_ACTOR
-
-    sys.modules["hub.auth"].require_api = require_api  # type: ignore
-
-if "hub.web.views" not in sys.modules:
-    web_mod = types.ModuleType("hub.web.views")
-    web_mod.web_router = APIRouter()
-    sys.modules["hub.web.views"] = web_mod
-
 from hub.api.routes import (
     api_router,
     clear_screen_size_cache,
@@ -68,6 +47,11 @@ def mock_manager() -> DeviceManager:
 @pytest.fixture
 def app(mock_manager: DeviceManager) -> FastAPI:
     test_app = FastAPI()
+
+    async def _fake_require_api() -> str:
+        return "test-user"
+
+    test_app.dependency_overrides[require_api] = _fake_require_api
     test_app.include_router(public_router)
     test_app.include_router(api_router)
     return test_app

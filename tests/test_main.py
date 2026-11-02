@@ -12,21 +12,6 @@ import pytest
 from starlette.middleware.sessions import SessionMiddleware
 
 # Заглушки параллельных модулей hub.auth и hub.web.views
-if "hub.auth" not in sys.modules:
-    auth_mod = types.ModuleType("hub.auth")
-    auth_mod.auth_router = APIRouter()
-
-    async def require_api() -> str:
-        return "test-user"
-
-    auth_mod.require_api = require_api  # type: ignore
-    sys.modules["hub.auth"] = auth_mod
-
-if "hub.web.views" not in sys.modules:
-    web_mod = types.ModuleType("hub.web.views")
-    web_mod.web_router = APIRouter()
-    sys.modules["hub.web.views"] = web_mod
-
 import hub.main as main_module
 from hub.config import DeviceConfig, Settings
 from hub.devices import actions

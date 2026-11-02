@@ -15,12 +15,7 @@ from hub.config import get_settings
 from hub.devices import actions
 from hub.devices.adb import AdbError, AdbTimeout, DeviceOffline, adb_shell
 
-# Контракт hub/auth.py: параллельная разработка
-try:
-    from hub.auth import require_api
-except (ImportError, ModuleNotFoundError):
-    async def require_api() -> str:
-        return "api"
+from hub.auth import require_api
 
 
 # --- Модели запросов ---

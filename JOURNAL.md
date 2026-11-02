@@ -19,8 +19,10 @@
 - 2026-11-02 — Волна 2 (этап 2) поставлена в пул (flash-high, review): `34221236efd9` auth.py; `5e9af5a1ba7e` routes.py+main.py; `d585dc44992c` веб-панель hub/web; `55c69ee603ab` deploy/ + docs/phone-setup.md + README. В CLAUDE.md добавлены контракты этапа 2 (запушены до постановки, коммит 2c040d3). Пока задачи идут, в main не пушить.
 - 2026-11-02 — Принята и слита локально `5e9af5a1ba7e` (routes.py, main.py, тесты; 1 раунд, approved). Всего 119 тестов зелёные. Ждём auth, web, deploy.
 - 2026-11-02 — Слита локально `d585dc44992c` (hub/web: views, шаблоны, JS/CSS, test_web; 1 раунд, approved). Сейчас test_web не собирается: (1) в test_main/test_routes заглушки sys.modules подменяют hub.auth и hub.web.views — убрать после прихода настоящего auth.py; (2) `str | None` в сигнатурах FastAPI падает на Python 3.9 (локальный Mac), на сервере 3.14 ок — привести к Optional[str]. Сделаю после приёмки auth.
+- 2026-11-02 — Приняты `34221236efd9` (auth.py, 2 раунда) и `55c69ee603ab` (deploy/, docs/phone-setup.md, README; 2 раунда). Интеграция моими правками: убраны sys.modules-заглушки из test_main/test_routes, в routes.py прямой импорт require_api, в test_routes dependency_overrides, views.py -> Optional[str] (совместимость с Python 3.9), 2 scrypt-теста пропускаются на Mac (нет hashlib.scrypt). Итог: 162 passed, 2 skipped. Этап 2 по коду готов, ещё не выложен на сервер. install.sh прочитан: делает бэкап Caddyfile, validate, не трогает .env и блок пула.
 
 ## Дальше
-- Волна 2 (этап 2): auth.py, API routes + main.py, веб-панель (HTML/JS), deploy-файлы, docs/phone-setup.md. Волна 3: mcp_server.py + README.
+- Волна 3: mcp_server.py + тесты, раздел MCP в README.
+- Деплой этапа 2 на сервер (по согласию владельца): install.sh, .env, Caddy. Этап 0: Tailscale и телефоны.
 - Этап 2: auth.py, веб-панель, API routes, main.py, deploy-файлы. Этап 3: mcp_server.py, README.
 - Этап 0 с владельцем: ОС сервера, домен, Tailscale, подготовка телефонов (docs/phone-setup.md).

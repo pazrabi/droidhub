@@ -33,6 +33,7 @@ from hub.auth import (
 # =====================================================================
 
 
+@pytest.mark.skipif(not hasattr(hashlib, "scrypt"), reason="нет hashlib.scrypt в этом Python")
 def test_hash_password_format_scrypt() -> None:
     pw = "super_secret_123"
     hashed = hash_password(pw, algo="scrypt")
@@ -105,6 +106,7 @@ def test_verify_password_pbkdf2_variants() -> None:
     assert verify_password(pw, hashed_raw) is True
 
 
+@pytest.mark.skipif(not hasattr(hashlib, "scrypt"), reason="нет hashlib.scrypt в этом Python")
 def test_verify_password_scrypt_raw_params() -> None:
     pw = "test_scrypt_raw"
     salt = "b" * 32
