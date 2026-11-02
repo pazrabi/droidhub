@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+
+{% block title %}{{ device.name if device else device_id }} — Phone Hub{% endblock %}
+
+{% block content %}
+<div class="device-control-page" data-device-id="{{ device_id }}">
+  <div class="device-header">
+    <div class="breadcrumbs">
+      <a href="/" class="back-link">← Все устройства</a>
+    </div>
+    <div class="device-title-wrap">
+      <h1 class="device-title">{{ device.name if device else device_id }}</h1>
+      <span class="device-id-badge">{{ device_id }}</span>
+    </div>
+  </div>
+
+  <div class="device-layout">
+    <!-- Left column: Screen & Hardware Navigation Buttons -->
+    <div class="screen-column">
+      <div class="screen-panel">
+        <div class="screen-toolbar">
+          <div class="screen-status-indicator">
+            <span class="status-dot" id="stream-status-dot"></span>
+            <span id="stream-status-text">Подключение...</span>
+          </div>
+          <div class="screen-controls">
+            <button id="btn-toggle-stream" class="btn btn-xs btn-outline">Пауза</button>
+            <button id="btn-refresh-screen" class="btn btn-xs btn-outline">↻ Кадр</button>
+          </div>
+        </div>
+
+        <div class="screen-viewport" id="screen-viewport">
+          <div class="screen-placeholder" id="screen-placeholder">
+            <div class="spinner"></div>
+            <span>Загрузка экрана...</span>
+          </div>
+          <img
+            id="screen-img"
+            class="screen-img"
+            alt="Экран устройства {{ device_id }}"
+            draggable="false"
+            style="display: none;"
+          >
+          <div class="tap-indicator" id="tap-indicator"></div>
+        </div>
+
+        <!-- Hardware navigation buttons: Back, Home, Recents, Power -->
+        <div class="hardware-nav-bar" id="hardware-nav">
+          <button id="btn-back" class="btn btn-nav" data-key="back" title="Назад">
+            <span class="nav-icon">◀</span>
+            <span class="nav-label">Назад</span>
+          </button>
+          <button id="btn-home" class="btn btn-nav" data-key="home" title="Домой">
+            <span class="nav-icon">●</span>
+            <span class="nav-label">Домой</span>
+          </button>
+          <button id="btn-recents" class="btn btn-nav" data-key="recents" title="Недавние">
+            <span class="nav-icon">■</span>
+            <span class="nav-label">Недавние</span>
+          </button>
+          <button id="btn-power" class="btn btn-nav btn-power" data-key="power" title="Питание">
+            <span class="nav-icon">⏻</span>
+            <span class="nav-label">Питание</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right column: Controls (Text Input, Quick actions, Apps list) -->
+    <div class="controls-column">
+      <!-- Text Input Card -->
+      <div class="control-card">
+        <h2 class="card-title">Ввод текста</h2>
+        <form id="text-form" class="text-input-form">
+          <div class="input-with-button">
+            <input
+              type="text"
+              id="text-input"
+              class="form-control"
+              placeholder="Текст на русском или английском..."
+              autocomplete="off"
+            >
+            <button type="submit" id="btn-send-text" class="btn btn-primary">
+              Отправить
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Quick Actions / Keys Card -->
+      <div class="control-card">
+        <h2 class="card-title">Быстрые действия</h2>
+        <div class="quick-keys-grid">
+          <button class="btn btn-sm btn-outline btn-quick-key" data-key="volume_up">Громкость +</button>
+          <button class="btn btn-sm btn-outline btn-quick-key" data-key="volume_down">Громкость -</button>
+          <button class="btn btn-sm btn-outline btn-quick-key" data-key="enter">Ввод (Enter)</button>
+        </div>
+      </div>
+
+      <!-- Apps List Card -->
+      <div class="control-card apps-card">
+        <div class="card-header-row">
+          <h2 class="card-title">Приложения</h2>
+          <button id="btn-refresh-apps" class="btn btn-xs btn-outline">↻ Обновить</button>
+        </div>
+        <div class="apps-search-wrap">
+          <input
+            type="text"
+            id="app-search"
+            class="form-control form-control-sm"
+            placeholder="Поиск по приложениям..."
+          >
+        </div>
+        <div id="apps-list" class="apps-list">
+          <div class="apps-loading">Загрузка приложений...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
