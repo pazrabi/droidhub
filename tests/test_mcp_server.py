@@ -37,7 +37,7 @@ def mock_device_manager():
 # --- 1. Проверка списка инструментов и отсутствия shell ---
 
 def test_tool_list_and_no_shell() -> None:
-    """Проверяет наличие всех 13 обязательных инструментов и отсутствие shell."""
+    """Проверяет наличие всех 15 обязательных инструментов и отсутствие shell."""
     server = mcp_mod.mcp_server
     assert server is not None
 
@@ -48,6 +48,8 @@ def test_tool_list_and_no_shell() -> None:
         "list_devices",
         "device_status",
         "screenshot",
+        "look",
+        "tap_index",
         "ui_dump",
         "tap",
         "tap_element",
@@ -64,7 +66,7 @@ def test_tool_list_and_no_shell() -> None:
 
 
 def test_tools_accept_device_id_and_have_good_descriptions() -> None:
-    """Каждый инструмент принимает device_id, описания содержат ui_dump/screenshot и пиксели."""
+    """Каждый инструмент принимает device_id, описания содержат RU/EN строки, ui_dump/screenshot/look и пиксели."""
     server = mcp_mod.mcp_server
     assert server is not None
 
@@ -77,12 +79,16 @@ def test_tools_accept_device_id_and_have_good_descriptions() -> None:
         desc = tool.description or ""
         assert len(desc) > 20, f"У инструмента '{name}' слишком короткое описание: {desc!r}"
 
+        # Проверяем наличие двух строк описания (RU и EN)
+        lines = [line.strip() for line in desc.strip().splitlines() if line.strip()]
+        assert len(lines) == 2, f"У инструмента '{name}' должно быть 2 строки описания (RU и EN): {desc!r}"
+
         # Для инструментов действий проверяем упоминание ui_dump/screenshot или пикселей
-        if name in ("tap", "swipe", "screenshot"):
+        if name in ("tap", "swipe", "screenshot", "look", "tap_index"):
             assert "пиксел" in desc.lower(), f"Описание '{name}' должно содержать указание на пиксели"
         if name in ("tap", "tap_element", "type_text"):
-            assert ("ui_dump" in desc) or ("screenshot" in desc), (
-                f"Описание '{name}' должно рекомендовать ui_dump или screenshot"
+            assert ("ui_dump" in desc) or ("screenshot" in desc) or ("look" in desc), (
+                f"Описание '{name}' должно рекомендовать ui_dump, look или screenshot"
             )
 
 
@@ -310,7 +316,8 @@ async def test_call_tap_action(mock_device_manager) -> None:
     """Вызов tap вызывает actions.tap с actor='mcp'."""
     with patch("hub.devices.actions.tap", new_callable=AsyncMock) as mock_tap:
         res = await mcp_mod.tap("realme", 150, 300)
-        assert res.get("ok") is True
+        assert isinstance(res, str)
+        assert "150" in res and "300" in res
         mock_tap.assert_called_once_with("realme", 150, 300, actor="mcp")
 
 
@@ -319,19 +326,25 @@ async def test_call_swipe_action(mock_device_manager) -> None:
     """Вызов swipe вызывает actions.swipe с actor='mcp'."""
     with patch("hub.devices.actions.swipe", new_callable=AsyncMock) as mock_swipe:
         res = await mcp_mod.swipe("realme", 100, 200, 100, 800, ms=400)
-        assert res.get("ok") is True
+        assert isinstance(res, str)
+        assert "выполнен" in res.lower()
         mock_swipe.assert_called_once_with("realme", 100, 200, 100, 800, ms=400, actor="mcp")
 
 
 @pytest.mark.asyncio
 async def test_call_screenshot_action(mock_device_manager) -> None:
-    """Вызов screenshot возвращает объект картинки и вызывает actions.screenshot с actor='mcp'."""
+    """Вызов screenshot возвращает объект картинки и вызывает actions.screenshot с actor='mcp' (max_width по умолчанию 540)."""
     fake_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIFfake"
     with patch("hub.devices.actions.screenshot", new_callable=AsyncMock, return_value=fake_jpeg) as mock_screen:
         img = await mcp_mod.screenshot("realme", max_width=640)
         mock_screen.assert_called_once_with("realme", max_width=640, actor="mcp")
         assert img is not None
         assert getattr(img, "data", None) == fake_jpeg
+
+    # Проверка дефолтного max_width=540
+    with patch("hub.devices.actions.screenshot", new_callable=AsyncMock, return_value=fake_jpeg) as mock_screen:
+        await mcp_mod.screenshot("realme")
+        mock_screen.assert_called_once_with("realme", max_width=540, actor="mcp")
 
 
 @pytest.mark.asyncio
@@ -350,7 +363,8 @@ async def test_call_tap_element_action(mock_device_manager) -> None:
     elem = {"text": "Войти", "center": [250, 400]}
     with patch("hub.devices.actions.tap_element", new_callable=AsyncMock, return_value=elem) as mock_te:
         res = await mcp_mod.tap_element("realme", text="Войти")
-        assert res == elem
+        assert isinstance(res, str)
+        assert "Войти" in res
         mock_te.assert_called_once_with("realme", text="Войти", resource_id=None, actor="mcp")
 
 
@@ -359,7 +373,8 @@ async def test_call_type_text_action(mock_device_manager) -> None:
     """Вызов type_text вызывает actions.type_text с actor='mcp'."""
     with patch("hub.devices.actions.type_text", new_callable=AsyncMock) as mock_type:
         res = await mcp_mod.type_text("realme", "Привет мир")
-        assert res.get("ok") is True
+        assert isinstance(res, str)
+        assert "Привет мир" in res
         mock_type.assert_called_once_with("realme", "Привет мир", actor="mcp")
 
 
@@ -368,7 +383,8 @@ async def test_call_press_key_action(mock_device_manager) -> None:
     """Вызов press_key вызывает actions.key с actor='mcp'."""
     with patch("hub.devices.actions.key", new_callable=AsyncMock) as mock_key:
         res = await mcp_mod.press_key("realme", "home")
-        assert res.get("ok") is True
+        assert isinstance(res, str)
+        assert "home" in res
         mock_key.assert_called_once_with("realme", "home", actor="mcp")
 
 
@@ -377,7 +393,8 @@ async def test_call_open_app_action(mock_device_manager) -> None:
     """Вызов open_app вызывает actions.open_app с actor='mcp'."""
     with patch("hub.devices.actions.open_app", new_callable=AsyncMock) as mock_app:
         res = await mcp_mod.open_app("realme", "com.android.chrome")
-        assert res.get("ok") is True
+        assert isinstance(res, str)
+        assert "com.android.chrome" in res
         mock_app.assert_called_once_with("realme", "com.android.chrome", actor="mcp")
 
 
@@ -396,7 +413,8 @@ async def test_call_open_url_action(mock_device_manager) -> None:
     """Вызов open_url вызывает actions.open_url с actor='mcp'."""
     with patch("hub.devices.actions.open_url", new_callable=AsyncMock) as mock_url:
         res = await mcp_mod.open_url("realme", "https://ya.ru")
-        assert res.get("ok") is True
+        assert isinstance(res, str)
+        assert "https://ya.ru" in res
         mock_url.assert_called_once_with("realme", "https://ya.ru", actor="mcp")
 
 
@@ -453,3 +471,148 @@ async def test_server_call_tool_interface(mock_device_manager) -> None:
         call_res = await server.call_tool("tap", {"device_id": "realme", "x": 50, "y": 75})
         mock_tap.assert_called_once_with("realme", 50, 75, actor="mcp")
         assert not call_res.is_error
+
+
+# --- 4. Проверка look и tap_index ---
+
+@pytest.mark.asyncio
+async def test_look_formatting_filtering(mock_device_manager) -> None:
+    """Фильтрация: исключаются пустые неинтерактивные элементы, остаются только значимые."""
+    raw_data = [
+        {"class": "android.view.View", "bounds": [0, 0, 100, 100], "center": [50, 50]},  # не значимый
+        {"class": "android.widget.TextView", "text": "Заголовок", "center": [50, 100]},  # значимый (есть text)
+        {"class": "android.widget.ImageView", "content_desc": "Иконка", "center": [50, 150]},  # значимый (есть content_desc)
+        {"class": "android.view.View", "clickable": True, "center": [50, 200]},  # значимый (clickable)
+        {"class": "android.widget.ScrollView", "scrollable": True, "center": [50, 250]},  # значимый (scrollable)
+        {"class": "android.widget.CheckBox", "checkable": True, "center": [50, 300]},  # значимый (checkable)
+        {"class": "android.widget.EditText", "editable": True, "center": [50, 350]},  # значимый (editable)
+    ]
+    with patch("hub.devices.actions.ui_dump", new_callable=AsyncMock, return_value=raw_data):
+        res = await mcp_mod.look("realme")
+        assert "Заголовок" in res
+        assert "Иконка" in res
+        assert "(кликабельно)" in res
+        assert "(прокрутка)" in res
+        assert "(выбор)" in res
+        assert "(ввод)" in res
+        lines = [line for line in res.splitlines() if line.startswith("[")]
+        assert len(lines) == 6
+
+
+@pytest.mark.asyncio
+async def test_look_formatting_numbering_and_order(mock_device_manager) -> None:
+    """Сортировка сверху вниз (по Y) и сквозная нумерация [1], [2], [3]... плюс заголовок с пакетом/активити."""
+    raw_data = [
+        {"package": "com.android.settings", "activity": ".SettingsActivity", "class": "Button", "text": "Низ", "center": [100, 500], "clickable": True},
+        {"class": "TextView", "text": "Верх", "center": [100, 50]},
+        {"class": "Button", "text": "Середина", "center": [100, 250], "clickable": True},
+    ]
+    with patch("hub.devices.actions.ui_dump", new_callable=AsyncMock, return_value=raw_data):
+        res = await mcp_mod.look("realme")
+        lines = res.splitlines()
+        # Заголовок
+        assert lines[0] == "Экран: com.android.settings / .SettingsActivity"
+        # Порядок: Верх (Y=50), Середина (Y=250), Низ (Y=500)
+        item_lines = [l for l in lines if l.startswith("[")]
+        assert len(item_lines) == 3
+        assert item_lines[0].startswith("[1] Текст «Верх»")
+        assert "центр=(100,50)" in item_lines[0]
+        assert item_lines[1].startswith("[2] Кнопка «Середина» (кликабельно)")
+        assert "центр=(100,250)" in item_lines[1]
+        assert item_lines[2].startswith("[3] Кнопка «Низ» (кликабельно)")
+        assert "центр=(100,500)" in item_lines[2]
+
+
+@pytest.mark.asyncio
+async def test_look_formatting_truncation(mock_device_manager) -> None:
+    """Длинный текст обрезается до 80 символов."""
+    long_text = "А" * 120
+    raw_data = [{"class": "TextView", "text": long_text, "center": [100, 100]}]
+    with patch("hub.devices.actions.ui_dump", new_callable=AsyncMock, return_value=raw_data):
+        res = await mcp_mod.look("realme")
+        expected_part = "«" + ("А" * 80) + "»"
+        assert expected_part in res
+        assert ("А" * 81) not in res
+
+
+@pytest.mark.asyncio
+async def test_look_formatting_limit(mock_device_manager) -> None:
+    """Лимит не больше 120 элементов с пометкой (показано 120 из Y)."""
+    raw_data = [
+        {"class": "Button", "text": f"Кнопка {i}", "clickable": True, "center": [10, i * 10]}
+        for i in range(1, 141)  # 140 элементов
+    ]
+    with patch("hub.devices.actions.ui_dump", new_callable=AsyncMock, return_value=raw_data):
+        res = await mcp_mod.look("realme")
+        item_lines = [l for l in res.splitlines() if l.startswith("[")]
+        assert len(item_lines) == 120
+        assert "[120]" in item_lines[-1]
+        assert "[121]" not in res
+        assert "(показано 120 из 140)" in res
+
+
+@pytest.mark.asyncio
+async def test_look_deduplication(mock_device_manager) -> None:
+    """Удаление дубликатов элементов."""
+    raw_data = [
+        {"class": "Button", "text": "Войти", "clickable": True, "center": [100, 200]},
+        {"class": "Button", "text": "Войти", "clickable": True, "center": [100, 200]},  # полный дубликат
+        {"class": "FrameLayout", "text": "", "clickable": True, "center": [100, 200]},  # пустой контейнер на том же центре
+    ]
+    with patch("hub.devices.actions.ui_dump", new_callable=AsyncMock, return_value=raw_data):
+        res = await mcp_mod.look("realme")
+        item_lines = [l for l in res.splitlines() if l.startswith("[")]
+        assert len(item_lines) == 1
+        assert item_lines[0].startswith("[1] Кнопка «Войти»")
+
+
+@pytest.mark.asyncio
+async def test_tap_index_success(mock_device_manager) -> None:
+    """Успешный tap_index по индексу из последнего look."""
+    raw_data = [
+        {"class": "Button", "text": "Первая", "clickable": True, "center": [120, 240]},
+        {"class": "Button", "text": "Вторая", "clickable": True, "center": [300, 600]},
+    ]
+    with patch("hub.devices.actions.ui_dump", new_callable=AsyncMock, return_value=raw_data):
+        await mcp_mod.look("realme")
+
+    with patch("hub.devices.actions.tap", new_callable=AsyncMock) as mock_tap:
+        res = await mcp_mod.tap_index("realme", 2)
+        assert isinstance(res, str)
+        assert "[2]" in res
+        assert "300" in res and "600" in res
+        mock_tap.assert_called_once_with("realme", 300, 600, actor="mcp")
+
+
+@pytest.mark.asyncio
+async def test_tap_index_no_look(mock_device_manager) -> None:
+    """tap_index без предварительного вызова look возвращает понятную ошибку."""
+    mcp_mod._look_cache.clear()
+    with pytest.raises(ValueError, match="(?i)сначала вызови look"):
+        await mcp_mod.tap_index("realme", 1)
+
+
+@pytest.mark.asyncio
+async def test_tap_index_expired(mock_device_manager) -> None:
+    """tap_index с устаревшим (>120 с) look возвращает ошибку 'сначала вызови look'."""
+    raw_data = [{"class": "Button", "text": "OK", "clickable": True, "center": [100, 100]}]
+    with patch("hub.devices.actions.ui_dump", new_callable=AsyncMock, return_value=raw_data):
+        await mcp_mod.look("realme")
+
+    # Искусственно состариваем запись в кеше на 130 секунд
+    mcp_mod._look_cache["realme"].timestamp -= 130.0
+
+    with pytest.raises(ValueError, match="(?i)сначала вызови look"):
+        await mcp_mod.tap_index("realme", 1)
+
+
+@pytest.mark.asyncio
+async def test_tap_index_invalid_index(mock_device_manager) -> None:
+    """tap_index с несуществующим индексом возвращает ошибку 'сначала вызови look'."""
+    raw_data = [{"class": "Button", "text": "OK", "clickable": True, "center": [100, 100]}]
+    with patch("hub.devices.actions.ui_dump", new_callable=AsyncMock, return_value=raw_data):
+        await mcp_mod.look("realme")
+
+    with pytest.raises(ValueError, match="(?i)сначала вызови look"):
+        await mcp_mod.tap_index("realme", 999)
+
