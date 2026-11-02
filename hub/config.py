@@ -41,6 +41,12 @@ class Settings:
     full_charge_hours: float = 6.0
     offline_alert_min: float = 10.0
     alert_cooldown_min: float = 30.0
+    alert_tag: str = "droidhub"
+    public_url: str = ""
+
+    def __post_init__(self) -> None:
+        if self.public_url:
+            self.public_url = self.public_url.strip().rstrip("/")
 
 
 def load_devices(path: str | Path = "config/devices.yaml") -> list[DeviceConfig]:
@@ -167,6 +173,8 @@ def get_settings(env_file: str | Path | None = None) -> Settings:
     full_charge_hours = parse_float("HUB_FULL_CHARGE_HOURS", 6.0)
     offline_alert_min = parse_float("HUB_OFFLINE_ALERT_MIN", 10.0)
     alert_cooldown_min = parse_float("HUB_ALERT_COOLDOWN_MIN", 30.0)
+    alert_tag = get_val("HUB_ALERT_TAG", "droidhub").strip() or "droidhub"
+    public_url = get_val("HUB_PUBLIC_URL", "").strip().rstrip("/")
 
     return Settings(
         devices_file=get_val("HUB_DEVICES_FILE", "config/devices.yaml"),
@@ -187,6 +195,8 @@ def get_settings(env_file: str | Path | None = None) -> Settings:
         full_charge_hours=full_charge_hours,
         offline_alert_min=offline_alert_min,
         alert_cooldown_min=alert_cooldown_min,
+        alert_tag=alert_tag,
+        public_url=public_url,
     )
 
 

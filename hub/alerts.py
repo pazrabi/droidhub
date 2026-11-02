@@ -58,9 +58,8 @@ class TelegramNotifier:
     Уведомитель в Telegram:
     - отправка сообщений через httpx к api.telegram.org (токен нигде не логируется)
     - при пустом токене работает в режиме только логирования в лог
-    - long-polling getUpdates для обработки нажатий inline-кнопок
-    - подтверждение при нажатии off:<device_id> («Выключить? Да/Нет»)
-    - игнорирование чужих chat_id
+    - хаб только отправляет сообщения (sendMessage) с префиксом [<alert_tag>]
+    - никогда не вызывает getUpdates и не обрабатывает callback_query
     """
 
     def __init__(
@@ -70,6 +69,7 @@ class TelegramNotifier:
         manager: DeviceManager | None = None,
         client: httpx.AsyncClient | None = None,
         poll_timeout: float = 20.0,
+        alert_tag: str = "droidhub",
     ) -> None:
         self.token = str(token).strip() if token else ""
         if self.token:
@@ -77,11 +77,9 @@ class TelegramNotifier:
         self.chat_id = str(chat_id).strip() if chat_id else ""
         self.manager = manager
         self.poll_timeout = poll_timeout
+        self.alert_tag = str(alert_tag).strip() if alert_tag else "droidhub"
         self._client = client
         self._own_client = client is None
-        self._running = False
-        self._poll_task: asyncio.Task | None = None
-        self._offset: int = 0
 
     def __repr__(self) -> str:
         return f"TelegramNotifier(chat_id={self.chat_id!r}, token='[REDACTED]')"
@@ -99,8 +97,14 @@ class TelegramNotifier:
     ) -> bool:
         """
         Отправляет текстовое сообщение с опциональными inline-кнопками.
+        Все отправляемые сообщения получают префикс [<alert_tag>].
         Если токен пуст — пишет только в лог.
         """
+        if self.alert_tag:
+            prefix = f"[{self.alert_tag}] "
+            if not text.startswith(f"[{self.alert_tag}]"):
+                text = f"{prefix}{text}"
+
         if not self.token:
             logger.info("Telegram notification [token empty, log only]: %s (buttons=%s)", text, buttons)
             return True
@@ -132,160 +136,12 @@ class TelegramNotifier:
             logger.warning("Telegram sendMessage error: %s", type(exc).__name__)
             return False
 
-    async def answer_callback(self, callback_query_id: str, text: str | None = None) -> bool:
-        """Подтверждает callback_query для Telegram."""
-        if not self.token or not callback_query_id:
-            return True
-
-        payload: dict[str, Any] = {"callback_query_id": callback_query_id}
-        if text:
-            payload["text"] = text
-
-        url = f"https://api.telegram.org/bot{self.token}/answerCallbackQuery"
-        try:
-            client = await self._get_client()
-            await client.post(url, json=payload)
-            return True
-        except Exception as exc:
-            logger.warning("Telegram answerCallbackQuery error: %s", type(exc).__name__)
-            return False
-
-    async def handle_update(self, update: dict[str, Any]) -> None:
-        """Обрабатывает одно входящее обновление Telegram."""
-        cb = update.get("callback_query")
-        if cb is not None:
-            await self._handle_callback_query(cb)
-            return
-
-        msg = update.get("message")
-        if msg is not None:
-            chat = msg.get("chat") or {}
-            chat_id = str(chat.get("id", ""))
-            if self.chat_id and chat_id != str(self.chat_id):
-                logger.debug("Ignoring message from unexpected chat_id: %s", chat_id)
-                return
-
-    async def _handle_callback_query(self, cb: dict[str, Any]) -> None:
-        """Обработка нажатия inline-кнопки с проверкой chat_id и подтверждением."""
-        cb_id = str(cb.get("id", ""))
-        data = str(cb.get("data", "")).strip()
-        msg = cb.get("message") or {}
-        chat = msg.get("chat") or {}
-        chat_id = str(chat.get("id", ""))
-        user_id = str(cb.get("from", {}).get("id", ""))
-
-        # Игнорировать чужие chat_id
-        if self.chat_id:
-            expected = str(self.chat_id)
-            if chat_id != expected and user_id != expected:
-                logger.warning(
-                    "Ignoring callback_query from unauthorized chat/user: %s / %s (expected %s)",
-                    chat_id,
-                    user_id,
-                    expected,
-                )
-                return
-        else:
-            logger.warning("Ignoring callback_query because telegram_chat_id is not configured")
-            return
-
-        if data.startswith("off:"):
-            device_id = data.split("off:", 1)[1].strip()
-            await self.answer_callback(cb_id)
-            dev_name = device_id
-            if self.manager is not None:
-                try:
-                    dev_name = self.manager.get(device_id).name
-                except Exception:
-                    pass
-
-            confirm_text = f"Выключить {dev_name}? Да/Нет"
-            buttons = [
-                [
-                    {"text": "Да", "callback_data": f"confirm_off:{device_id}"},
-                    {"text": "Нет", "callback_data": f"cancel_off:{device_id}"},
-                ]
-            ]
-            await self.send(confirm_text, buttons=buttons)
-
-        elif any(data.startswith(p) for p in ("confirm_off:", "confirm:off:", "yes_off:", "yes:off:")):
-            device_id = ""
-            for p in ("confirm_off:", "confirm:off:", "yes_off:", "yes:off:"):
-                if data.startswith(p):
-                    device_id = data[len(p):].strip()
-                    break
-
-            await self.answer_callback(cb_id, text="Выключение...")
-            dev_name = device_id
-            if self.manager is not None:
-                try:
-                    dev_name = self.manager.get(device_id).name
-                except Exception:
-                    pass
-
-            try:
-                await actions.power(device_id, "shutdown", actor="telegram")
-                await self.send(f"Устройство {dev_name} выключается")
-            except Exception as exc:
-                logger.error("Failed to shutdown device %s via telegram: %s", device_id, exc)
-                await self.send(f"Ошибка выключения {dev_name}: {exc}")
-
-        elif any(data.startswith(p) for p in ("cancel_off:", "cancel:off:", "no_off:", "no:off:")):
-            await self.answer_callback(cb_id, text="Отменено")
-            await self.send("Выключение отменено")
-
-        else:
-            logger.warning("Unknown or outdated callback_query data: %s", data)
-            await self.answer_callback(cb_id)
-
-    async def _poll_loop(self) -> None:
-        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
-        while self._running:
-            try:
-                client = await self._get_client()
-                resp = await client.get(
-                    url,
-                    params={"offset": self._offset, "timeout": int(self.poll_timeout)},
-                    timeout=self.poll_timeout + 10.0,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    updates = data.get("result", [])
-                    if isinstance(updates, list):
-                        for update in updates:
-                            upd_id = update.get("update_id")
-                            if upd_id is not None:
-                                self._offset = max(self._offset, int(upd_id) + 1)
-                            await self.handle_update(update)
-                else:
-                    logger.warning("Telegram getUpdates returned HTTP %s", resp.status_code)
-                    await asyncio.sleep(2.0)
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.warning("Telegram getUpdates error: %s", type(exc).__name__)
-                try:
-                    await asyncio.sleep(2.0)
-                except asyncio.CancelledError:
-                    break
-
     async def start(self) -> None:
-        if self._running:
-            return
-        self._running = True
-        if self.token:
-            self._poll_task = asyncio.create_task(self._poll_loop())
+        """Совместимый метод: long polling удалён, никаких фоновых задач не запускается."""
+        pass
 
     async def stop(self) -> None:
-        self._running = False
-        if self._poll_task is not None:
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
-            self._poll_task = None
-
+        """Совместимый метод: освобождает собственный HTTP-клиент."""
         if self._own_client and self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -295,11 +151,13 @@ class AlertMonitor:
     """
     Монитор безопасности устройств:
     - предупреждение при температуре >= temp_warn_c
-    - тревога с inline-кнопкой «Выключить <имя>» при температуре >= temp_alert_c
+    - тревога при температуре >= temp_alert_c с inline-кнопкой «Открыть панель» (url=<public_url>/device/<id>)
     - авто-выключение при температуре >= temp_shutdown_c (если > 0)
+    - фраза «Зарядка не остановлена...» при тревоге и автовыключении
     - напоминание при заряде 100% дольше full_charge_hours
     - оповещение о выходе в оффлайн дольше offline_alert_min и оповещение «снова онлайн» при возврате
     - кулдаун alert_cooldown_min на каждое правило и устройство, температурные тревоги не молчат при росте на >= 2 °C
+    - префикс [<alert_tag>] во всех отправляемых сообщениях
     """
 
     def __init__(
@@ -320,6 +178,7 @@ class AlertMonitor:
                 token=settings.telegram_token,
                 chat_id=settings.telegram_chat_id,
                 manager=manager,
+                alert_tag=settings.alert_tag,
             )
         self.interval = interval
         self._running = False
@@ -330,6 +189,14 @@ class AlertMonitor:
         self._offline_since: dict[str, float] = {}
         self._offline_alerted: set[str] = set()
         self._full_charge_since: dict[str, float] = {}
+
+    def _format_msg(self, text: str) -> str:
+        tag = self.settings.alert_tag.strip() if self.settings.alert_tag else ""
+        if tag:
+            prefix = f"[{tag}] "
+            if not text.startswith(f"[{tag}]"):
+                return f"{prefix}{text}"
+        return text
 
     def _can_alert(
         self,
@@ -386,14 +253,16 @@ class AlertMonitor:
             offline_duration_min = (now - self._offline_since[dev_id]) / 60.0
             if offline_duration_min >= self.settings.offline_alert_min:
                 if self._can_alert(dev_id, "offline", now=now):
-                    msg = f"Устройство {dev_name} оффлайн более {self.settings.offline_alert_min:.0f} мин"
+                    msg = self._format_msg(
+                        f"Устройство {dev_name} оффлайн более {self.settings.offline_alert_min:.0f} мин"
+                    )
                     await self.notifier.send(msg)
                     self._record_alert(dev_id, "offline", now=now)
                     self._offline_alerted.add(dev_id)
             return
         else:
             if dev_id in self._offline_alerted:
-                msg = f"Устройство {dev_name} снова онлайн"
+                msg = self._format_msg(f"Устройство {dev_name} снова онлайн")
                 await self.notifier.send(msg)
                 self._offline_alerted.discard(dev_id)
             self._offline_since.pop(dev_id, None)
@@ -406,7 +275,7 @@ class AlertMonitor:
                 duration_hours = (now - self._full_charge_since[dev_id]) / 3600.0
                 if duration_hours >= self.settings.full_charge_hours:
                     if self._can_alert(dev_id, "full_charge", now=now):
-                        msg = f"Устройство {dev_name}: заряд держится на 100%"
+                        msg = self._format_msg(f"Устройство {dev_name}: заряд держится на 100%")
                         await self.notifier.send(msg)
                         self._record_alert(dev_id, "full_charge", now=now)
             else:
@@ -421,6 +290,11 @@ class AlertMonitor:
             is_alert = (temp >= self.settings.temp_alert_c)
             is_warn = (temp >= self.settings.temp_warn_c)
 
+            charging_warning = (
+                "Зарядка не остановлена: при подключённом кабеле батарея продолжает заряжаться, "
+                "отключи питание физически"
+            )
+
             if is_shutdown:
                 if self._can_alert(dev_id, "temp_shutdown", temp=temp, now=now):
                     shutdown_err = None
@@ -431,20 +305,32 @@ class AlertMonitor:
                         shutdown_err = exc
 
                     if shutdown_err:
-                        msg = f"Критический перегрев {dev_name}: {temp:.1f} °C! Сбой авто-выключения: {shutdown_err}"
+                        body = (
+                            f"Критический перегрев {dev_name}: {temp:.1f} °C! "
+                            f"Сбой авто-выключения: {shutdown_err}. {charging_warning}"
+                        )
                     else:
-                        msg = f"Критический перегрев {dev_name}: {temp:.1f} °C. Устройство автоматически выключается!"
+                        body = (
+                            f"Критический перегрев {dev_name}: {temp:.1f} °C. "
+                            f"Устройство автоматически выключается! {charging_warning}"
+                        )
+                    msg = self._format_msg(body)
                     await self.notifier.send(msg)
                     self._record_alert(dev_id, "temp_shutdown", now=now, temp=temp)
             elif is_alert:
                 if self._can_alert(dev_id, "temp_alert", temp=temp, now=now):
-                    msg = f"Тревога: перегрев {dev_name}: {temp:.1f} °C"
-                    buttons = [{"text": f"Выключить {dev_name}", "callback_data": f"off:{dev_id}"}]
+                    body = f"Тревога: перегрев {dev_name}: {temp:.1f} °C. {charging_warning}"
+                    msg = self._format_msg(body)
+                    buttons = None
+                    if self.settings.public_url and self.settings.public_url.strip():
+                        base_url = self.settings.public_url.strip().rstrip("/")
+                        buttons = [{"text": "Открыть панель", "url": f"{base_url}/device/{dev_id}"}]
                     await self.notifier.send(msg, buttons=buttons)
                     self._record_alert(dev_id, "temp_alert", now=now, temp=temp)
             elif is_warn:
                 if self._can_alert(dev_id, "temp_warn", temp=temp, now=now):
-                    msg = f"Предупреждение: нагрев {dev_name}: {temp:.1f} °C"
+                    body = f"Предупреждение: нагрев {dev_name}: {temp:.1f} °C"
+                    msg = self._format_msg(body)
                     await self.notifier.send(msg)
                     self._record_alert(dev_id, "temp_warn", now=now, temp=temp)
 
