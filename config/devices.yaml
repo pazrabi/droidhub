@@ -1,0 +1,3 @@
+devices:
+  - {id: realme, name: Realme C21Y, host: 100.64.0.1, port: 5555}
+  - {id: redmi, name: Redmi Note 11, host: 100.64.0.2, port: 5555}
