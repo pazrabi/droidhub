@@ -62,9 +62,51 @@ KEY_CODES: dict[str, str] = {
 
 _SHELL_UNSAFE_CHARS = set(';&|`$"\'()<>\\!*?#~=\n\r\t')
 
+ADB_KEYBOARD_PACKAGE = "com.android.adbkeyboard"
+ADB_KEYBOARD_IME = "com.android.adbkeyboard/.AdbIME"
+_IME_SWITCH_DELAY: float = 0.5
+
 # Блокировки и задачи для скриншотов по устройствам
 _screenshot_locks: dict[str, asyncio.Lock] = {}
 _screenshot_inflight: dict[str, asyncio.Task[bytes]] = {}
+
+# Блокировки для ввода текста (переключение IME) по устройствам
+_type_text_locks: dict[str, asyncio.Lock] = {}
+_ime_locks = _type_text_locks
+
+
+def _get_type_text_lock(device_id: str) -> asyncio.Lock:
+    """Возвращает персональный asyncio.Lock для синхронизации переключения клавиатуры и ввода текста."""
+    if device_id not in _type_text_locks:
+        _type_text_locks[device_id] = asyncio.Lock()
+    return _type_text_locks[device_id]
+
+
+def _split_text_for_adb_b64(text: str, max_b64_len: int = 800) -> list[str]:
+    """
+    Разбивает текст на части так, чтобы base64-представление каждой части
+    было не больше max_b64_len символов и не разрывало многобайтовые UTF-8 символы.
+    """
+    if not text:
+        return []
+    max_bytes = (max_b64_len // 4) * 3
+    chunks: list[str] = []
+    current_chars: list[str] = []
+    current_bytes = 0
+
+    for ch in text:
+        ch_bytes = len(ch.encode("utf-8"))
+        if current_bytes + ch_bytes > max_bytes and current_chars:
+            chunks.append("".join(current_chars))
+            current_chars = []
+            current_bytes = 0
+        current_chars.append(ch)
+        current_bytes += ch_bytes
+
+    if current_chars:
+        chunks.append("".join(current_chars))
+
+    return chunks
 
 
 def _get_screenshot_lock(device_id: str) -> asyncio.Lock:
@@ -621,7 +663,7 @@ async def long_press(
 
 
 async def type_text(device_id: str, text: str, *, actor: str = "system") -> None:
-    """Вводит текст: латиница через input text, кириллица/эмодзи/спецсимволы через ADBKeyBoard broadcast ADB_INPUT_B64."""
+    """Вводит текст: латиница через input text, кириллица/эмодзи через ADBKeyBoard broadcast ADB_INPUT_B64."""
     params = {"text": text}
 
     async def _action() -> None:
@@ -630,16 +672,34 @@ async def type_text(device_id: str, text: str, *, actor: str = "system") -> None
         if adb_shell is None:
             raise RuntimeError("Функция adb_shell не доступна")
 
-        if text:
-            # Если текст содержит не-ASCII символы (кириллица, эмодзи) или спецсимволы shell (&, $, кавычки и т.д.),
-            # направляем ввод через ADBKeyBoard broadcast ADB_INPUT_B64 (base64 полностью безопасен к инъекциям).
-            is_safe_ascii = text.isascii() and not any(c in _SHELL_UNSAFE_CHARS for c in text)
-            if is_safe_ascii:
-                escaped = text.replace(" ", "%s")
-                await adb_shell(serial, f"input text {shlex.quote(escaped)}")
-            else:
-                b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
-                await adb_shell(serial, f"am broadcast -a ADB_INPUT_B64 --es msg '{b64}'")
+        if not text:
+            return
+
+        # Чисто ASCII-текст по-прежнему отправляем через input text без переключения IME
+        if text.isascii():
+            escaped = text.replace(" ", "%s")
+            await adb_shell(serial, f"input text {shlex.quote(escaped)}")
+            return
+
+        # Для текста с не-ASCII символами: блокировка устройства, проверка ADBKeyBoard и временное переключение IME
+        lock = _get_type_text_lock(device_id)
+        async with lock:
+            pm_out = await adb_shell(serial, f"pm list packages {ADB_KEYBOARD_PACKAGE}")
+            if ADB_KEYBOARD_PACKAGE not in (pm_out or ""):
+                raise RuntimeError("На телефоне не установлена клавиатура ADBKeyBoard")
+
+            prev_ime = (await adb_shell(serial, "settings get secure default_input_method")).strip()
+            try:
+                await adb_shell(serial, f"ime enable {ADB_KEYBOARD_IME}")
+                await adb_shell(serial, f"ime set {ADB_KEYBOARD_IME}")
+                if _IME_SWITCH_DELAY > 0:
+                    await asyncio.sleep(_IME_SWITCH_DELAY)
+                for chunk in _split_text_for_adb_b64(text):
+                    b64 = base64.b64encode(chunk.encode("utf-8")).decode("ascii")
+                    await adb_shell(serial, f"am broadcast -a ADB_INPUT_B64 --es msg '{b64}'")
+            finally:
+                if prev_ime and prev_ime != "null" and prev_ime != ADB_KEYBOARD_IME:
+                    await adb_shell(serial, f"ime set {prev_ime}")
 
     await _execute_action(device_id, "type_text", params, _action, actor=actor)
 
