@@ -7,6 +7,7 @@ from io import BytesIO
 from pathlib import Path
 import shlex
 import sys
+import time
 import types
 from typing import Any
 import xml.etree.ElementTree as ET
@@ -557,6 +558,8 @@ async def test_key_known_keys(monkeypatch: pytest.MonkeyPatch, setup_actions: Mo
         ("Home", "KEYCODE_HOME"),  # Регистронезависимость
     ]:
         calls.clear()
+        import time
+        actions._screen_cache["realme"] = (True, time.monotonic())
         await actions.key("realme", k)
         assert calls == [f"input keyevent {expected_code}"]
 
@@ -1972,6 +1975,253 @@ async def test_auto_ensure_awake_in_screenshot(monkeypatch: pytest.MonkeyPatch):
     wakeup_idx = next(i for i, c in enumerate(calls) if "KEYCODE_WAKEUP" in c)
     pull_idx = next(i for i, c in enumerate(calls) if "pull" in c)
     assert wakeup_idx < pull_idx
+
+
+# --- ТЕСТЫ ИСПРАВЛЕНИЙ ЗАМЕЧАНИЙ РЕВЬЮВЕРА ---
+
+@pytest.mark.asyncio
+async def test_action_audit_on_ensure_awake_failure(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    actions._screen_cache.clear()
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        if "dumpsys power" in cmd:
+            raise actions.AdbTimeout("Превышен таймаут adb dumpsys power")
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    with pytest.raises(actions.AdbTimeout):
+        await actions.tap("realme", 100, 200)
+
+    # Ошибка должна быть перехвачена _execute_action и записана в аудит с ok=False
+    tap_entries = [e for e in setup_actions.entries if e["action"] == "tap"]
+    assert len(tap_entries) == 1
+    assert tap_entries[0]["ok"] is False
+    assert "Превышен таймаут" in tap_entries[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_action_reconnect_on_ensure_awake_offline(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    actions._screen_cache.clear()
+    connect_calls: list[tuple[str, int]] = []
+    fail_first = True
+
+    async def mock_connect(host: str, port: int) -> bool:
+        connect_calls.append((host, port))
+        return True
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        nonlocal fail_first
+        if "dumpsys power" in cmd:
+            if fail_first:
+                fail_first = False
+                raise actions.DeviceOffline("device offline")
+            return "mWakefulness=Awake\nDisplay Power: state=ON\n"
+        return ""
+
+    monkeypatch.setattr(actions, "connect", mock_connect)
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    await actions.tap("realme", 100, 200)
+
+    assert len(connect_calls) >= 1
+    tap_entries = [e for e in setup_actions.entries if e["action"] == "tap"]
+    assert len(tap_entries) == 1
+    assert tap_entries[0]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_screenshot_audit_on_ensure_awake_failure(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    actions._screen_cache.clear()
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        if "dumpsys power" in cmd:
+            raise actions.AdbTimeout("Превышен таймаут при проверке экрана")
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    with pytest.raises(actions.AdbTimeout):
+        await actions.screenshot("realme")
+
+    screenshot_entries = [e for e in setup_actions.entries if e["action"] == "screenshot"]
+    assert len(screenshot_entries) == 1
+    assert screenshot_entries[0]["ok"] is False
+    assert "Превышен таймаут" in screenshot_entries[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_awake_wait_loop_continues_on_exception(monkeypatch: pytest.MonkeyPatch):
+    actions._screen_cache.clear()
+    attempts = 0
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        nonlocal attempts
+        if "dumpsys power" in cmd:
+            attempts += 1
+            if attempts == 1:
+                # Первый вызов проверки экрана - он выключен
+                return "mWakefulness=Asleep\n"
+            elif attempts == 2:
+                # Первая итерация цикла ожидания падает с ошибкой
+                raise RuntimeError("adb connection hiccup")
+            elif attempts == 3:
+                # Вторая итерация цикла ожидания возвращает включенный экран
+                return "mWakefulness=Awake\n"
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    res = await actions.ensure_awake("realme")
+    assert res is True
+    assert attempts >= 3
+    assert actions._is_screen_cached_awake("realme") is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_awake_timeout_does_not_cache_true(monkeypatch: pytest.MonkeyPatch):
+    actions._screen_cache.clear()
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        if "dumpsys power" in cmd:
+            return "mWakefulness=Asleep\n"
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    curr_time = 1000.0
+
+    def mock_monotonic() -> float:
+        return curr_time
+
+    async def mock_sleep(sec: float):
+        nonlocal curr_time
+        curr_time += 1.0
+
+    monkeypatch.setattr(actions.time, "monotonic", mock_monotonic)
+    monkeypatch.setattr(actions.asyncio, "sleep", mock_sleep)
+
+    res = await actions.ensure_awake("realme")
+    assert res is True
+    # При таймауте экран не должен быть закеширован как включенный
+    assert "realme" not in actions._screen_cache
+    assert actions._is_screen_cached_awake("realme") is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_awake_raises_adb_timeout_no_false_cache(monkeypatch: pytest.MonkeyPatch):
+    actions._screen_cache.clear()
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        if "dumpsys power" in cmd:
+            raise actions.AdbTimeout("AdbTimeout in dumpsys power")
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    with pytest.raises(actions.AdbTimeout):
+        await actions.ensure_awake("realme")
+
+    assert "realme" not in actions._screen_cache
+    assert actions._is_screen_cached_awake("realme") is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_awake_retry_after_offline_failure_raises(monkeypatch: pytest.MonkeyPatch):
+    actions._screen_cache.clear()
+    connect_called = False
+
+    async def mock_connect(host: str, port: int) -> bool:
+        nonlocal connect_called
+        connect_called = True
+        return False
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        raise actions.DeviceOffline("device offline")
+
+    monkeypatch.setattr(actions, "connect", mock_connect)
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    with pytest.raises(actions.DeviceOffline):
+        await actions.ensure_awake("realme")
+
+    assert connect_called is True
+    assert "realme" not in actions._screen_cache
+    assert actions._is_screen_cached_awake("realme") is False
+
+
+@pytest.mark.asyncio
+async def test_key_power_invalidates_screen_cache(monkeypatch: pytest.MonkeyPatch):
+    actions._screen_cache["realme"] = (True, time.monotonic())
+    assert actions._is_screen_cached_awake("realme") is True
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    await actions.key("realme", "power")
+    assert "realme" not in actions._screen_cache
+    assert actions._is_screen_cached_awake("realme") is False
+
+    actions._screen_cache["realme"] = (True, time.monotonic())
+    await actions.key("realme", "KEYCODE_POWER")
+    assert "realme" not in actions._screen_cache
+    assert actions._is_screen_cached_awake("realme") is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_awake_parallel_calls_synchronization(monkeypatch: pytest.MonkeyPatch):
+    actions._screen_cache.clear()
+    state_asleep = True
+    wake_events: list[str] = []
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        nonlocal state_asleep
+        if "dumpsys power" in cmd:
+            if state_asleep:
+                return "mWakefulness=Asleep\n"
+            return "mWakefulness=Awake\n"
+        if "KEYCODE_WAKEUP" in cmd:
+            wake_events.append(cmd)
+            await asyncio.sleep(0.05)
+            state_asleep = False
+            return ""
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    # Запускаем два параллельных ensure_awake
+    res1, res2 = await asyncio.gather(
+        actions.ensure_awake("realme"),
+        actions.ensure_awake("realme"),
+    )
+
+    # Ровно один раз был вызван KEYCODE_WAKEUP
+    assert len(wake_events) == 1
+    # Первый вернул True (пришлось будить), второй подождал на Lock, увидел кеш awake и вернул False
+    assert (res1 is True and res2 is False) or (res1 is False and res2 is True)
+    assert actions._is_screen_cached_awake("realme") is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_awake_recursion_protection_task_context(monkeypatch: pytest.MonkeyPatch):
+    actions._screen_cache.clear()
+    inner_res: list[bool] = []
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        if "dumpsys power" in cmd:
+            # Имитируем рекурсивный вызов ensure_awake изнутри обработки
+            r = await actions.ensure_awake("realme")
+            inner_res.append(r)
+            return "mWakefulness=Awake\nDisplay Power: state=ON\n"
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    outer_res = await actions.ensure_awake("realme")
+    assert outer_res is False
+    assert inner_res == [False]  # Рекурсивный вызов внутри той же задачи вернул False без взаимной блокировки
 
 
 
