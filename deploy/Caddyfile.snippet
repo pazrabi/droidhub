@@ -1,0 +1,11 @@
+# Phone Hub — конфигурационный блок для Caddy
+# Этот блок добавляется в /etc/caddy/Caddyfile к существующей конфигурации
+# (блок для панели gemini-pool не изменять).
+#
+# После добавления проверьте и перезагрузите Caddy:
+#   sudo caddy validate --config /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+
+hub.193-41-86-92.sslip.io {
+    reverse_proxy 127.0.0.1:8090
+}
