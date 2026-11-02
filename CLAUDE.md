@@ -66,3 +66,18 @@ FastAPI-зависимости: `require_user(request) -> str` (логин из 
 
 ### hub/web/views.py
 `web_router`: `GET /login` (страница входа), `GET /` (список устройств, нужна сессия, иначе редирект на /login), `GET /device/{id}` (экран телефона). Шаблоны Jinja2 в `hub/web/templates/`, статика в `hub/web/static/` (`app.js`, `style.css`). Страницы работают только через `/api/...` с cookie-сессией. Никаких CDN и фреймворков, только vanilla JS. Адаптивная вёрстка (телефон), тач-события, тёмная тема. Экран: обновление скриншота 1–3 раза в секунду (не накладывать запросы друг на друга), тап по картинке с пересчётом координат из размера картинки в реальные (размер экрана брать из заголовка ответа `X-Screen-Width`/`X-Screen-Height`, которые добавляет `/screenshot`), свайп мышью/пальцем, поле ввода текста, кнопки Назад/Домой/Недавние/Питание, список приложений с запуском.
+
+## Контракты этапа 3.5: безопасность телефонов (алерты, питание, автопробуждение)
+
+### hub/devices/actions.py (добавляется)
+`async ensure_awake(device_id, *, actor="system") -> bool`: если экран выключен (по `dumpsys power`/`dumpsys display`: Display Power state OFF / mWakefulness != Awake), послать `KEYCODE_WAKEUP`, при наличии свайпа-блокировки свайпнуть вверх, подождать до 3 с пока экран не включится; True если пришлось будить. Вызывается автоматически в начале screenshot, ui_dump, tap, swipe, long_press, type_text, key (кроме power), open_app, open_url. Кеш состояния экрана не дольше 3 с.
+`async power(device_id, action: str, *, actor="system") -> None`: action одно из `wake`, `sleep` (KEYCODE_SLEEP), `reboot` (`reboot`), `shutdown` (`reboot -p`, при ошибке `svc power shutdown`). Пишет audit с action=`power:<action>`.
+
+### HTTP API (hub/api/routes.py)
+`POST /api/devices/{id}/power` тело `{"action": "wake|sleep|reboot|shutdown", "confirm": bool}`; для `reboot` и `shutdown` без `"confirm": true` отвечать 400 с русским текстом. Остальное как у остальных POST (404, 502, 429 по общим правилам). В MCP эти действия НЕ добавлять.
+
+### hub/config.py (добавляется в Settings, все с дефолтами)
+`telegram_token: str = ""`, `telegram_chat_id: str = ""` (env `HUB_TELEGRAM_TOKEN`, `HUB_TELEGRAM_CHAT_ID`), `temp_warn_c: float = 40.0`, `temp_alert_c: float = 45.0`, `temp_shutdown_c: float = 50.0` (0 отключает автовыключение), `full_charge_hours: float = 6.0`, `offline_alert_min: float = 10.0`, `alert_cooldown_min: float = 30.0`.
+
+### hub/alerts.py
+`class AlertMonitor`: `__init__(manager, settings, notifier=None)`, `async start()/stop()` — фоновый цикл раз в 30 с по `manager.statuses()`. Правила: температура >= warn — предупреждение, >= alert — тревога с inline-кнопкой «Выключить <имя>», >= shutdown_c (если не 0) — вызвать `actions.power(id, "shutdown", actor="alerts")` и сообщить; заряд 100% и подключено дольше `full_charge_hours` — напоминание «заряд держится на 100%»; устройство оффлайн дольше `offline_alert_min` — сообщение, при возврате «снова онлайн». Кулдаун на каждое правило и устройство (`alert_cooldown_min`), температурные тревоги не молчат при росте на ≥2 °C. `class TelegramNotifier`: `send(text, buttons=None)` через `httpx` к api.telegram.org (токен в URL не логировать), и long-polling `getUpdates` для нажатий inline-кнопок (callback_data `off:<device_id>` → ответить подтверждением «Выключить? Да/Нет» → при «Да» `actions.power(... "shutdown", actor="telegram")`); реагировать ТОЛЬКО на `telegram_chat_id`. Если токен пуст — монитор работает, но шлёт только в лог. Подключение в lifespan `hub/main.py`.
