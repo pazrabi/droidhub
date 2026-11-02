@@ -169,7 +169,8 @@ async def device_page(request: Request, device_id: str) -> Response:
     device_status = None
     try:
         for s in manager.statuses():
-            if s.id == device_id:
+            sid = s.get("id") if isinstance(s, dict) else getattr(s, "id", None)
+            if sid == device_id:
                 device_status = s
                 break
     except Exception:

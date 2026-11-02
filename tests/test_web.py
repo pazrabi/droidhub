@@ -289,6 +289,31 @@ def test_device_page_renders_all_required_elements(mock_manager: DeviceManager) 
     assert 'id="stream-updating"' in html
     assert 'id="frame-age"' in html
 
+    # 7. Блок «Питание» и кнопки управления питанием
+    assert 'id="power-card"' in html
+    assert "Питание" in html
+    assert 'id="btn-power-wake"' in html
+    assert 'data-power="wake"' in html
+    assert "Разбудить" in html
+    assert 'id="btn-power-sleep"' in html
+    assert 'data-power="sleep"' in html
+    assert "Экран выкл." in html
+    assert 'id="btn-power-reboot"' in html
+    assert 'data-power="reboot"' in html
+    assert "Перезагрузить" in html
+    assert 'id="btn-power-shutdown"' in html
+    assert 'data-power="shutdown"' in html
+    assert "Выключить телефон" in html
+
+    # 8. Телеметрия устройства (заряд и температура)
+    assert 'id="device-telemetry"' in html
+    assert 'id="device-battery-val"' in html
+    assert "85%" in html
+    assert 'id="device-temp-val"' in html
+    assert "29.5°C" in html
+    assert "temp-neutral" in html
+    assert 'id="device-overheat-badge"' in html
+
 
 def test_device_page_not_found(mock_manager: DeviceManager) -> None:
     """Несуществующее устройство должно возвращать 404."""
@@ -410,3 +435,225 @@ def test_responsive_ui_and_adaptive_streaming(mock_manager: DeviceManager) -> No
     # (6) Пауза при скрытой вкладке
     assert "visibilitychange" in js
     assert "document.hidden" in js
+
+
+# =====================================================================
+# 6. Тесты управления питанием, телеметрии и алертов перегрева (Этап 3.5)
+# =====================================================================
+
+
+def test_index_page_temperature_ranges_and_overheat() -> None:
+    """
+    Проверка цветовой индикации температуры и кнопки выключения на карточках:
+    - < 40 °C: нейтрально (temp-neutral), без пометки ПЕРЕГРЕВ, кнопка «Выключить» скрыта;
+    - 40–44 °C: жёлтый (temp-warning), без пометки ПЕРЕГРЕВ, кнопка «Выключить» скрыта;
+    - ≥ 45 °C: красный (temp-danger), с пометкой «ПЕРЕГРЕВ» и заметной кнопкой «Выключить» прямо в карточке.
+    """
+    dev_normal = DeviceConfig(id="dev_normal", name="Normal Phone", host="100.64.0.10")
+    dev_warn = DeviceConfig(id="dev_warn", name="Warm Phone", host="100.64.0.11")
+    dev_hot = DeviceConfig(id="dev_hot", name="Hot Phone", host="100.64.0.12")
+
+    manager = DeviceManager([dev_normal, dev_warn, dev_hot])
+    manager._statuses = {
+        "dev_normal": DeviceStatus(
+            id="dev_normal",
+            name="Normal Phone",
+            online=True,
+            battery=75,
+            temperature=36.5,
+            screen_on=True,
+            last_seen=1000.0,
+            error=None,
+        ),
+        "dev_warn": DeviceStatus(
+            id="dev_warn",
+            name="Warm Phone",
+            online=True,
+            battery=50,
+            temperature=42.0,
+            screen_on=True,
+            last_seen=1000.0,
+            error=None,
+        ),
+        "dev_hot": DeviceStatus(
+            id="dev_hot",
+            name="Hot Phone",
+            online=True,
+            battery=90,
+            temperature=47.5,
+            screen_on=True,
+            last_seen=1000.0,
+            error=None,
+        ),
+    }
+
+    app = create_web_app(manager)
+    client = TestClient(app)
+    client.post("/test-login")
+
+    response = client.get("/")
+    assert response.status_code == 200
+    html = response.text
+
+    # 1. dev_normal (< 40 °C): нейтрально, кнопка выключения скрыта
+    assert "36.5°C" in html
+    assert 'id="temp-dev_normal"' in html
+    assert "temp-neutral" in html
+    # Бейдж перегрева и кнопка выключения скрыты
+    assert 'id="overheat-dev_normal" style="display: none;"' in html
+    assert 'id="btn-shutdown-dev_normal"' in html
+    assert 'id="btn-shutdown-dev_normal" data-device-id="dev_normal" data-device-name="Normal Phone" style="display: none;"' in html
+
+    # 2. dev_warn (40–44 °C): жёлтый (temp-warning), перегрев скрыт
+    assert "42.0°C" in html or "42°C" in html
+    assert 'id="temp-dev_warn"' in html
+    assert "temp-warning" in html
+    assert 'id="overheat-dev_warn" style="display: none;"' in html
+    assert 'id="btn-shutdown-dev_warn" data-device-id="dev_warn" data-device-name="Warm Phone" style="display: none;"' in html
+
+    # 3. dev_hot (≥ 45 °C): красный (temp-danger), пометка «ПЕРЕГРЕВ», заметная кнопка «Выключить»
+    assert "47.5°C" in html
+    assert 'id="temp-dev_hot"' in html
+    assert "temp-danger" in html
+    assert 'id="overheat-dev_hot" style=""' in html or 'id="overheat-dev_hot">' in html or ('id="overheat-dev_hot"' in html and 'style="display: none;"' not in html.split('id="overheat-dev_hot"')[1].split('>')[0])
+    assert "ПЕРЕГРЕВ" in html
+    # Кнопка «Выключить» в карточке dev_hot не скрыта
+    assert 'id="btn-shutdown-dev_hot"' in html
+    # Проверяем, что у кнопки dev_hot нет style="display: none;"
+    btn_hot_tag = html.split('id="btn-shutdown-dev_hot"')[1].split('>')[0]
+    assert 'display: none' not in btn_hot_tag
+    assert "Выключить" in html
+
+
+def test_device_page_overheat_state() -> None:
+    """На странице перегретого устройства отображаются красный цвет температуры и бейдж «ПЕРЕГРЕВ»."""
+    dev_hot = DeviceConfig(id="hot_phone", name="Hot Phone", host="100.64.0.12")
+    manager = DeviceManager([dev_hot])
+    manager._statuses = {
+        "hot_phone": DeviceStatus(
+            id="hot_phone",
+            name="Hot Phone",
+            online=True,
+            battery=99,
+            temperature=48.2,
+            screen_on=True,
+            last_seen=1000.0,
+            error=None,
+        ),
+    }
+
+    app = create_web_app(manager)
+    client = TestClient(app)
+    client.post("/test-login")
+
+    response = client.get("/device/hot_phone")
+    assert response.status_code == 200
+    html = response.text
+
+    assert "48.2°C" in html
+    assert "temp-danger" in html
+    assert 'id="device-overheat-badge"' in html
+    assert "ПЕРЕГРЕВ" in html
+    # Проверяем, что у бейджа нет display: none
+    badge_tag = html.split('id="device-overheat-badge"')[1].split('>')[0]
+    assert "display: none" not in badge_tag
+
+
+def test_power_confirmation_modal_and_warning_text(mock_manager: DeviceManager) -> None:
+    """
+    Проверка модального окна и предупреждения:
+    - Модальное окно в DOM (base.html) с кнопками Отмена и Подтвердить;
+    - Чёткое русское предупреждение в JS:
+      «Выключенный телефон нельзя включить удалённо. Зарядка при подключённом кабеле продолжится. Выключить?»
+    """
+    app = create_web_app(mock_manager)
+    client = TestClient(app)
+    client.post("/test-login")
+
+    # 1. Проверяем наличие разметки модального окна на странице
+    response = client.get("/device/realme")
+    assert response.status_code == 200
+    html = response.text
+
+    assert 'id="power-modal"' in html
+    assert 'id="modal-title"' in html
+    assert 'id="modal-warning-text"' in html
+    assert 'id="modal-btn-confirm"' in html
+    assert 'id="modal-btn-cancel"' in html
+    assert 'id="modal-btn-close"' in html
+
+    # 2. Проверяем наличие предупреждения в app.js
+    res_js = client.get("/static/app.js")
+    assert res_js.status_code == 200
+    js = res_js.text
+
+    expected_warning = (
+        "Выключенный телефон нельзя включить удалённо. "
+        "Зарядка при подключённом кабеле продолжится. Выключить?"
+    )
+    assert expected_warning in js
+    assert "PowerModal" in js
+
+
+def test_power_js_logic_and_polling_contract() -> None:
+    """
+    Проверка клиентского JS контракта:
+    (1) Запрос POST /api/devices/{id}/power с {"action": ..., "confirm": true};
+    (2) Действия: wake, sleep, reboot, shutdown;
+    (3) Обновление значений с тем же интервалом, что и список устройств, без накладывания запросов;
+    (4) Обработка порогов температуры: 40 и 45 °C с пометкой ПЕРЕГРЕВ.
+    """
+    app = create_web_app()
+    client = TestClient(app)
+
+    res_js = client.get("/static/app.js")
+    assert res_js.status_code == 200
+    js = res_js.text
+
+    # (1) Эндпоинт POST /power и confirm: true
+    assert "/power" in js
+    assert "sendPowerAction" in js
+    assert "POST" in js
+    assert "action" in js
+    assert "confirm" in js
+
+    # (2) Действия питания
+    assert "wake" in js
+    assert "sleep" in js
+    assert "reboot" in js
+    assert "shutdown" in js
+
+    # (3) Одинаковый интервал обновления без накладывания запросов
+    assert "DEVICES_POLL_INTERVAL_MS" in js
+    assert "isUpdatingDevices" in js
+    assert "isFetchingStatus" in js
+
+    # (4) Пороги температуры и ПЕРЕГРЕВ
+    assert "45" in js
+    assert "40" in js
+    assert "temp-danger" in js
+    assert "temp-warning" in js
+    assert "temp-neutral" in js
+    assert "isOverheat" in js
+
+
+def test_power_css_styling() -> None:
+    """Проверка наличия стилей для блоков питания, модального окна и цветов температуры."""
+    app = create_web_app()
+    client = TestClient(app)
+
+    res_css = client.get("/static/style.css")
+    assert res_css.status_code == 200
+    css = res_css.text
+
+    assert ".temp-neutral" in css
+    assert ".temp-warning" in css
+    assert ".temp-danger" in css
+    assert ".badge-overheat" in css
+    assert ".btn-shutdown-card" in css
+    assert ".power-card" in css
+    assert ".power-buttons-grid" in css
+    assert ".btn-power-shutdown" in css
+    assert ".modal-backdrop" in css
+    assert ".modal-window" in css
+    assert ".modal-warning-text" in css

@@ -35,6 +35,23 @@
     </div>
   </footer>
 
+  <!-- Modal for Confirmation (Shutdown / Reboot) -->
+  <div id="power-modal" class="modal-backdrop" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-window">
+      <div class="modal-header">
+        <h3 id="modal-title" class="modal-title">Подтверждение</h3>
+        <button type="button" class="modal-close" id="modal-btn-close" aria-label="Закрыть">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p id="modal-warning-text" class="modal-warning-text"></p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline" id="modal-btn-cancel">Отмена</button>
+        <button type="button" class="btn btn-danger" id="modal-btn-confirm">Подтвердить</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/app.js"></script>
   {% block scripts %}{% endblock %}
 </body>

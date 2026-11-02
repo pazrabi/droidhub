@@ -724,3 +724,211 @@ a:hover {
   color: var(--text-secondary);
   font-size: 0.85rem;
 }
+
+/* =========================================================================
+   Питание, телеметрия (температура/заряд) и модальное окно
+   ========================================================================= */
+
+/* Температура и заряд с цветом */
+.temp-neutral {
+  color: var(--text-primary);
+}
+
+.temp-warning {
+  color: var(--accent-warning);
+  font-weight: 600;
+}
+
+.temp-danger {
+  color: var(--accent-danger-hover);
+  font-weight: 700;
+}
+
+.temp-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.badge-overheat {
+  background-color: var(--accent-danger);
+  color: #ffffff;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 0.15rem 0.45rem;
+  font-size: 0.7rem;
+  border-radius: var(--radius-sm);
+  display: inline-block;
+  vertical-align: middle;
+  animation: pulse-overheat 1.5s infinite;
+}
+
+@keyframes pulse-overheat {
+  0% { opacity: 1; }
+  50% { opacity: 0.6; }
+  100% { opacity: 1; }
+}
+
+.battery-value {
+  color: var(--text-primary);
+}
+
+.battery-neutral {
+  color: var(--text-primary);
+}
+
+.battery-warning {
+  color: var(--accent-warning);
+}
+
+.battery-danger {
+  color: var(--accent-danger-hover);
+}
+
+/* Заметная кнопка выключения в карточке при перегреве */
+.btn-shutdown-card {
+  background-color: var(--accent-danger);
+  border-color: var(--accent-danger);
+  color: #ffffff;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+
+.btn-shutdown-card:hover {
+  background-color: var(--accent-danger-hover);
+  border-color: var(--accent-danger-hover);
+}
+
+/* Телеметрия на странице устройства */
+.device-telemetry-bar {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+  margin-top: 0.35rem;
+  padding: 0.35rem 0.65rem;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  width: fit-content;
+}
+
+.telemetry-item {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.telemetry-label {
+  color: var(--text-secondary);
+}
+
+.telemetry-value {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* Блок «Питание» */
+.power-card {
+  border-color: var(--border-color);
+}
+
+.power-buttons-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.5rem;
+}
+
+.btn-power-shutdown {
+  background-color: var(--accent-danger);
+  border-color: var(--accent-danger);
+  color: #ffffff;
+  font-weight: 500;
+}
+
+.btn-power-shutdown:hover {
+  background-color: var(--accent-danger-hover);
+  border-color: var(--accent-danger-hover);
+}
+
+/* Модальное окно подтверждения */
+.modal-backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background-color: rgba(0, 0, 0, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 1rem;
+}
+
+.modal-window {
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  width: 100%;
+  max-width: 480px;
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: modal-appear 0.15s ease-out;
+}
+
+@keyframes modal-appear {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.modal-header {
+  padding: 0.85rem 1.25rem;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.modal-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 1.5rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 0.25rem;
+}
+
+.modal-close:hover {
+  color: var(--text-primary);
+}
+
+.modal-body {
+  padding: 1.25rem;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+
+.modal-warning-text {
+  word-break: break-word;
+}
+
+.modal-footer {
+  padding: 0.75rem 1.25rem;
+  background-color: var(--bg-surface-elevated);
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}

@@ -28,29 +28,35 @@
           </div>
           <div class="device-meta-row">
             <span class="meta-label">Батарея:</span>
-            <span class="meta-value">
+            <span class="meta-value battery-value" id="battery-{{ d.id }}">
               {% if d.battery is not none %}{{ d.battery }}%{% else %}—{% endif %}
             </span>
           </div>
           <div class="device-meta-row">
             <span class="meta-label">Температура:</span>
-            <span class="meta-value">
-              {% if d.temperature is not none %}{{ d.temperature }}°C{% else %}—{% endif %}
-            </span>
+            <div class="temp-wrap">
+              <span class="meta-value temp-value {% if d.temperature is not none %}{% if d.temperature >= 45 %}temp-danger{% elif d.temperature >= 40 %}temp-warning{% else %}temp-neutral{% endif %}{% endif %}" id="temp-{{ d.id }}">
+                {% if d.temperature is not none %}{{ d.temperature }}°C{% else %}—{% endif %}
+              </span>
+              <span class="badge badge-overheat badge-danger" id="overheat-{{ d.id }}" style="{% if not (d.temperature is not none and d.temperature >= 45) %}display: none;{% endif %}">ПЕРЕГРЕВ</span>
+            </div>
           </div>
           <div class="device-meta-row">
             <span class="meta-label">Экран:</span>
-            <span class="meta-value">
+            <span class="meta-value" id="screen-status-{{ d.id }}">
               {% if d.screen_on is true %}Включен{% elif d.screen_on is false %}Выключен{% else %}—{% endif %}
             </span>
           </div>
           {% if d.error %}
-          <div class="device-error-text">
+          <div class="device-error-text" id="error-{{ d.id }}">
             {{ d.error }}
           </div>
           {% endif %}
         </div>
         <div class="device-card-actions">
+          <button type="button" class="btn btn-danger btn-sm btn-block btn-shutdown-card" id="btn-shutdown-{{ d.id }}" data-device-id="{{ d.id }}" data-device-name="{{ d.name or d.id }}" style="{% if not (d.temperature is not none and d.temperature >= 45) %}display: none;{% endif %}">
+            Выключить
+          </button>
           <a href="/device/{{ d.id }}" class="btn btn-primary btn-sm btn-block" id="btn-open-{{ d.id }}">
             Открыть экран
           </a>
