@@ -491,21 +491,27 @@ async def test_type_text_latin(monkeypatch: pytest.MonkeyPatch, setup_actions: M
 @pytest.mark.asyncio
 async def test_type_text_cyrillic(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
     calls: list[str] = []
+    monkeypatch.setattr(actions, "_IME_SWITCH_DELAY", 0.0)
 
     async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
         calls.append(cmd)
+        if "pm list packages" in cmd:
+            return "package:com.android.adbkeyboard\n"
+        if "settings get secure default_input_method" in cmd:
+            return "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME\n"
         return ""
 
     monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
 
-    # Кириллица должна отправляться через ADBKeyBoard broadcast ADB_INPUT_B64
+    # Кириллица должна отправляться через ADBKeyBoard broadcast ADB_INPUT_B64 с переключением IME
     cyrillic_text = "Привет, мир! 🚀"
     await actions.type_text("realme", cyrillic_text)
-    assert len(calls) == 1
-    assert "am broadcast -a ADB_INPUT_B64 --es msg" in calls[0]
+    
+    broadcast_calls = [c for c in calls if "am broadcast -a ADB_INPUT_B64 --es msg" in c]
+    assert len(broadcast_calls) == 1
 
     # Извлекаем base64 и проверяем декодирование
-    b64_part = calls[0].split("--es msg")[-1].strip().strip("'\"")
+    b64_part = broadcast_calls[0].split("--es msg")[-1].strip().strip("'\"")
     decoded = base64.b64decode(b64_part).decode("utf-8")
     assert decoded == cyrillic_text
     assert setup_actions.entries[0]["action"] == "type_text"
@@ -526,13 +532,200 @@ async def test_type_text_special_characters(monkeypatch: pytest.MonkeyPatch, set
     special_text = 'test & id; echo "hello $USER" && rm -rf / < > `whoami`'
     await actions.type_text("realme", special_text)
     assert len(calls) == 1
-    # Должен направляться через ADBKeyBoard broadcast с base64 (полная защита от injection)
-    assert "am broadcast -a ADB_INPUT_B64 --es msg" in calls[0]
-    b64_part = calls[0].split("--es msg")[-1].strip().strip("'\"")
-    decoded = base64.b64decode(b64_part).decode("utf-8")
-    assert decoded == special_text
+    # Чисто ASCII текст передается через input text с экранированием пробелов в %s и shlex.quote
+    escaped = special_text.replace(" ", "%s")
+    assert calls[0] == f"input text {shlex.quote(escaped)}"
     assert setup_actions.entries[0]["action"] == "type_text"
     assert setup_actions.entries[0]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_type_text_command_order(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    calls: list[str] = []
+    monkeypatch.setattr(actions, "_IME_SWITCH_DELAY", 0.0)
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        calls.append(cmd)
+        if "pm list packages" in cmd:
+            return "package:com.android.adbkeyboard\n"
+        if "settings get secure default_input_method" in cmd:
+            return "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME\n"
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    await actions.type_text("realme", "Привет мир")
+
+    assert calls == [
+        "pm list packages com.android.adbkeyboard",
+        "settings get secure default_input_method",
+        "ime enable com.android.adbkeyboard/.AdbIME",
+        "ime set com.android.adbkeyboard/.AdbIME",
+        f"am broadcast -a ADB_INPUT_B64 --es msg '{base64.b64encode('Привет мир'.encode('utf-8')).decode('ascii')}'",
+        "ime set com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME",
+    ]
+    assert setup_actions.entries[0]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_type_text_restore_ime_on_exception(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    calls: list[str] = []
+    monkeypatch.setattr(actions, "_IME_SWITCH_DELAY", 0.0)
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        calls.append(cmd)
+        if "pm list packages" in cmd:
+            return "package:com.android.adbkeyboard\n"
+        if "settings get secure default_input_method" in cmd:
+            return "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME\n"
+        if "am broadcast" in cmd:
+            raise actions.AdbError("Ошибка широковещательной рассылки")
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    with pytest.raises(actions.AdbError, match="Ошибка широковещательной рассылки"):
+        await actions.type_text("realme", "Привет с ошибкой")
+
+    # В блоке finally прежняя клавиатура должна быть обязательно возвращена
+    assert calls[-1] == "ime set com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+    assert setup_actions.entries[0]["ok"] is False
+    assert "Ошибка широковещательной рассылки" in setup_actions.entries[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_type_text_restore_ime_skipped_if_already_adbime(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    calls: list[str] = []
+    monkeypatch.setattr(actions, "_IME_SWITCH_DELAY", 0.0)
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        calls.append(cmd)
+        if "pm list packages" in cmd:
+            return "package:com.android.adbkeyboard\n"
+        if "settings get secure default_input_method" in cmd:
+            return "com.android.adbkeyboard/.AdbIME\n"
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    await actions.type_text("realme", "Привет")
+    # Если текущая клавиатура уже была AdbIME, в finally повторный ime set не вызывается
+    assert not any(c.startswith("ime set") and "com.android.adbkeyboard/.AdbIME" not in c for c in calls)
+    assert calls[-1].startswith("am broadcast")
+
+
+@pytest.mark.asyncio
+async def test_type_text_missing_adbkeyboard_package(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    calls: list[str] = []
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        calls.append(cmd)
+        if "pm list packages" in cmd:
+            return ""  # Пакет не найден
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    with pytest.raises(RuntimeError, match="На телефоне не установлена клавиатура ADBKeyBoard"):
+        await actions.type_text("realme", "Привет, проверка!")
+
+    # Должна выполниться только проверка пакета, без переключения клавиатуры
+    assert calls == ["pm list packages com.android.adbkeyboard"]
+    assert setup_actions.entries[0]["ok"] is False
+    assert "На телефоне не установлена клавиатура ADBKeyBoard" in setup_actions.entries[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_type_text_ascii_no_ime_switch(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    calls: list[str] = []
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    ascii_text = "Quick brown fox jumps over 123 lazy dogs!"
+    await actions.type_text("realme", ascii_text)
+
+    # Чисто ASCII-текст отправляется через input text без вызова pm list packages, settings get или ime set
+    assert calls == [f"input text {shlex.quote(ascii_text.replace(' ', '%s'))}"]
+    assert not any("ime" in c for c in calls)
+    assert not any("package" in c for c in calls)
+    assert setup_actions.entries[0]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_type_text_long_text_chunks(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    calls: list[str] = []
+    monkeypatch.setattr(actions, "_IME_SWITCH_DELAY", 0.0)
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        calls.append(cmd)
+        if "pm list packages" in cmd:
+            return "package:com.android.adbkeyboard\n"
+        if "settings get secure default_input_method" in cmd:
+            return "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME\n"
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    # Длинный текст на кириллице (более 1000 байт), который должен разбиться на части <= 800 символов base64
+    long_cyrillic_text = "Привет, мир! Это длинный тестовый текст для проверки отправки частями. " * 15
+    await actions.type_text("realme", long_cyrillic_text)
+
+    broadcast_calls = [c for c in calls if "am broadcast -a ADB_INPUT_B64 --es msg" in c]
+    assert len(broadcast_calls) > 1
+
+    decoded_parts: list[str] = []
+    for call in broadcast_calls:
+        b64_part = call.split("--es msg")[-1].strip().strip("'\"")
+        assert len(b64_part) <= 800
+        decoded_parts.append(base64.b64decode(b64_part).decode("utf-8"))
+
+    assert "".join(decoded_parts) == long_cyrillic_text
+    # В конце клавиатура должна быть возвращена на место
+    assert calls[-1] == "ime set com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+    assert setup_actions.entries[0]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_type_text_device_lock(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    calls: list[str] = []
+    monkeypatch.setattr(actions, "_IME_SWITCH_DELAY", 0.0)
+
+    active_count = 0
+    max_active = 0
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        nonlocal active_count, max_active
+        calls.append(cmd)
+        if "pm list packages" in cmd:
+            return "package:com.android.adbkeyboard\n"
+        if "settings get secure default_input_method" in cmd:
+            return "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME\n"
+        if "am broadcast" in cmd:
+            active_count += 1
+            max_active = max(max_active, active_count)
+            await asyncio.sleep(0.01)
+            active_count -= 1
+        return ""
+
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    # Запускаем два параллельных ввода с не-ASCII текстом на одном устройстве
+    await asyncio.gather(
+        actions.type_text("realme", "Первый текст 1"),
+        actions.type_text("realme", "Второй текст 2"),
+    )
+
+    # Благодаря lock на устройство, они не должны выполняться одновременно
+    assert max_active == 1
+
+    # Проверяем, что блокировки создаются индивидуально под device_id
+    lock_realme = actions._get_type_text_lock("realme")
+    lock_redmi = actions._get_type_text_lock("redmi")
+    assert lock_realme is not lock_redmi
 
 
 # --- ТЕСТ KEY ---
