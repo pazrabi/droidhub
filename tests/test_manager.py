@@ -144,6 +144,21 @@ def test_parse_screen_dumpsys():
     assert parse_screen_dumpsys("") is None
     assert parse_screen_dumpsys("Display Power: unknown") is None
 
+    # Предотвращение ложного срабатывания на mDeviceIdleState=OFF / BatterySaverState=OFF
+    dump_with_idle_on = """
+    mDeviceIdleState=OFF
+    BatterySaverState=OFF
+    Display Power: state=ON
+    """
+    assert parse_screen_dumpsys(dump_with_idle_on) is True
+
+    dump_with_idle_off = """
+    mDeviceIdleState=OFF
+    BatterySaverState=OFF
+    Display Power: state=OFF
+    """
+    assert parse_screen_dumpsys(dump_with_idle_off) is False
+
 
 def test_manager_get_and_serial():
     dev1 = DeviceConfig(id="realme", name="Realme C21Y", host="100.64.0.1", port=5555)

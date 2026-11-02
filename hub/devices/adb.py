@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 from hub.config import get_settings
@@ -21,18 +22,19 @@ class AdbTimeout(AdbError):
     pass
 
 
+ADB_OFFLINE_PATTERN = re.compile(
+    r"error:\s*(?:device\s+('.+?'\s+)?not found|device\s+offline|no devices(?:/emulators found)?)",
+    re.IGNORECASE,
+)
+
+
 def _get_adb_path() -> str:
     """Возвращает путь к adb из настроек get_settings().adb_path."""
     try:
-        import hub.config
-        settings = hub.config.get_settings()
+        settings = get_settings()
         return getattr(settings, "adb_path", "adb") or "adb"
     except Exception:
-        try:
-            settings = get_settings()
-            return getattr(settings, "adb_path", "adb") or "adb"
-        except Exception:
-            return "adb"
+        return "adb"
 
 
 async def run_adb(
@@ -87,39 +89,39 @@ async def run_adb(
             pass
         raise
 
+    target_str = f" '{serial}'" if serial else ""
+
     if proc.returncode != 0:
         err_text = stderr.decode("utf-8", errors="replace").strip()
         out_text = stdout.decode("utf-8", errors="replace").strip()
         msg = err_text or out_text or f"Код возврата {proc.returncode}"
-        msg_lower = msg.lower()
 
-        if (
-            "offline" in msg_lower
-            or "device not found" in msg_lower
-            or ("device" in msg_lower and "not found" in msg_lower)
-            or "no devices/emulators found" in msg_lower
-        ):
-            target_str = f" '{serial}'" if serial else ""
+        if ADB_OFFLINE_PATTERN.search(msg):
             raise DeviceOffline(f"Устройство{target_str} оффлайн или не найдено: {msg}")
+        if out_text and ADB_OFFLINE_PATTERN.search(out_text):
+            raise DeviceOffline(f"Устройство{target_str} оффлайн или не найдено: {out_text}")
 
         raise AdbError(f"Ошибка выполнения ADB (код {proc.returncode}): {msg}")
 
+    if binary:
+        err_text = stderr.decode("utf-8", errors="replace").strip()
+        if err_text and ADB_OFFLINE_PATTERN.search(err_text):
+            raise DeviceOffline(f"Устройство{target_str} оффлайн или не найдено: {err_text}")
+        if stdout.lstrip().startswith((b"error:", b"adb: error:")):
+            out_preview = stdout[:512].decode("utf-8", errors="replace").strip()
+            if ADB_OFFLINE_PATTERN.search(out_preview):
+                raise DeviceOffline(f"Устройство{target_str} оффлайн или не найдено: {out_preview}")
+        return stdout
+
     text = stdout.decode("utf-8", errors="replace")
     err_text = stderr.decode("utf-8", errors="replace").strip()
-    check_text = f"{text} {err_text}".strip()
-    check_lower = check_text.lower()
-    if (
-        "offline" in check_lower
-        or "device not found" in check_lower
-        or ("device" in check_lower and "not found" in check_lower)
-        or "no devices/emulators found" in check_lower
-    ):
-        target_str = f" '{serial}'" if serial else ""
-        msg = text.strip() or err_text
-        raise DeviceOffline(f"Устройство{target_str} оффлайн или не найдено: {msg}")
 
-    if binary:
-        return stdout
+    if err_text and ADB_OFFLINE_PATTERN.search(err_text):
+        raise DeviceOffline(f"Устройство{target_str} оффлайн или не найдено: {err_text}")
+
+    stripped_text = text.strip()
+    if (stripped_text.startswith("error:") or stripped_text.startswith("adb: error:")) and ADB_OFFLINE_PATTERN.search(stripped_text):
+        raise DeviceOffline(f"Устройство{target_str} оффлайн или не найдено: {stripped_text}")
 
     return text
 

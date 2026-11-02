@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from hub.config import DeviceConfig, get_settings
+from hub.config import DeviceConfig
 from hub.devices.adb import (
     AdbError,
     AdbTimeout,
@@ -71,7 +71,9 @@ def parse_screen_dumpsys(dumpsys_output: str) -> bool | None:
         if val in ("asleep", "dozing", "dreaming"):
             return False
 
-    state_match = re.search(r"(?:Display Power:\s*)?state[=\s]+(ON|OFF)\b", dumpsys_output, re.IGNORECASE)
+    state_match = re.search(r"Display Power:\s*state[=\s]+(ON|OFF)\b", dumpsys_output, re.IGNORECASE)
+    if not state_match:
+        state_match = re.search(r"\bstate[=\s]+(ON|OFF)\b", dumpsys_output, re.IGNORECASE)
     if state_match:
         return state_match.group(1).upper() == "ON"
 

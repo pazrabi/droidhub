@@ -184,7 +184,7 @@ async def test_run_adb_settings_path(monkeypatch, mock_exec):
 
     import hub.config
     custom_settings = hub.config.Settings(adb_path="/custom/bin/adb")
-    monkeypatch.setattr(hub.config, "get_settings", lambda: custom_settings)
+    monkeypatch.setattr("hub.devices.adb.get_settings", lambda: custom_settings)
 
     await run_adb(["devices"])
     assert calls[0][0][0] == "/custom/bin/adb"
@@ -257,4 +257,50 @@ async def test_run_adb_device_not_found_with_serial(mock_exec):
         await run_adb(["shell", "dumpsys"], serial="100.64.0.1:5555")
 
     assert "оффлайн или не найдено" in str(exc_info.value)
+
+
+async def test_run_adb_no_false_positive_offline_package(mock_exec):
+    setter, calls = mock_exec
+    sample = b"package:com.google.android.apps.docs.editors.offline\npackage:com.android.chrome\n"
+    setter(stdout=sample, returncode=0)
+
+    res = await run_adb(["shell", "pm", "list", "packages"])
+    assert "package:com.google.android.apps.docs.editors.offline" in res
+
+
+async def test_run_adb_no_false_positive_ui_offline(mock_exec):
+    setter, _ = mock_exec
+    ui_dump = b'<node text="Offline mode" resource-id="offline_btn" />'
+    setter(stdout=ui_dump, returncode=0)
+
+    res = await run_adb(["shell", "uiautomator", "dump"])
+    assert "Offline mode" in res
+
+
+async def test_run_adb_binary_with_offline_bytes(mock_exec):
+    setter, _ = mock_exec
+    binary_content = b"\x89PNG\r\n\x1a\n\x00\x00\x00\roffline_data_bytes\x00\x00\x00\rdevice not found"
+    setter(stdout=binary_content, returncode=0)
+
+    res = await run_adb(["exec-out", "screencap", "-p"], binary=True)
+    assert res == binary_content
+
+
+async def test_run_adb_shell_error_not_device_offline(mock_exec):
+    setter, _ = mock_exec
+    setter(stderr=b"sh: /system/bin/my_device_script: not found\n", returncode=127)
+
+    with pytest.raises(AdbError) as exc_info:
+        await run_adb(["shell", "/system/bin/my_device_script"])
+
+    assert not isinstance(exc_info.value, DeviceOffline)
+    assert "my_device_script: not found" in str(exc_info.value)
+
+    setter(stderr=b"cat: /sys/bus/usb/devices/x: not found\n", returncode=1)
+
+    with pytest.raises(AdbError) as exc_info:
+        await run_adb(["shell", "cat /sys/bus/usb/devices/x"])
+
+    assert not isinstance(exc_info.value, DeviceOffline)
+
 
