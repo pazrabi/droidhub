@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from hub.alerts import AlertMonitor, TelegramNotifier
+from hub.alerts import AlertMonitor, TelegramNotifier, _sanitize
 from hub.config import DeviceConfig, Settings
 from hub.devices import actions
 from hub.devices.manager import DeviceManager, DeviceStatus
@@ -125,6 +125,15 @@ async def test_temperature_cooldown_and_2c_rise(manager: DeviceManager) -> None:
     await monitor.check_device(s6, now=t0 + 180.0 + 31 * 60.0)
     assert notifier.send.call_count == 1
 
+    # Граничный случай float: 42.1 -> 44.1 (44.1 - 42.1 = 1.9999999999999991 < 2.0 без округления)
+    monitor_float = AlertMonitor(manager, settings, notifier=notifier)
+    notifier.send.reset_mock()
+    await monitor_float.check_device(DeviceStatus(id="dev1", name="Pixel 6", online=True, temperature=42.1), now=t0)
+    assert notifier.send.call_count == 1
+    notifier.send.reset_mock()
+    await monitor_float.check_device(DeviceStatus(id="dev1", name="Pixel 6", online=True, temperature=44.1), now=t0 + 60.0)
+    assert notifier.send.call_count == 1
+
 
 # 3. 100% заряда дольше N часов
 @pytest.mark.asyncio
@@ -240,6 +249,18 @@ async def test_auto_shutdown_behavior(manager: DeviceManager, mock_power: AsyncM
     assert "Тревога" in notifier.send.call_args[0][0]
     assert notifier.send.call_args[1].get("buttons") is not None
 
+    # 3. Сбой вызова actions.power — сообщение об ошибке авто-выключения
+    mock_power.reset_mock()
+    notifier.send.reset_mock()
+    mock_power.side_effect = RuntimeError("ADB timeout")
+    status_fail = DeviceStatus(id="dev1", name="Pixel 6", online=True, temperature=52.0)
+    await monitor1.check_device(status_fail, now=3000.0)
+    mock_power.assert_called_once_with("dev1", "shutdown", actor="alerts")
+    assert notifier.send.call_count == 1
+    assert "Сбой авто-выключения" in notifier.send.call_args[0][0]
+    assert "ADB timeout" in notifier.send.call_args[0][0]
+    mock_power.side_effect = None
+
 
 # 6. Чужой chat_id игнорируется
 @pytest.mark.asyncio
@@ -289,12 +310,26 @@ async def test_empty_token_only_logs(caplog: pytest.LogCaptureFixture) -> None:
 
 
 # 8. Токен нигде не логируется
-def test_token_never_logged() -> None:
+def test_token_never_logged(caplog: pytest.LogCaptureFixture) -> None:
     secret_token = "SECRET_TELEGRAM_BOT_TOKEN_12345"
     notifier = TelegramNotifier(token=secret_token, chat_id="12345")
     # Проверка строкового представления
     assert secret_token not in repr(notifier)
     assert secret_token not in str(notifier)
+
+    # Проверка функции санитизации
+    assert "SECRET" not in _sanitize(f"https://api.telegram.org/bot{secret_token}/getUpdates", secret_token)
+    assert "[REDACTED]" in _sanitize(f"https://api.telegram.org/bot{secret_token}/getUpdates", secret_token)
+
+    # Уровень логгера httpx должен быть заглушен до WARNING
+    assert logging.getLogger("httpx").level >= logging.WARNING
+
+    # Принудительно проверяем, что фильтр логгера httpx санитизирует URL с токеном
+    httpx_logger = logging.getLogger("httpx")
+    with caplog.at_level(logging.INFO, logger="httpx"):
+        httpx_logger.info("HTTP Request: GET https://api.telegram.org/bot%s/getUpdates 200 OK", secret_token)
+    assert secret_token not in caplog.text
+    assert "[REDACTED]" in caplog.text
 
 
 # 9. Нажатие кнопки с подтверждением (Да / Нет)
@@ -364,6 +399,22 @@ async def test_button_confirmation_flow(manager: DeviceManager, mock_power: Asyn
     mock_power.assert_called_once_with("dev1", "shutdown", actor="telegram")
     assert notifier.send.call_count == 1
     assert "выключается" in notifier.send.call_args[0][0].lower()
+
+    # Шаг 2В: Неизвестный callback — подтверждается получение (answer_callback), чтобы не зависал индикатор загрузки
+    notifier.send.reset_mock()
+    notifier.answer_callback.reset_mock()
+    unknown_update = {
+        "update_id": 13,
+        "callback_query": {
+            "id": "cb_unknown",
+            "from": {"id": 12345},
+            "message": {"chat": {"id": 12345}},
+            "data": "unknown_action_data",
+        },
+    }
+    await notifier.handle_update(unknown_update)
+    notifier.answer_callback.assert_called_once_with("cb_unknown")
+    notifier.send.assert_not_called()
 
 
 # 10. Нажатие кнопки с подтверждением через мок httpx

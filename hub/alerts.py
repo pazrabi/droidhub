@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -20,11 +21,36 @@ if not hasattr(actions, "power"):
     actions.power = _stub_power  # type: ignore[attr-defined]
 
 
-def _sanitize(text: str, token: str) -> str:
+_TOKENS_TO_SANITIZE: set[str] = set()
+_BOT_URL_PATTERN = re.compile(r"/bot[^/\s]+")
+
+
+def _sanitize(text: str, token: str = "") -> str:
     """Удаляет секретный Telegram-токен из строк логов."""
     if token and token in text:
-        return text.replace(token, "[REDACTED]")
-    return text
+        text = text.replace(token, "[REDACTED]")
+    for t in _TOKENS_TO_SANITIZE:
+        if t and t in text:
+            text = text.replace(t, "[REDACTED]")
+    return _BOT_URL_PATTERN.sub("/bot[REDACTED]", text)
+
+
+class _TelegramTokenFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = _sanitize(record.getMessage())
+            record.args = ()
+        except Exception:
+            if isinstance(record.msg, str):
+                record.msg = _sanitize(record.msg)
+        return True
+
+
+# Заглушаем вывод информационных логов httpx, чтобы токен бота в URL не логировался
+_httpx_logger = logging.getLogger("httpx")
+_httpx_logger.setLevel(logging.WARNING)
+_httpx_logger.addFilter(_TelegramTokenFilter())
+logger.addFilter(_TelegramTokenFilter())
 
 
 class TelegramNotifier:
@@ -46,6 +72,8 @@ class TelegramNotifier:
         poll_timeout: float = 20.0,
     ) -> None:
         self.token = str(token).strip() if token else ""
+        if self.token:
+            _TOKENS_TO_SANITIZE.add(self.token)
         self.chat_id = str(chat_id).strip() if chat_id else ""
         self.manager = manager
         self.poll_timeout = poll_timeout
@@ -206,6 +234,10 @@ class TelegramNotifier:
             await self.answer_callback(cb_id, text="Отменено")
             await self.send("Выключение отменено")
 
+        else:
+            logger.warning("Unknown or outdated callback_query data: %s", data)
+            await self.answer_callback(cb_id)
+
     async def _poll_loop(self) -> None:
         url = f"https://api.telegram.org/bot{self.token}/getUpdates"
         while self._running:
@@ -319,7 +351,7 @@ class AlertMonitor:
         # Внутри кулдауна температурные тревоги не молчат при росте на >= 2 °C
         if temp is not None:
             last_temp = self._last_alert_temp.get(key)
-            if last_temp is not None and (temp - last_temp) >= 2.0:
+            if last_temp is not None and round(temp - last_temp, 5) >= 2.0:
                 return True
 
         return False
@@ -391,14 +423,17 @@ class AlertMonitor:
 
             if is_shutdown:
                 if self._can_alert(dev_id, "temp_shutdown", temp=temp, now=now):
-                    msg = (
-                        f"Критический перегрев {dev_name}: {temp:.1f} °C. "
-                        f"Устройство автоматически выключается!"
-                    )
+                    shutdown_err = None
                     try:
                         await actions.power(dev_id, "shutdown", actor="alerts")
                     except Exception as exc:
                         logger.error("Error shutting down device %s on overheat: %s", dev_id, exc)
+                        shutdown_err = exc
+
+                    if shutdown_err:
+                        msg = f"Критический перегрев {dev_name}: {temp:.1f} °C! Сбой авто-выключения: {shutdown_err}"
+                    else:
+                        msg = f"Критический перегрев {dev_name}: {temp:.1f} °C. Устройство автоматически выключается!"
                     await self.notifier.send(msg)
                     self._record_alert(dev_id, "temp_shutdown", now=now, temp=temp)
             elif is_alert:
