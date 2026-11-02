@@ -83,6 +83,14 @@ def test_settings_defaults() -> None:
     assert settings.adb_path == "adb"
     assert settings.allow_shell is False
     assert settings.rate_limit_per_min == 60
+    assert settings.telegram_token == ""
+    assert settings.telegram_chat_id == ""
+    assert settings.temp_warn_c == 40.0
+    assert settings.temp_alert_c == 45.0
+    assert settings.temp_shutdown_c == 50.0
+    assert settings.full_charge_hours == 6.0
+    assert settings.offline_alert_min == 10.0
+    assert settings.alert_cooldown_min == 30.0
 
 
 def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -221,3 +229,24 @@ HUB_ALLOW_SHELL=false
     settings = get_settings(env_file=env_file)
     assert settings.admin_user == "admin_from_env"
     assert settings.allow_shell is True
+
+
+def test_get_settings_alert_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HUB_TELEGRAM_TOKEN", "123456:ABC-DEF")
+    monkeypatch.setenv("HUB_TELEGRAM_CHAT_ID", "-100123456789")
+    monkeypatch.setenv("HUB_TEMP_WARN_C", "42.5")
+    monkeypatch.setenv("HUB_TEMP_ALERT_C", "47.0")
+    monkeypatch.setenv("HUB_TEMP_SHUTDOWN_C", "52.0")
+    monkeypatch.setenv("HUB_FULL_CHARGE_HOURS", "8.5")
+    monkeypatch.setenv("HUB_OFFLINE_ALERT_MIN", "15.0")
+    monkeypatch.setenv("HUB_ALERT_COOLDOWN_MIN", "45.0")
+
+    settings = get_settings()
+    assert settings.telegram_token == "123456:ABC-DEF"
+    assert settings.telegram_chat_id == "-100123456789"
+    assert settings.temp_warn_c == 42.5
+    assert settings.temp_alert_c == 47.0
+    assert settings.temp_shutdown_c == 52.0
+    assert settings.full_charge_hours == 8.5
+    assert settings.offline_alert_min == 15.0
+    assert settings.alert_cooldown_min == 45.0
