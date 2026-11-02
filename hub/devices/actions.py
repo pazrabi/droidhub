@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import tempfile
+import time
 from typing import Any, Awaitable, Callable, TypeVar
 import xml.etree.ElementTree as ET
 
@@ -308,8 +309,201 @@ async def _capture_raw_task(device_id: str) -> bytes:
             _screenshot_inflight.pop(device_id, None)
 
 
+_SCREEN_CACHE_TTL: float = 3.0
+_screen_cache: dict[str, tuple[bool, float]] = {}  # device_id -> (is_awake, timestamp)
+_in_ensure_awake: set[str] = set()
+
+
+def _is_screen_cached_awake(device_id: str) -> bool:
+    """Возвращает True, если состояние экрана закешировано как включенное и кеш не старше 3 с."""
+    if device_id in _screen_cache:
+        is_awake, ts = _screen_cache[device_id]
+        if 0 <= (time.monotonic() - ts) <= _SCREEN_CACHE_TTL:
+            return is_awake
+    return False
+
+
+def _parse_screen_off(dumpsys_output: str) -> bool:
+    """
+    Определяет, выключен ли экран, по выводу
+    dumpsys power | grep -E "mWakefulness|Display Power"
+    с учетом формата Android 11 и 13.
+    """
+    if not dumpsys_output:
+        return False
+
+    # 1. Проверяем Display Power: state=OFF / ON / DOZE / etc.
+    disp_match = re.search(
+        r"Display Power:\s*state[=\s]+([A-Za-z0-9_]+)", dumpsys_output, re.IGNORECASE
+    )
+    if disp_match:
+        disp_state = disp_match.group(1).upper()
+        if disp_state in ("OFF", "DOZE", "DOZE_SUSPEND"):
+            return True
+
+    # 2. Проверяем mWakefulness: Awake / Asleep / Dozing / Dreaming / Sleeping
+    wake_match = re.search(r"\bmWakefulness[=\s]+([A-Za-z0-9_]+)", dumpsys_output, re.IGNORECASE)
+    if wake_match:
+        wake_state = wake_match.group(1).upper()
+        if wake_state != "AWAKE":
+            return True
+
+    # Явные подтверждения включенного экрана
+    if disp_match and disp_match.group(1).upper() == "ON":
+        return False
+    if wake_match and wake_match.group(1).upper() == "AWAKE":
+        return False
+
+    return False
+
+
+async def _check_swipe_lock(serial: str) -> bool:
+    """Проверяет наличие экрана блокировки / keyguard при пробуждении."""
+    if adb_shell is None:
+        return False
+    try:
+        out = await adb_shell(
+            serial,
+            'dumpsys window | grep -E "mDreamingLockscreen=true|mShowing=true|isStatusBarKeyguard=true|mKeyguardShowing=true"',
+        )
+        if any(
+            token in out
+            for token in (
+                "mDreamingLockscreen=true",
+                "mShowing=true",
+                "isStatusBarKeyguard=true",
+                "mKeyguardShowing=true",
+            )
+        ):
+            return True
+    except Exception:
+        pass
+
+    try:
+        trust_out = await adb_shell(serial, 'dumpsys trust | grep -i "locked"')
+        if "device is locked=true" in trust_out.lower() or "device is locked: true" in trust_out.lower():
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+async def ensure_awake(device_id: str, *, actor: str = "system") -> bool:
+    """
+    Проверяет, включен ли экран. Если выключен (по dumpsys power / Display Power state OFF /
+    mWakefulness != Awake) — посылает KEYCODE_WAKEUP, при наличии свайпа-блокировки
+    свайпает вверх, ожидает до 3 с включения экрана.
+    Возвращает True, если пришлось будить, иначе False.
+    Кеш состояния экрана не дольше 3 с на устройство.
+    """
+    if device_id in _in_ensure_awake:
+        return False
+
+    if _is_screen_cached_awake(device_id):
+        return False
+
+    _in_ensure_awake.add(device_id)
+    try:
+        serial = _get_serial(device_id)
+        if adb_shell is None:
+            raise RuntimeError("Функция adb_shell не доступна")
+
+        cmd = 'dumpsys power | grep -E "mWakefulness|Display Power"'
+        try:
+            out = await adb_shell(serial, cmd)
+        except Exception as exc:
+            if _is_offline_error(exc):
+                await _reconnect_for_device(device_id)
+                out = await adb_shell(serial, cmd)
+            else:
+                out = ""
+
+        if not _parse_screen_off(out):
+            _screen_cache[device_id] = (True, time.monotonic())
+            return False
+
+        # Экран выключен — будим
+        _screen_cache.pop(device_id, None)
+        await adb_shell(serial, "input keyevent KEYCODE_WAKEUP")
+
+        if await _check_swipe_lock(serial):
+            await adb_shell(serial, "input swipe 500 1200 500 400 300")
+            try:
+                await adb_shell(serial, "wm dismiss-keyguard")
+            except Exception:
+                pass
+
+        # Ожидаем до 3 с пока экран не включится
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            try:
+                check_out = await adb_shell(serial, cmd)
+            except Exception:
+                check_out = ""
+            if not _parse_screen_off(check_out):
+                break
+
+        _screen_cache[device_id] = (True, time.monotonic())
+        return True
+    finally:
+        _in_ensure_awake.discard(device_id)
+
+
+async def power(device_id: str, action: str, *, actor: str = "system") -> None:
+    """
+    Управление питанием устройства: wake, sleep, reboot, shutdown.
+    Пишет аудит с action=power:<action>.
+    Не вызывает ensure_awake рекурсивно.
+    """
+    act_lower = action.strip().lower()
+    if act_lower not in ("wake", "sleep", "reboot", "shutdown"):
+        raise ValueError(f"Неизвестное действие питания: {action}")
+
+    audit_action = f"power:{act_lower}"
+    params = {"action": act_lower}
+
+    async def _action() -> None:
+        serial = _get_serial(device_id)
+        if adb_shell is None:
+            raise RuntimeError("Функция adb_shell не доступна")
+
+        if act_lower == "wake":
+            await adb_shell(serial, "input keyevent KEYCODE_WAKEUP")
+            _screen_cache[device_id] = (True, time.monotonic())
+        elif act_lower == "sleep":
+            await adb_shell(serial, "input keyevent KEYCODE_SLEEP")
+            _screen_cache[device_id] = (False, time.monotonic())
+        elif act_lower == "reboot":
+            _screen_cache.pop(device_id, None)
+            await adb_shell(serial, "reboot")
+        elif act_lower == "shutdown":
+            _screen_cache.pop(device_id, None)
+            out = ""
+            has_error = False
+            try:
+                out = await adb_shell(serial, "reboot -p")
+            except Exception:
+                has_error = True
+
+            if (
+                has_error
+                or not out
+                or not out.strip()
+                or any(
+                    err in out.lower()
+                    for err in ("error", "denied", "permitted", "not allowed", "unknown")
+                )
+            ):
+                await adb_shell(serial, "svc power shutdown")
+
+    await _execute_action(device_id, audit_action, params, _action, actor=actor)
+
+
 async def screenshot(device_id: str, max_width: int = 720, *, actor: str = "system") -> bytes:
     """Делает скриншот через pull (с откатом на exec-out) и уменьшает до JPEG с помощью Pillow."""
+    await ensure_awake(device_id, actor=actor)
     params = {"max_width": max_width}
 
     # Не допускай гонок: на одно устройство одновременно один screenshot (asyncio.Lock на device_id),
@@ -332,6 +526,7 @@ async def screenshot(device_id: str, max_width: int = 720, *, actor: str = "syst
 
 async def tap(device_id: str, x: int, y: int, *, actor: str = "system") -> None:
     """Выполняет нажатие (тап) по координатам (x, y)."""
+    await ensure_awake(device_id, actor=actor)
     params = {"x": x, "y": y}
 
     async def _action() -> None:
@@ -354,6 +549,7 @@ async def swipe(
     actor: str = "system",
 ) -> None:
     """Выполняет свайп от (x1, y1) до (x2, y2) за ms миллисекунд."""
+    await ensure_awake(device_id, actor=actor)
     params = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "ms": ms}
 
     async def _action() -> None:
@@ -374,6 +570,7 @@ async def long_press(
     actor: str = "system",
 ) -> None:
     """Выполняет долгое нажатие по координатам (x, y) длительностью ms миллисекунд."""
+    await ensure_awake(device_id, actor=actor)
     params = {"x": x, "y": y, "ms": ms}
 
     async def _action() -> None:
@@ -387,6 +584,7 @@ async def long_press(
 
 async def type_text(device_id: str, text: str, *, actor: str = "system") -> None:
     """Вводит текст: латиница через input text, кириллица/эмодзи/спецсимволы через ADBKeyBoard broadcast ADB_INPUT_B64."""
+    await ensure_awake(device_id, actor=actor)
     params = {"text": text}
 
     async def _action() -> None:
@@ -419,6 +617,9 @@ async def key(device_id: str, name: str, *, actor: str = "system") -> None:
     else:
         raise ValueError(f"Неизвестная клавиша: {name}")
 
+    if key_lower not in ("power", "keycode_power"):
+        await ensure_awake(device_id, actor=actor)
+
     params = {"name": name}
 
     async def _action() -> None:
@@ -432,6 +633,7 @@ async def key(device_id: str, name: str, *, actor: str = "system") -> None:
 
 async def open_app(device_id: str, package: str, *, actor: str = "system") -> None:
     """Запускает приложение по имени пакета."""
+    await ensure_awake(device_id, actor=actor)
     params = {"package": package}
 
     async def _action() -> None:
@@ -478,6 +680,7 @@ async def list_apps(device_id: str, *, actor: str = "system") -> list[str]:
 
 async def open_url(device_id: str, url: str, *, actor: str = "system") -> None:
     """Открывает URL в браузере устройства."""
+    await ensure_awake(device_id, actor=actor)
     params = {"url": url}
 
     async def _action() -> None:
@@ -491,6 +694,7 @@ async def open_url(device_id: str, url: str, *, actor: str = "system") -> None:
 
 async def ui_dump(device_id: str, *, actor: str = "system") -> list[dict]:
     """Делает дамп интерфейса через uiautomator dump со сжатием в список элементов."""
+    await ensure_awake(device_id, actor=actor)
     params: dict[str, Any] = {}
 
     async def _action() -> list[dict]:
@@ -661,6 +865,7 @@ async def wake_and_unlock(device_id: str, *, actor: str = "system") -> None:
         await adb_shell(serial, "input keyevent KEYCODE_WAKEUP")
         await adb_shell(serial, "wm dismiss-keyguard")
         await adb_shell(serial, "input keyevent 82")
+        _screen_cache[device_id] = (True, time.monotonic())
 
     await _execute_action(device_id, "wake_and_unlock", params, _action, actor=actor)
 
