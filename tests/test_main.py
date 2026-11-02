@@ -166,7 +166,39 @@ def test_exception_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_mcp_mounted_on_mcp_path() -> None:
     """Контракт: MCP-сервер монтируется на путь /mcp."""
+    pytest.importorskip("mcp")
     settings = Settings(db_path=":memory:", devices_file="")
     app = create_app(settings)
     route_paths = [getattr(r, "path", None) for r in app.routes]
     assert "/mcp" in route_paths
+
+
+def test_mcp_initialization_failure_logged(caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ошибки отсутствия/инициализации MCP логируются как warning, а /mcp не монтируется."""
+    import logging
+    import hub.main as main_mod
+
+    def _fail_create_mcp(s):
+        raise RuntimeError("Тестовый сбой инициализации FastMCP")
+
+    monkeypatch.setattr(main_mod, "create_mcp_app", _fail_create_mcp)
+    with caplog.at_level(logging.WARNING):
+        settings = Settings(db_path=":memory:", devices_file="")
+        app = main_mod.create_app(settings)
+        route_paths = [getattr(r, "path", None) for r in app.routes]
+        assert "/mcp" not in route_paths
+        assert "MCP server initialization failed" in caplog.text
+        assert "Тестовый сбой инициализации FastMCP" in caplog.text
+
+
+def test_mcp_initialization_unexpected_error_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Неожиданные ошибки при создании MCP-приложения не глушатся."""
+    import hub.main as main_mod
+
+    def _broken_create_mcp(s):
+        raise TypeError("Unexpected type error")
+
+    monkeypatch.setattr(main_mod, "create_mcp_app", _broken_create_mcp)
+    settings = Settings(db_path=":memory:", devices_file="")
+    with pytest.raises(TypeError, match="Unexpected type error"):
+        main_mod.create_app(settings)

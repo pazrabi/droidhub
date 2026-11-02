@@ -172,6 +172,137 @@ def test_auth_secret_path(test_settings: Settings) -> None:
         assert r_ok.status_code == 200
 
 
+def test_direct_mcp_app_routing(test_settings: Settings) -> None:
+    """Прямое обращение к standalone mcp_app переписывает пути в корень (не 404)."""
+    mcp_app, _ = mcp_mod.create_mcp_app(test_settings)
+    init_payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "test-client", "version": "1.0"},
+        },
+    }
+
+    with TestClient(mcp_app) as client:
+        # 1. Прямой вызов с /mcp/<token>/
+        r1 = client.post(
+            f"/mcp/{test_settings.mcp_token}/",
+            json=init_payload,
+            headers={"Accept": "application/json, text/event-stream"},
+        )
+        assert r1.status_code == 200
+
+        # 2. Прямой вызов с /<token>/
+        r2 = client.post(
+            f"/{test_settings.mcp_token}/",
+            json=init_payload,
+            headers={"Accept": "application/json, text/event-stream"},
+        )
+        assert r2.status_code == 200
+
+        # 3. Прямой вызов с /mcp/ и Bearer заголовком
+        r3 = client.post(
+            "/mcp/",
+            json=init_payload,
+            headers={
+                "Authorization": f"Bearer {test_settings.mcp_token}",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        assert r3.status_code == 200
+
+
+def test_check_and_rewrite_path_logic() -> None:
+    """_check_and_rewrite_path всегда возвращает remaining без добавления prefix /mcp."""
+    token = "secret123"
+
+    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path(f"/mcp/{token}/", token)
+    assert ok is True
+    assert rewritten == "/"
+
+    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path(f"/mcp/{token}", token)
+    assert ok is True
+    assert rewritten == "/"
+
+    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path(f"/{token}/", token)
+    assert ok is True
+    assert rewritten == "/"
+
+    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path(f"/{token}", token)
+    assert ok is True
+    assert rewritten == "/"
+
+    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path(f"/mcp/{token}/sse", token)
+    assert ok is True
+    assert rewritten == "/sse"
+
+    # Неверный токен или отсутствие токена
+    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path("/mcp/wrong/", token)
+    assert ok is False
+
+    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path("/mcp/", token)
+    assert ok is False
+
+    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path("/", token)
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_non_http_websocket_security() -> None:
+    """Не-HTTP соединения (websocket) требуют авторизации, иначе закрываются с кодом 1008."""
+    called_scopes: list[dict] = []
+
+    async def dummy_app(scope, receive, send):
+        called_scopes.append(dict(scope))
+        await send({"type": "websocket.accept"})
+
+    mw = mcp_mod.MCPAuthMiddleware(dummy_app, get_token=lambda: "ws-secret")
+
+    # 1. Неавторизованный websocket закрывается с кодом 1008
+    events: list[dict] = []
+    scope_unauth = {"type": "websocket", "path": "/mcp/", "headers": []}
+
+    async def send_1(msg):
+        events.append(msg)
+
+    await mw(scope_unauth, None, send_1)
+    assert len(called_scopes) == 0
+    assert events == [{"type": "websocket.close", "code": 1008}]
+
+    # 2. Авторизованный через заголовок Bearer проходит
+    events.clear()
+    scope_bearer = {
+        "type": "websocket",
+        "path": "/mcp/",
+        "headers": [(b"authorization", b"Bearer ws-secret")],
+    }
+    await mw(scope_bearer, None, send_1)
+    assert len(called_scopes) == 1
+    assert called_scopes[-1]["path"] == "/"
+
+    # 3. Авторизованный через секретный путь проходит с переписанным путем
+    events.clear()
+    scope_path = {"type": "websocket", "path": "/mcp/ws-secret/", "headers": []}
+    await mw(scope_path, None, send_1)
+    assert len(called_scopes) == 2
+    assert called_scopes[-1]["path"] == "/"
+
+    # 4. При пустом токене (сервер выключен) websocket закрывается
+    mw_off = mcp_mod.MCPAuthMiddleware(dummy_app, get_token=lambda: "")
+    events.clear()
+    await mw_off(scope_bearer, None, send_1)
+    assert len(called_scopes) == 2  # не вызвался dummy_app
+    assert events == [{"type": "websocket.close", "code": 1008}]
+
+    # 5. Lifespan проходит без авторизации
+    scope_lifespan = {"type": "lifespan"}
+    await mw(scope_lifespan, None, send_1)
+    assert len(called_scopes) == 3
+
+
 # --- 3. Проверка вызова инструментов с замоканными actions ---
 
 @pytest.mark.asyncio

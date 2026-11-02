@@ -334,17 +334,21 @@ class MCPAuthMiddleware:
         self.get_token = get_token
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        scope_type = scope.get("type")
+        if scope_type == "lifespan":
             await self.app(scope, receive, send)
             return
 
         expected_token = (self.get_token() or "").strip()
         if not expected_token:
-            resp = JSONResponse(
-                {"detail": "MCP сервер отключен (mcp_token не настроен)"},
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            )
-            await resp(scope, receive, send)
+            if scope_type == "http":
+                resp = JSONResponse(
+                    {"detail": "MCP сервер отключен (mcp_token не настроен)"},
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+                await resp(scope, receive, send)
+            elif scope_type == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
             return
 
         path = scope.get("path", "")
@@ -367,13 +371,24 @@ class MCPAuthMiddleware:
             new_path = candidate_path
 
         if not authorized:
-            resp = JSONResponse(
-                {"detail": "Не авторизован"},
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-            await resp(scope, receive, send)
+            if scope_type == "http":
+                resp = JSONResponse(
+                    {"detail": "Не авторизован"},
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+                await resp(scope, receive, send)
+            elif scope_type == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
             return
+
+        # Если обращение шло напрямую к FastMCP приложению по пути /mcp или /mcp/ (например, с Bearer auth)
+        if new_path == "/mcp":
+            new_path = "/"
+        elif new_path.startswith("/mcp/"):
+            new_path = new_path[4:]
+            if not new_path:
+                new_path = "/"
 
         if new_path != path:
             scope = dict(scope)
@@ -386,10 +401,8 @@ class MCPAuthMiddleware:
     def _check_and_rewrite_path(path: str, expected_token: str) -> tuple[bool, str]:
         if path == "/mcp" or path.startswith("/mcp/"):
             subpath = path[4:]
-            prefix = "/mcp"
         else:
             subpath = path
-            prefix = ""
 
         parts = [p for p in subpath.split("/") if p]
         if parts:
@@ -400,7 +413,7 @@ class MCPAuthMiddleware:
                     remaining = "/"
                 elif not remaining.startswith("/"):
                     remaining = "/" + remaining
-                return True, prefix + remaining
+                return True, remaining
 
         return False, path
 

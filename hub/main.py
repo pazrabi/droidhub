@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import logging
 import os
 from pathlib import Path
 
@@ -60,7 +61,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if create_mcp_app is not None:
         try:
             mcp_app, mcp_lifespan_ctx = create_mcp_app(settings)
-        except Exception:
+        except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
+            logging.getLogger(__name__).warning("MCP server initialization failed: %s", exc, exc_info=True)
             mcp_app = None
             mcp_lifespan_ctx = None
 
