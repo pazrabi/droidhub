@@ -20,6 +20,7 @@
 - 2026-11-02 — Принята и слита локально `5e9af5a1ba7e` (routes.py, main.py, тесты; 1 раунд, approved). Всего 119 тестов зелёные. Ждём auth, web, deploy.
 - 2026-11-02 — Слита локально `d585dc44992c` (hub/web: views, шаблоны, JS/CSS, test_web; 1 раунд, approved). Сейчас test_web не собирается: (1) в test_main/test_routes заглушки sys.modules подменяют hub.auth и hub.web.views — убрать после прихода настоящего auth.py; (2) `str | None` в сигнатурах FastAPI падает на Python 3.9 (локальный Mac), на сервере 3.14 ок — привести к Optional[str]. Сделаю после приёмки auth.
 - 2026-11-02 — Приняты `34221236efd9` (auth.py, 2 раунда) и `55c69ee603ab` (deploy/, docs/phone-setup.md, README; 2 раунда). Интеграция моими правками: убраны sys.modules-заглушки из test_main/test_routes, в routes.py прямой импорт require_api, в test_routes dependency_overrides, views.py -> Optional[str] (совместимость с Python 3.9), 2 scrypt-теста пропускаются на Mac (нет hashlib.scrypt). Итог: 162 passed, 2 skipped. Этап 2 по коду готов, ещё не выложен на сервер. install.sh прочитан: делает бэкап Caddyfile, validate, не трогает .env и блок пула.
+- 2026-11-02 — Этап 2 запушен в main (19c8220). Поставлена волна 3: `7170e1160c4b` mcp_server.py + подключение в main.py + тесты + раздел MCP в README. Пока идёт — в main не пушить.
 
 ## Дальше
 - Волна 3: mcp_server.py + тесты, раздел MCP в README.
