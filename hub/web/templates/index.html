@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+
+{% block title %}Устройства — Phone Hub{% endblock %}
+
+{% block content %}
+<div class="devices-page">
+  <div class="page-header">
+    <h1 class="page-title">Подключенные устройства</h1>
+    <button id="btn-refresh-devices" class="btn btn-outline btn-sm">↻ Обновить</button>
+  </div>
+
+  <div class="devices-grid" id="devices-container">
+    {% if devices %}
+      {% for d in devices %}
+      <div class="device-card" id="card-{{ d.id }}">
+        <div class="device-card-header">
+          <h2 class="device-card-title">{{ d.name or d.id }}</h2>
+          {% if d.online %}
+            <span class="badge badge-success">В сети</span>
+          {% else %}
+            <span class="badge badge-danger">Не в сети</span>
+          {% endif %}
+        </div>
+        <div class="device-card-body">
+          <div class="device-meta-row">
+            <span class="meta-label">ID:</span>
+            <span class="meta-value">{{ d.id }}</span>
+          </div>
+          <div class="device-meta-row">
+            <span class="meta-label">Батарея:</span>
+            <span class="meta-value">
+              {% if d.battery is not none %}{{ d.battery }}%{% else %}—{% endif %}
+            </span>
+          </div>
+          <div class="device-meta-row">
+            <span class="meta-label">Температура:</span>
+            <span class="meta-value">
+              {% if d.temperature is not none %}{{ d.temperature }}°C{% else %}—{% endif %}
+            </span>
+          </div>
+          <div class="device-meta-row">
+            <span class="meta-label">Экран:</span>
+            <span class="meta-value">
+              {% if d.screen_on is true %}Включен{% elif d.screen_on is false %}Выключен{% else %}—{% endif %}
+            </span>
+          </div>
+          {% if d.error %}
+          <div class="device-error-text">
+            {{ d.error }}
+          </div>
+          {% endif %}
+        </div>
+        <div class="device-card-actions">
+          <a href="/device/{{ d.id }}" class="btn btn-primary btn-sm btn-block" id="btn-open-{{ d.id }}">
+            Открыть экран
+          </a>
+        </div>
+      </div>
+      {% endfor %}
+    {% else %}
+      <div class="empty-state" id="no-devices-msg">
+        <p>Нет подключенных устройств или устройства не настроены.</p>
+      </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
