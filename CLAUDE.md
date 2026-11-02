@@ -48,3 +48,21 @@
 
 ### HTTP API (hub/api/routes.py), все пути под `/api`, авторизация: сессия панели ИЛИ заголовок `Authorization: Bearer <api_token>`
 `GET /api/devices`, `GET /api/devices/{id}/screenshot?max_width=`, `POST /api/devices/{id}/tap {x,y}`, `/swipe`, `/text {text}`, `/key {name}`, `/open_app {package}`, `GET /api/devices/{id}/apps`, `GET /api/devices/{id}/ui`, `GET /api/audit`.
+
+## Контракты этапа 2
+
+### hub/auth.py
+`hash_password(pw: str) -> str` (stdlib scrypt/pbkdf2, формат `algo$params$salt$hash`), `verify_password(pw, hashed) -> bool` (constant-time). `class LoginLimiter`: `__init__(max_attempts=5, window_s=300)`, `check(key: str) -> bool` (можно ли пробовать), `fail(key)`, `reset(key)`.
+FastAPI-зависимости: `require_user(request) -> str` (логин из сессии, иначе 401 для /api и редирект на /login для страниц обрабатывает веб-слой), `require_api(request) -> str` (сессия ИЛИ `Authorization: Bearer <api_token>`, возвращает actor: логин или `"api"`; токены сравнивать через `hmac.compare_digest`).
+`auth_router` (APIRouter без префикса): `POST /login` (form: username, password; ограничение попыток по IP; успех -> сессия `request.session["user"]`, редирект 303 на `/`; ошибка -> редирект на `/login?error=1`), `POST /logout`.
+`python -m hub.auth hash` спрашивает пароль через getpass и печатает хэш для `.env`.
+Сессия: starlette `SessionMiddleware` подключается в `main.py` (ключ `session_secret`, cookie `https_only` если `HUB_COOKIE_SECURE=true`).
+
+### hub/main.py
+`create_app(settings: Settings | None = None) -> FastAPI`: собирает настройки, `DeviceManager`, `init_audit`, `actions.set_manager`, SessionMiddleware, подключает `auth_router`, `hub.api.routes.api_router` (префикс `/api` уже внутри роутера), `hub.web.views.web_router`, статику `/static` из `hub/web/static`; lifespan запускает/останавливает manager. `app = create_app()` на уровне модуля НЕ создавать (ленивый `def app_factory()` для uvicorn `--factory`). Запуск: `uvicorn hub.main:create_app --factory --host 127.0.0.1 --port 8090`.
+
+### hub/api/routes.py
+`api_router = APIRouter(prefix="/api", dependencies=[Depends(require_api)])`. Эндпоинты из раздела «HTTP API» выше + `GET /api/health` (без авторизации — вынести отдельным роутером `public_router`, также подключается в main). Ошибки adb -> 502 с русским текстом, неизвестный device_id -> 404, `shell` не отдавать в HTTP API вообще. Лимит `rate_limit_per_min` действий на устройство (скользящее окно в памяти, 429). Все действия вызывают функции из `hub/devices/actions.py` с `actor=` из `require_api`.
+
+### hub/web/views.py
+`web_router`: `GET /login` (страница входа), `GET /` (список устройств, нужна сессия, иначе редирект на /login), `GET /device/{id}` (экран телефона). Шаблоны Jinja2 в `hub/web/templates/`, статика в `hub/web/static/` (`app.js`, `style.css`). Страницы работают только через `/api/...` с cookie-сессией. Никаких CDN и фреймворков, только vanilla JS. Адаптивная вёрстка (телефон), тач-события, тёмная тема. Экран: обновление скриншота 1–3 раза в секунду (не накладывать запросы друг на друга), тап по картинке с пересчётом координат из размера картинки в реальные (размер экрана брать из заголовка ответа `X-Screen-Width`/`X-Screen-Height`, которые добавляет `/screenshot`), свайп мышью/пальцем, поле ввода текста, кнопки Назад/Домой/Недавние/Питание, список приложений с запуском.
