@@ -91,6 +91,8 @@ def test_settings_defaults() -> None:
     assert settings.full_charge_hours == 6.0
     assert settings.offline_alert_min == 10.0
     assert settings.alert_cooldown_min == 30.0
+    assert settings.alert_tag == "droidhub"
+    assert settings.public_url == ""
 
 
 def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -240,6 +242,8 @@ def test_get_settings_alert_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HUB_FULL_CHARGE_HOURS", "8.5")
     monkeypatch.setenv("HUB_OFFLINE_ALERT_MIN", "15.0")
     monkeypatch.setenv("HUB_ALERT_COOLDOWN_MIN", "45.0")
+    monkeypatch.setenv("HUB_ALERT_TAG", "testhub")
+    monkeypatch.setenv("HUB_PUBLIC_URL", "https://hub.example.com/")
 
     settings = get_settings()
     assert settings.telegram_token == "123456:ABC-DEF"
@@ -250,3 +254,14 @@ def test_get_settings_alert_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.full_charge_hours == 8.5
     assert settings.offline_alert_min == 15.0
     assert settings.alert_cooldown_min == 45.0
+    assert settings.alert_tag == "testhub"
+    assert settings.public_url == "https://hub.example.com"
+
+
+def test_settings_public_url_strips_slash() -> None:
+    settings = Settings(public_url="https://hub.example.com/")
+    assert settings.public_url == "https://hub.example.com"
+    settings_no_slash = Settings(public_url="https://hub.example.com")
+    assert settings_no_slash.public_url == "https://hub.example.com"
+    settings_empty = Settings(public_url="")
+    assert settings_empty.public_url == ""
