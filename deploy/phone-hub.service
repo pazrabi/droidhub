@@ -11,6 +11,7 @@ WorkingDirectory=/opt/phone-hub
 EnvironmentFile=/opt/phone-hub/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HOME=/opt/phone-hub
 ExecStart=/opt/phone-hub/venv/bin/uvicorn hub.main:create_app --factory --host 127.0.0.1 --port 8090
 Restart=always
 RestartSec=5
@@ -31,7 +32,7 @@ RestrictSUIDSGID=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 LockPersonality=true
-ReadWritePaths=/opt/phone-hub/data /opt/phone-hub/config
+ReadWritePaths=/opt/phone-hub/data /opt/phone-hub/config /opt/phone-hub/.android
 
 [Install]
 WantedBy=multi-user.target
