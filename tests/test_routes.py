@@ -249,6 +249,9 @@ def test_unknown_device_returns_404(client: TestClient) -> None:
     res_apps = client.get("/api/devices/unknown_dev/apps")
     assert res_apps.status_code == 404
 
+    res_power = client.post("/api/devices/unknown_dev/power", json={"action": "wake"})
+    assert res_power.status_code == 404
+
 
 def test_adb_errors_mapping_502(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """Ошибки ADB мапятся в 502 с понятным текстом."""
@@ -312,3 +315,143 @@ def test_no_shell_endpoint_exposed() -> None:
     route_paths = [r.path for r in api_router.routes] + [r.path for r in public_router.routes]
     for path in route_paths:
         assert "shell" not in path.lower()
+
+
+def test_power_action_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """POST /api/devices/{id}/power успешен для wake, sleep, reboot (confirm=True), shutdown (confirm=True)."""
+    mock_power = AsyncMock(return_value=None)
+    monkeypatch.setattr(actions, "power", mock_power)
+
+    # 1. wake
+    res_wake = client.post("/api/devices/realme/power", json={"action": "wake"})
+    assert res_wake.status_code == 200
+    assert res_wake.json() == {"ok": True, "status": "ok"}
+    mock_power.assert_called_with("realme", "wake", actor=TEST_ACTOR)
+
+    # 2. sleep
+    mock_power.reset_mock()
+    res_sleep = client.post("/api/devices/realme/power", json={"action": "sleep"})
+    assert res_sleep.status_code == 200
+    assert res_sleep.json() == {"ok": True, "status": "ok"}
+    mock_power.assert_called_with("realme", "sleep", actor=TEST_ACTOR)
+
+    # 3. reboot с confirm=True
+    mock_power.reset_mock()
+    res_reboot = client.post("/api/devices/realme/power", json={"action": "reboot", "confirm": True})
+    assert res_reboot.status_code == 200
+    assert res_reboot.json() == {"ok": True, "status": "ok"}
+    mock_power.assert_called_with("realme", "reboot", actor=TEST_ACTOR)
+
+    # 4. shutdown с confirm=True
+    mock_power.reset_mock()
+    res_shutdown = client.post("/api/devices/realme/power", json={"action": "shutdown", "confirm": True})
+    assert res_shutdown.status_code == 200
+    assert res_shutdown.json() == {"ok": True, "status": "ok"}
+    mock_power.assert_called_with("realme", "shutdown", actor=TEST_ACTOR)
+
+
+def test_power_action_requires_confirm_400(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """reboot и shutdown требуют confirm=true иначе 400 с русским текстом."""
+    mock_power = AsyncMock(return_value=None)
+    monkeypatch.setattr(actions, "power", mock_power)
+
+    # 1. reboot без поля confirm
+    res_reboot_no_confirm = client.post("/api/devices/realme/power", json={"action": "reboot"})
+    assert res_reboot_no_confirm.status_code == 400
+    detail = res_reboot_no_confirm.json()["detail"].lower()
+    assert "подтвержден" in detail or "confirm" in detail
+
+    # 2. reboot с confirm=False
+    res_reboot_false = client.post("/api/devices/realme/power", json={"action": "reboot", "confirm": False})
+    assert res_reboot_false.status_code == 400
+
+    # 3. shutdown без поля confirm
+    res_shutdown_no_confirm = client.post("/api/devices/realme/power", json={"action": "shutdown"})
+    assert res_shutdown_no_confirm.status_code == 400
+    detail = res_shutdown_no_confirm.json()["detail"].lower()
+    assert "подтвержден" in detail or "confirm" in detail
+
+    # 4. shutdown с confirm=False
+    res_shutdown_false = client.post("/api/devices/realme/power", json={"action": "shutdown", "confirm": False})
+    assert res_shutdown_false.status_code == 400
+
+    # actions.power не должен вызываться
+    mock_power.assert_not_called()
+
+
+def test_power_action_unknown_device_404(client: TestClient) -> None:
+    """Неизвестное устройство возвращает 404."""
+    res = client.post("/api/devices/unknown_dev/power", json={"action": "wake"})
+    assert res.status_code == 404
+    assert "не найдено" in res.json()["detail"].lower()
+
+
+def test_power_action_adb_errors_502(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ошибки ADB мапятся в 502 с понятным текстом."""
+    # 1. DeviceOffline -> 502
+    mock_power = AsyncMock(side_effect=DeviceOffline("Устройство 'realme' оффлайн или не найдено"))
+    monkeypatch.setattr(actions, "power", mock_power)
+    res1 = client.post("/api/devices/realme/power", json={"action": "wake"})
+    assert res1.status_code == 502
+    assert "оффлайн" in res1.json()["detail"]
+
+    # 2. AdbTimeout -> 502
+    mock_power = AsyncMock(side_effect=AdbTimeout("Превышено время ожидания команды ADB (15.0 с)"))
+    monkeypatch.setattr(actions, "power", mock_power)
+    res2 = client.post("/api/devices/realme/power", json={"action": "wake"})
+    assert res2.status_code == 502
+    assert "время ожидания" in res2.json()["detail"]
+
+    # 3. AdbError -> 502
+    mock_power = AsyncMock(side_effect=AdbError("Ошибка выполнения ADB (код 1)"))
+    monkeypatch.setattr(actions, "power", mock_power)
+    res3 = client.post("/api/devices/realme/power", json={"action": "wake"})
+    assert res3.status_code == 502
+    assert "Ошибка выполнения ADB" in res3.json()["detail"]
+
+
+def test_power_action_invalid_action_422(client: TestClient) -> None:
+    """Неверное действие возвращает 422."""
+    res1 = client.post("/api/devices/realme/power", json={"action": "invalid"})
+    assert res1.status_code == 422
+
+    res2 = client.post("/api/devices/realme/power", json={"action": "restart"})
+    assert res2.status_code == 422
+
+    res3 = client.post("/api/devices/realme/power", json={})
+    assert res3.status_code == 422
+
+
+def test_power_action_rate_limiter_429(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Эндпоинт питания учитывает общий лимит действий на устройство (429)."""
+    settings = Settings(rate_limit_per_min=1)
+    monkeypatch.setattr("hub.api.routes.get_settings", lambda: settings)
+    monkeypatch.setattr(actions, "power", AsyncMock(return_value=None))
+
+    res1 = client.post("/api/devices/realme/power", json={"action": "wake"})
+    assert res1.status_code == 200
+
+    res2 = client.post("/api/devices/realme/power", json={"action": "wake"})
+    assert res2.status_code == 429
+    assert "лимит действий" in res2.json()["detail"].lower()
+
+
+def test_get_devices_charging_field(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /api/devices добавляет charging (bool|None) если оно есть у DeviceStatus, иначе не меняет."""
+    # 1. По умолчанию у DeviceStatus нет charging -> в ответе поля charging нет
+    res_default = client.get("/api/devices")
+    assert res_default.status_code == 200
+    data_default = res_default.json()
+    assert len(data_default) == 2
+    for item in data_default:
+        assert "charging" not in item
+
+    # 2. Если у DeviceStatus есть charging -> в ответе появляется поле charging
+    monkeypatch.setattr(DeviceStatus, "charging", True, raising=False)
+    res_with_charging = client.get("/api/devices")
+    assert res_with_charging.status_code == 200
+    data_with_charging = res_with_charging.json()
+    assert len(data_with_charging) == 2
+    for item in data_with_charging:
+        assert "charging" in item
+        assert item["charging"] is True
