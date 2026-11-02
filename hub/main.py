@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import logging
 import os
 from pathlib import Path
 
@@ -15,6 +16,11 @@ from hub.config import Settings, get_settings, load_devices
 from hub.devices import actions
 from hub.devices.adb import AdbError
 from hub.devices.manager import DeviceManager
+
+try:
+    from hub.mcp_server import create_mcp_app
+except (ImportError, ModuleNotFoundError):
+    create_mcp_app = None  # type: ignore
 
 # Контракты параллельной разработки
 try:
@@ -50,11 +56,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     manager = DeviceManager(devices)
     actions.set_manager(manager)
 
+    mcp_app = None
+    mcp_lifespan_ctx = None
+    if create_mcp_app is not None:
+        try:
+            mcp_app, mcp_lifespan_ctx = create_mcp_app(settings)
+        except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
+            logging.getLogger(__name__).warning("MCP server initialization failed: %s", exc, exc_info=True)
+            mcp_app = None
+            mcp_lifespan_ctx = None
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await manager.start()
         try:
-            yield
+            if mcp_lifespan_ctx is not None:
+                async with mcp_lifespan_ctx():
+                    yield
+            else:
+                yield
         finally:
             await manager.stop()
 
@@ -81,6 +101,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     static_dir = _get_static_dir()
     if static_dir.is_dir():
         app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    # MCP-сервер
+    if mcp_app is not None:
+        app.mount("/mcp", mcp_app)
 
     # Обработчики ошибок
     @app.exception_handler(AdbError)
