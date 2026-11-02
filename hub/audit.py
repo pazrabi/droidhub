@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
 
 class Audit:
@@ -14,6 +15,7 @@ class Audit:
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
+        self._lock = asyncio.Lock()
         if self.db_path == ":memory:":
             import uuid
 
@@ -21,8 +23,9 @@ class Audit:
             self._resolved_path = f"file:{mem_name}?mode=memory&cache=shared"
             self._is_uri = True
             self._keep_alive: sqlite3.Connection | None = sqlite3.connect(
-                self._resolved_path, uri=True
+                self._resolved_path, timeout=5.0, uri=True
             )
+            self._keep_alive.execute("PRAGMA busy_timeout=5000;")
         else:
             self._resolved_path = self.db_path
             self._is_uri = False
@@ -34,27 +37,38 @@ class Audit:
         self._init_db_sync()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._resolved_path, uri=self._is_uri)
+        conn = sqlite3.connect(self._resolved_path, timeout=5.0, uri=self._is_uri)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000;")
         return conn
 
+    @contextlib.contextmanager
+    def _connection(self) -> Generator[sqlite3.Connection, None, None]:
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
     def _init_db_sync(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp REAL NOT NULL,
-                    actor TEXT NOT NULL,
-                    device_id TEXT,
-                    action TEXT NOT NULL,
-                    params TEXT NOT NULL,
-                    ok INTEGER NOT NULL,
-                    error TEXT
+        with self._connection() as conn:
+            with conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA busy_timeout=5000;")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS audit_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp REAL NOT NULL,
+                        actor TEXT NOT NULL,
+                        device_id TEXT,
+                        action TEXT NOT NULL,
+                        params TEXT NOT NULL,
+                        ok INTEGER NOT NULL,
+                        error TEXT
+                    )
+                    """
                 )
-                """
-            )
-            conn.commit()
 
     async def log(
         self,
@@ -68,26 +82,27 @@ class Audit:
         """Записывает событие в журнал аудита."""
         def _do_log() -> None:
             safe_params = params if params is not None else {}
-            params_json = json.dumps(safe_params, ensure_ascii=False)
+            params_json = json.dumps(safe_params, ensure_ascii=False, default=str)
             ts = time.time()
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO audit_log (timestamp, actor, device_id, action, params, ok, error)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (ts, actor, device_id, action, params_json, 1 if ok else 0, error),
-                )
-                conn.commit()
+            with self._connection() as conn:
+                with conn:
+                    conn.execute(
+                        """
+                        INSERT INTO audit_log (timestamp, actor, device_id, action, params, ok, error)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (ts, actor, device_id, action, params_json, 1 if ok else 0, error),
+                    )
 
-        await asyncio.to_thread(_do_log)
+        async with self._lock:
+            await asyncio.to_thread(_do_log)
 
     async def recent(self, limit: int = 100) -> list[dict]:
         """Возвращает последние записи журнала аудита (новые сначала)."""
         def _do_recent() -> list[dict]:
             if limit <= 0:
                 return []
-            with self._connect() as conn:
+            with self._connection() as conn:
                 cursor = conn.execute(
                     """
                     SELECT id, timestamp, actor, device_id, action, params, ok, error

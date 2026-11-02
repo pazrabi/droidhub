@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -98,3 +99,84 @@ async def test_audit_module_init_and_get(tmp_path: Path) -> None:
     assert records[0]["params"] == {"max_width": 720}
 
     instance.close()
+
+
+@pytest.mark.asyncio
+async def test_audit_memory_mode() -> None:
+    audit = Audit(":memory:")
+
+    # Проверяем запись обычных параметров и несериализуемых напрямую в JSON объектов
+    await audit.log(
+        actor="mem_user",
+        device_id="mem_dev",
+        action="action_mem",
+        params={
+            "path": Path("/var/log/test"),
+            "error_obj": ValueError("ошибка валидации"),
+            "bytes_val": b"binary",
+            "number": 42,
+        },
+        ok=True,
+    )
+
+    records = await audit.recent(limit=10)
+    assert len(records) == 1
+    assert records[0]["actor"] == "mem_user"
+    assert records[0]["device_id"] == "mem_dev"
+    assert records[0]["action"] == "action_mem"
+    assert records[0]["ok"] is True
+    assert records[0]["params"]["path"] == "/var/log/test"
+    assert "ошибка валидации" in records[0]["params"]["error_obj"]
+    assert "binary" in records[0]["params"]["bytes_val"]
+    assert records[0]["params"]["number"] == 42
+
+    audit.close()
+
+
+@pytest.mark.asyncio
+async def test_audit_concurrent_writes_memory() -> None:
+    audit = Audit(":memory:")
+    total = 30
+
+    async def log_entry(i: int) -> None:
+        await audit.log(
+            actor=f"concurrent_actor_{i}",
+            device_id=f"device_{i}",
+            action="tap",
+            params={"index": i},
+            ok=(i % 2 == 0),
+        )
+
+    await asyncio.gather(*[log_entry(i) for i in range(total)])
+
+    records = await audit.recent(limit=total + 10)
+    assert len(records) == total
+    actors = {r["actor"] for r in records}
+    assert actors == {f"concurrent_actor_{i}" for i in range(total)}
+
+    audit.close()
+
+
+@pytest.mark.asyncio
+async def test_audit_concurrent_writes_file(tmp_path: Path) -> None:
+    db_file = tmp_path / "concurrent_file.db"
+    audit = Audit(db_file)
+    total = 30
+
+    async def log_entry(i: int) -> None:
+        await audit.log(
+            actor=f"file_actor_{i}",
+            device_id="dev1",
+            action="swipe",
+            params={"idx": i, "path": Path(f"/data/{i}")},
+            ok=True,
+        )
+
+    await asyncio.gather(*[log_entry(i) for i in range(total)])
+
+    records = await audit.recent(limit=total + 10)
+    assert len(records) == total
+    actors = {r["actor"] for r in records}
+    assert actors == {f"file_actor_{i}" for i in range(total)}
+
+    audit.close()

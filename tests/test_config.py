@@ -98,6 +98,7 @@ def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
         "HUB_RATE_LIMIT_PER_MIN",
         "HUB_DEVICES_FILE",
         "HUB_DB_PATH",
+        "HUB_ENV_FILE",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -112,7 +113,7 @@ def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HUB_DEVICES_FILE", "custom/devices.yaml")
     monkeypatch.setenv("HUB_DB_PATH", "custom/hub.db")
 
-    settings = get_settings(env_file="non_existent.env")
+    settings = get_settings()
     assert settings.admin_user == "superadmin"
     assert settings.admin_password_hash == "hashed_pwd_123"
     assert settings.session_secret == "super_secret_session"
@@ -123,6 +124,48 @@ def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.rate_limit_per_min == 120
     assert settings.devices_file == "custom/devices.yaml"
     assert settings.db_path == "custom/hub.db"
+
+
+def test_get_settings_default_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Очищаем все возможные переменные окружения
+    for key in (
+        "HUB_ADMIN_USER",
+        "HUB_ADMIN_PASSWORD_HASH",
+        "HUB_SESSION_SECRET",
+        "HUB_MCP_TOKEN",
+        "HUB_API_TOKEN",
+        "HUB_ADB_PATH",
+        "HUB_ALLOW_SHELL",
+        "HUB_RATE_LIMIT_PER_MIN",
+        "HUB_DEVICES_FILE",
+        "HUB_DB_PATH",
+        "HUB_ENV_FILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    # Вызов get_settings() без аргументов (основной контракт)
+    settings = get_settings()
+    assert isinstance(settings, Settings)
+    assert settings.devices_file == "config/devices.yaml"
+    assert settings.db_path == "data/hub.db"
+    assert settings.admin_user == ""
+    assert settings.admin_password_hash == ""
+    assert settings.session_secret == ""
+    assert settings.mcp_token == ""
+    assert settings.api_token == ""
+    assert settings.adb_path == "adb"
+    assert settings.allow_shell is False
+    assert settings.rate_limit_per_min == 60
+
+    # Проверяем чтение переменных окружения при вызове без аргументов
+    monkeypatch.setenv("HUB_ADMIN_USER", "default_caller")
+    monkeypatch.setenv("HUB_ALLOW_SHELL", "true")
+    monkeypatch.setenv("HUB_RATE_LIMIT_PER_MIN", "45")
+
+    settings_env = get_settings()
+    assert settings_env.admin_user == "default_caller"
+    assert settings_env.allow_shell is True
+    assert settings_env.rate_limit_per_min == 45
 
 
 def test_get_settings_from_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
