@@ -39,6 +39,49 @@ from hub.config import Settings, get_settings
 from hub.devices import actions
 
 
+# --- Вспомогательные структуры данных и маппинги ---
+
+CLASS_MAP: dict[str, str] = {
+    "Button": "Кнопка",
+    "ImageButton": "Кнопка",
+    "TextView": "Текст",
+    "EditText": "Поле ввода",
+    "ImageView": "Картинка",
+    "CheckBox": "Флажок",
+    "RadioButton": "Радиокнопка",
+    "Switch": "Переключатель",
+    "ProgressBar": "Прогресс",
+    "SeekBar": "Ползунок",
+    "Spinner": "Список",
+    "ListView": "Список",
+    "RecyclerView": "Список",
+    "ScrollView": "Прокрутка",
+    "WebView": "WebView",
+    "View": "Элемент",
+    "ViewGroup": "Группа",
+    "FrameLayout": "Контейнер",
+    "LinearLayout": "Контейнер",
+    "RelativeLayout": "Контейнер",
+}
+
+
+def _is_truthy(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1")
+    return bool(val)
+
+
+@dataclasses.dataclass
+class _LookCacheEntry:
+    timestamp: float
+    indices: dict[int, tuple[int, int]]
+
+
+_look_cache: dict[str, _LookCacheEntry] = {}
+
+
 # --- Вспомогательный локальный ограничитель (fallback, если limiter недоступен) ---
 
 class _LocalDeviceLimiter:
@@ -114,8 +157,9 @@ if FastMCP is not None:
         "phone-hub",
         instructions=(
             "Сервер Phone Hub для удаленного управления Android-телефонами через ADB. "
-            "Перед выполнением действий (tap, swipe, type_text) всегда вызывайте ui_dump или screenshot "
-            "для получения точных координат и актуального состояния экрана."
+            "Главный инструмент просмотра экрана — look: компактный и быстрый список элементов с индексами и координатами. "
+            "Предпочитайте look скриншоту; скриншот использовать только когда в look нет нужных элементов (игры, картинки, WebView). "
+            "Для нажатия элементов используйте tap_index по номерам из последнего вызова look."
         ),
     )
 else:
@@ -130,11 +174,8 @@ if mcp_server is not None:
 
     @mcp_server.tool()
     async def list_devices(device_id: str = "") -> list[dict[str, Any]]:
-        """Получить список всех настроенных Android-устройств и их текущие статусы.
-
-        Возвращает список устройств с параметрами: id, name, online, battery (заряд в %),
-        temperature (°C), screen_on. Используйте этот инструмент первым, чтобы узнать доступные device_id.
-        """
+        """Получить список настроенных Android-устройств и их статусы; используй первым для получения device_id.
+Get list of configured Android devices and their statuses; use first to obtain device_id."""
         mgr = actions.get_manager()
         statuses = mgr.statuses()
         results: list[dict[str, Any]] = []
@@ -159,11 +200,8 @@ if mcp_server is not None:
 
     @mcp_server.tool()
     async def device_status(device_id: str) -> dict[str, Any]:
-        """Получить детальный статус конкретного Android-устройства по device_id.
-
-        Возвращает параметры: id, name, online (доступен ли по ADB), battery (уровень заряда в %),
-        temperature (температура батареи в °C), screen_on (включен ли экран), last_seen, error.
-        """
+        """Получить детальный статус Android-устройства (батарея, температура, экран) по device_id.
+Get detailed Android device status (battery, temperature, screen) by device_id."""
         await _enforce_rate_limit(device_id)
         mgr = actions.get_manager()
         try:
@@ -190,12 +228,188 @@ if mcp_server is not None:
             raise
 
     @mcp_server.tool()
-    async def screenshot(device_id: str, max_width: int = 720) -> Image:
-        """Сделать скриншот экрана Android-устройства и вернуть изображение JPEG.
+    async def look(device_id: str) -> str:
+        """Главный инструмент «посмотреть на экран»: компактный текстовый список элементов в пикселях; предпочитай look скриншоту, скриншот только когда в look нет нужных элементов (игры, картинки, WebView).
+Main tool to view screen: compact text list of elements in pixels; prefer look over screenshot, use screenshot only when elements are missing in look (games, images, WebView)."""
+        await _enforce_rate_limit(device_id)
+        raw_dump = await actions.ui_dump(device_id, actor="mcp")
 
-        ОБЯЗАТЕЛЬНО делайте screenshot или ui_dump перед выполнением любых действий (tap, swipe, type_text),
-        чтобы увидеть текущее состояние экрана. Координаты элементов на экране измеряются в пикселях.
-        """
+        pkg: str | None = None
+        act: str | None = None
+        if isinstance(raw_dump, dict):
+            raw_elements = raw_dump.get("elements", [])
+            pkg = raw_dump.get("package")
+            act = raw_dump.get("activity")
+        elif isinstance(raw_dump, list):
+            raw_elements = raw_dump
+        else:
+            raw_elements = []
+
+        # 1. Поиск пакета / активити если доступно
+        for el in raw_elements:
+            if isinstance(el, dict):
+                if not pkg and el.get("package"):
+                    pkg = str(el["package"]).strip() or None
+                if not act and el.get("activity"):
+                    act = str(el["activity"]).strip() or None
+                if not pkg and el.get("resource_id") and ":id/" in str(el["resource_id"]):
+                    prefix = str(el["resource_id"]).split(":id/")[0]
+                    if "." in prefix and not prefix.startswith("android"):
+                        pkg = prefix
+
+        header_line: str | None = None
+        if pkg and act:
+            header_line = f"Экран: {pkg} / {act}"
+        elif pkg:
+            header_line = f"Экран: {pkg}"
+        elif act:
+            header_line = f"Экран: {act}"
+
+        # 2. Фильтрация только значимых элементов
+        candidates: list[tuple[int, int, str, str, str, dict[str, Any]]] = []
+        for el in raw_elements:
+            if not isinstance(el, dict):
+                continue
+            text_raw = (el.get("text") or "").strip()
+            desc_raw = (el.get("content_desc") or "").strip()
+            clickable = _is_truthy(el.get("clickable"))
+            scrollable = _is_truthy(el.get("scrollable"))
+            checkable = _is_truthy(el.get("checkable"))
+            editable = _is_truthy(el.get("editable"))
+            cls_raw = el.get("class") or ""
+            if "EditText" in cls_raw:
+                editable = True
+
+            if not (text_raw or desc_raw or clickable or scrollable or checkable or editable):
+                continue
+
+            center = el.get("center")
+            if isinstance(center, (list, tuple)) and len(center) >= 2:
+                cx, cy = int(center[0]), int(center[1])
+            elif el.get("bounds") and len(el["bounds"]) >= 4:
+                b = el["bounds"]
+                cx, cy = int((b[0] + b[2]) // 2), int((b[1] + b[3]) // 2)
+            else:
+                cx, cy = 0, 0
+
+            if el.get("type"):
+                elem_type = str(el["type"])
+            else:
+                short_cls = cls_raw.split(".")[-1] if cls_raw else ""
+                elem_type = CLASS_MAP.get(short_cls, short_cls or "Элемент")
+
+            if text_raw and desc_raw and text_raw != desc_raw:
+                content_text = f"{text_raw} ({desc_raw})"
+            elif text_raw:
+                content_text = text_raw
+            elif desc_raw:
+                content_text = desc_raw
+            else:
+                content_text = ""
+
+            content_text = " ".join(content_text.split())
+            if len(content_text) > 80:
+                content_text = content_text[:80]
+
+            flags: list[str] = []
+            if clickable:
+                flags.append("кликабельно")
+            if scrollable:
+                flags.append("прокрутка")
+            if checkable:
+                flags.append("выбор")
+            if editable:
+                flags.append("ввод")
+            flags_str = f" ({', '.join(flags)})" if flags else ""
+
+            candidates.append((cy, cx, elem_type, content_text, flags_str, el))
+
+        # 3. Сортировка сверху вниз (по cy, затем cx, приоритет элементам с текстом)
+        candidates.sort(key=lambda item: (item[0], item[1], 0 if item[3] else 1))
+
+        # 4. Дедупликация
+        seen_keys: set[tuple[str, str, str, int, int]] = set()
+        seen_centers_with_text: set[tuple[int, int]] = set()
+        seen_centers_empty: set[tuple[int, int]] = set()
+        unique_elements: list[tuple[str, str, str, int, int]] = []
+
+        for cy, cx, elem_type, content_text, flags_str, _ in candidates:
+            key = (elem_type, content_text, flags_str, cx, cy)
+            if key in seen_keys:
+                continue
+
+            if content_text:
+                seen_centers_with_text.add((cx, cy))
+            else:
+                if (cx, cy) in seen_centers_with_text or (cx, cy) in seen_centers_empty:
+                    continue
+                seen_centers_empty.add((cx, cy))
+
+            seen_keys.add(key)
+            unique_elements.append((elem_type, content_text, flags_str, cx, cy))
+
+        # 5. Лимит не больше 120 элементов с пометкой
+        total_count = len(unique_elements)
+        max_limit = 120
+        if total_count > max_limit:
+            displayed = unique_elements[:max_limit]
+            limit_note = f"(показано {len(displayed)} из {total_count})"
+        else:
+            displayed = unique_elements
+            limit_note = None
+
+        # 6. Сохранение в кеш соответствия индекс -> центр
+        cache_indices: dict[int, tuple[int, int]] = {}
+        lines: list[str] = []
+        if header_line:
+            lines.append(header_line)
+
+        for idx, (elem_type, content_text, flags_str, cx, cy) in enumerate(displayed, start=1):
+            cache_indices[idx] = (cx, cy)
+            text_part = f" «{content_text}»" if content_text else ""
+            lines.append(f"[{idx}] {elem_type}{text_part}{flags_str} центр=({cx},{cy})")
+
+        if limit_note:
+            lines.append(limit_note)
+
+        _look_cache[device_id] = _LookCacheEntry(timestamp=time.monotonic(), indices=cache_indices)
+        await _log_audit_safe(device_id, "look", {"device_id": device_id, "count": len(displayed)}, ok=True)
+
+        if not lines:
+            return "(нет значимых элементов)"
+        return "\n".join(lines)
+
+    @mcp_server.tool()
+    async def tap_index(device_id: str, index: int) -> str:
+        """Нажать элемент по номеру [N] из последнего look устройства (координаты в пикселях); предпочитай look и tap_index скриншоту.
+Tap element by index [N] from last look on device (coordinates in pixels); prefer look and tap_index over screenshot."""
+        await _enforce_rate_limit(device_id)
+        try:
+            idx = int(index)
+        except (ValueError, TypeError):
+            raise ValueError(f"Некорректный номер элемента {index!r}. Сначала вызови look.")
+
+        entry = _look_cache.get(device_id)
+        if entry is None:
+            raise ValueError(f"Для устройства '{device_id}' нет данных последнего look: сначала вызови look.")
+
+        now = time.monotonic()
+        if now - entry.timestamp > 120.0:
+            raise ValueError(f"Данные look для устройства '{device_id}' устарели (>120 с): сначала вызови look.")
+
+        center = entry.indices.get(idx)
+        if center is None:
+            raise ValueError(f"Элемент [{idx}] отсутствует в последнем look устройства '{device_id}': сначала вызови look.")
+
+        cx, cy = center
+        await actions.tap(device_id, cx, cy, actor="mcp")
+        await _log_audit_safe(device_id, "tap_index", {"device_id": device_id, "index": idx, "x": cx, "y": cy}, ok=True)
+        return f"Тап по элементу [{idx}] ({cx}, {cy}) выполнен"
+
+    @mcp_server.tool()
+    async def screenshot(device_id: str, max_width: int = 540) -> Image:
+        """Сделать скриншот экрана в пикселях JPEG; предпочитай look скриншоту, скриншот использовать только когда в look нет нужных элементов (игры, картинки, WebView).
+Take JPEG screenshot in pixels; prefer look over screenshot, use screenshot only when needed elements are missing in look (games, images, WebView)."""
         await _enforce_rate_limit(device_id)
         jpeg_bytes = await actions.screenshot(device_id, max_width=max_width, actor="mcp")
         if Image is not None:
@@ -204,40 +418,31 @@ if mcp_server is not None:
 
     @mcp_server.tool()
     async def ui_dump(device_id: str) -> list[dict[str, Any]]:
-        """Получить дамп дерева элементов интерфейса (UI hierarchy) текущего экрана.
-
-        Возвращает список элементов: text, resource_id, class, content_desc, clickable,
-        bounds ([x1, y1, x2, y2] в пикселях экрана) и center ([cx, cy] в пикселях экрана).
-        Это ОСНОВНОЙ инструмент: всегда вызывайте ui_dump перед tap, tap_element или type_text,
-        чтобы найти точные координаты или идентификаторы кнопок и полей ввода.
-        """
+        """Получить полное дерево элементов интерфейса с координатами в пикселях; для большинства задач предпочитай look.
+Get full UI hierarchy tree with pixel coordinates; for most tasks prefer look over screenshot and ui_dump."""
         await _enforce_rate_limit(device_id)
         return await actions.ui_dump(device_id, actor="mcp")
 
     @mcp_server.tool()
-    async def tap(device_id: str, x: int, y: int) -> dict[str, Any]:
-        """Выполнить нажатие (тап) по координатам (x, y) на экране устройства.
-
-        Координаты указываются в пикселях экрана. Перед нажатием ОБЯЗАТЕЛЬНО вызовите
-        ui_dump или screenshot для определения точных пиксельных координат нужного элемента.
-        """
+    async def tap(device_id: str, x: int, y: int) -> str:
+        """Нажать по координатам (x, y) в пикселях; предпочитай look и tap_index скриншоту, скриншот только когда в look нет нужных элементов (игры, картинки, WebView).
+Tap screen at (x, y) in pixels; prefer look and tap_index over screenshot, use screenshot only when elements are missing in look (games, images, WebView)."""
         await _enforce_rate_limit(device_id)
         await actions.tap(device_id, x, y, actor="mcp")
-        return {"ok": True, "x": x, "y": y}
+        return f"Тап ({x}, {y}) выполнен"
 
     @mcp_server.tool()
     async def tap_element(
         device_id: str,
         text: str | None = None,
         resource_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Найти элемент интерфейса по тексту (text) или идентификатору (resource_id) и нажать на его центр.
-
-        Выполняет ui_dump и нажимает на центр найденного элемента. Координаты вычисляются в пикселях экрана.
-        Рекомендуется сначала вызвать ui_dump, чтобы узнать точный текст или resource_id элемента.
-        """
+    ) -> str:
+        """Найти элемент по тексту или id и нажать на его центр в пикселях; предпочитай look и tap_index скриншоту, скриншот только для игр, картинок, WebView.
+Find element by text or id and tap its pixel center; prefer look and tap_index over screenshot, screenshot only for games, images, WebView."""
         await _enforce_rate_limit(device_id)
-        return await actions.tap_element(device_id, text=text, resource_id=resource_id, actor="mcp")
+        elem = await actions.tap_element(device_id, text=text, resource_id=resource_id, actor="mcp")
+        target = text or resource_id or (elem.get("text") if isinstance(elem, dict) else "") or ""
+        return f"Тап по элементу «{target}» выполнен" if target else "Тап по элементу выполнен"
 
     @mcp_server.tool()
     async def swipe(
@@ -247,78 +452,56 @@ if mcp_server is not None:
         x2: int,
         y2: int,
         ms: int = 300,
-    ) -> dict[str, Any]:
-        """Выполнить свайп от точки (x1, y1) до точки (x2, y2) на экране за время ms (в миллисекундах).
-
-        Все координаты указываются в пикселях экрана. Перед выполнением свайпа рекомендуется
-        определить границы прокручиваемой области через ui_dump или screenshot.
-        """
+    ) -> str:
+        """Выполнить свайп от (x1, y1) до (x2, y2) в пикселях за время ms; предпочитай look скриншоту, скриншот только для игр, картинок, WebView.
+Swipe from (x1, y1) to (x2, y2) in pixels taking ms milliseconds; prefer look over screenshot, screenshot only for games, images, WebView."""
         await _enforce_rate_limit(device_id)
         await actions.swipe(device_id, x1, y1, x2, y2, ms=ms, actor="mcp")
-        return {"ok": True}
+        return f"Свайп ({x1}, {y1}) -> ({x2}, {y2}) выполнен"
 
     @mcp_server.tool()
-    async def type_text(device_id: str, text: str) -> dict[str, Any]:
-        """Ввести текст в активное поле ввода на устройстве.
-
-        Поддерживает латиницу, кириллицу, спецсимволы и эмодзи. Перед вводом текста
-        необходимо активировать нужное поле ввода тапом (tap или tap_element), предварительно
-        определив его координаты через ui_dump или screenshot.
-        """
+    async def type_text(device_id: str, text: str) -> str:
+        """Ввести текст в активное поле ввода; перед вводом найди поле через look и нажми на него, предпочитай look скриншоту.
+Type text into active input field; before typing find field via look and tap it, prefer look over screenshot."""
         await _enforce_rate_limit(device_id)
         await actions.type_text(device_id, text, actor="mcp")
-        return {"ok": True, "text": text}
+        return f"Введен текст: {text}"
 
     @mcp_server.tool()
-    async def press_key(device_id: str, key: str) -> dict[str, Any]:
-        """Нажать аппаратную или системную клавишу на устройстве.
-
-        Допустимые клавиши: 'back' (назад), 'home' (домой), 'recents' (недавние приложения),
-        'enter', 'power' (питание), 'volume_up', 'volume_down'. После нажатия клавиши
-        рекомендуется вызвать wait, а затем ui_dump или screenshot.
-        """
+    async def press_key(device_id: str, key: str) -> str:
+        """Нажать системную клавишу (back, home, recents, enter, power, volume_up, volume_down); для проверки экрана предпочитай look скриншоту.
+Press system key (back, home, recents, enter, power, volume_up, volume_down); to inspect screen prefer look over screenshot."""
         await _enforce_rate_limit(device_id)
         await actions.key(device_id, key, actor="mcp")
-        return {"ok": True, "key": key}
+        return f"Нажата клавиша {key}"
 
     @mcp_server.tool()
-    async def open_app(device_id: str, package: str) -> dict[str, Any]:
-        """Запустить приложение на устройстве по имени пакета (например, 'com.android.chrome').
-
-        Список установленных пакетов можно получить через list_apps.
-        После запуска приложения вызовите wait, затем ui_dump или screenshot.
-        """
+    async def open_app(device_id: str, package: str) -> str:
+        """Запустить приложение по имени пакета; после запуска проверяй экран через look, предпочитай look скриншоту.
+Open app by package name; after launch inspect screen via look, prefer look over screenshot."""
         await _enforce_rate_limit(device_id)
         await actions.open_app(device_id, package, actor="mcp")
-        return {"ok": True, "package": package}
+        return f"Запущено приложение {package}"
 
     @mcp_server.tool()
     async def list_apps(device_id: str) -> list[str]:
-        """Получить список всех установленных пакетов приложений на устройстве.
-
-        Используйте этот инструмент перед вызовом open_app для нахождения точного имени пакета.
-        """
+        """Получить список всех установленных пакетов приложений на устройстве перед вызовом open_app.
+Get list of all installed application packages on device before calling open_app."""
         await _enforce_rate_limit(device_id)
         return await actions.list_apps(device_id, actor="mcp")
 
     @mcp_server.tool()
-    async def open_url(device_id: str, url: str) -> dict[str, Any]:
-        """Открыть URL-ссылку в браузере по умолчанию на устройстве.
-
-        После перехода по ссылке рекомендуется подождать загрузки через wait,
-        а затем проверить результат через ui_dump или screenshot.
-        """
+    async def open_url(device_id: str, url: str) -> str:
+        """Открыть URL в браузере по умолчанию; после перехода проверяй экран через look, предпочитай look скриншоту.
+Open URL in default browser; after navigation inspect screen via look, prefer look over screenshot."""
         await _enforce_rate_limit(device_id)
         await actions.open_url(device_id, url, actor="mcp")
-        return {"ok": True, "url": url}
+        return f"Открыт URL {url}"
 
     @mcp_server.tool()
     async def wait(device_id: str, seconds: float = 1.0) -> dict[str, Any]:
-        """Приостановить выполнение на указанное количество секунд (seconds).
-
-        Вызывайте после действий (open_app, open_url, tap, swipe), чтобы дать приложению
-        время загрузиться перед следующим ui_dump или screenshot.
-        """
+        """Приостановить выполнение на указанное количество секунд; после ожидания проверяй экран через look, предпочитай look скриншоту.
+Pause execution for specified number of seconds; after waiting inspect screen via look, prefer look over screenshot."""
         await _enforce_rate_limit(device_id)
         await actions.wait(device_id, seconds, actor="mcp")
         return {"ok": True, "waited": seconds}
@@ -455,6 +638,8 @@ __all__ = [
     "get_mcp_app",
     "list_devices",
     "device_status",
+    "look",
+    "tap_index",
     "screenshot",
     "ui_dump",
     "tap",
