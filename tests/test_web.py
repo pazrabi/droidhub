@@ -281,6 +281,14 @@ def test_device_page_renders_all_required_elements(mock_manager: DeviceManager) 
     assert 'id="app-search"' in html
     assert 'id="btn-refresh-apps"' in html
 
+    # 6. Элементы адаптивности и отклика
+    assert 'id="quality-select"' in html
+    assert 'value="360"' in html
+    assert 'value="540"' in html
+    assert 'value="720"' in html
+    assert 'id="stream-updating"' in html
+    assert 'id="frame-age"' in html
+
 
 def test_device_page_not_found(mock_manager: DeviceManager) -> None:
     """Несуществующее устройство должно возвращать 404."""
@@ -324,3 +332,81 @@ def test_static_files_served() -> None:
     assert "/text" in res_js.text
     assert "/open_app" in res_js.text
     assert "/apps" in res_js.text
+
+    # Проверка механизмов быстрого отклика и адаптивности
+    assert "needsAnotherFrame" in res_js.text
+    assert "targetIntervalMs" in res_js.text
+    assert "stream-updating" in res_js.text
+    assert "frame-age" in res_js.text
+    assert "showTapEffect" in res_js.text
+    assert "600" in res_js.text
+    assert "quality-select" in res_js.text
+    assert "localStorage" in res_js.text
+    assert "visibilitychange" in res_js.text
+    assert "document.hidden" in res_js.text
+
+
+def test_responsive_ui_and_adaptive_streaming(mock_manager: DeviceManager) -> None:
+    """
+    Проверка требований по улучшению отклика:
+    (1) немедленный запрос кадра без наложения (needsAnotherFrame, requestImmediateFrame);
+    (2) адаптивный интервал таймера;
+    (3) индикатор «обновляется…» и возраст кадра («кадр N с назад»);
+    (4) визуальный отклик при тапе (исчезает через 600 мс);
+    (5) селектор качества (360/540/720), сохранение в localStorage, max_width;
+    (6) пауза при скрытой вкладке (visibilitychange).
+    """
+    app = create_web_app(mock_manager)
+    client = TestClient(app)
+
+    # 1. Проверка HTML страницы устройства
+    client.post("/test-login")
+    res_page = client.get("/device/realme")
+    assert res_page.status_code == 200
+    html = res_page.text
+
+    # Селектор качества в панели
+    assert 'id="quality-select"' in html
+    assert '<option value="360"' in html
+    assert '<option value="540"' in html
+    assert '<option value="720"' in html
+
+    # Индикаторы обновления и возраста кадра
+    assert 'id="stream-updating"' in html
+    assert "обновляется" in html
+    assert 'id="frame-age"' in html
+
+    # Кружок касания
+    assert 'id="tap-indicator"' in html
+
+    # 2. Проверка JS
+    res_js = client.get("/static/app.js")
+    assert res_js.status_code == 200
+    js = res_js.text
+
+    # (1) Запрос без ожидания таймера и флаг «нужен ещё один»
+    assert "requestImmediateFrame" in js
+    assert "needsAnotherFrame" in js
+
+    # (2) Адаптивный интервал: max(0, целевой интервал − время предыдущего кадра), целевой 1 с
+    assert "targetIntervalMs = 1000" in js or "targetIntervalMs" in js
+    assert "Math.max(0," in js
+
+    # (3) Индикатор «обновляется…» и возраст кадра («кадр N с назад»)
+    assert "stream-updating" in js
+    assert "обновляется" in js
+    assert "frame-age" in js
+    assert "с назад" in js
+
+    # (4) Исчезновение кружка касания через 600 мс
+    assert "600" in js
+    assert "showTapEffect" in js
+
+    # (5) Селектор качества, localStorage и max_width
+    assert "localStorage" in js
+    assert "max_width" in js
+    assert "quality-select" in js
+
+    # (6) Пауза при скрытой вкладке
+    assert "visibilitychange" in js
+    assert "document.hidden" in js

@@ -48,6 +48,9 @@
     const screenPlaceholder = document.getElementById('screen-placeholder');
     const statusDot = document.getElementById('stream-status-dot');
     const statusText = document.getElementById('stream-status-text');
+    const streamUpdating = document.getElementById('stream-updating');
+    const frameAgeEl = document.getElementById('frame-age');
+    const qualitySelect = document.getElementById('quality-select');
     const btnToggleStream = document.getElementById('btn-toggle-stream');
     const btnRefreshScreen = document.getElementById('btn-refresh-screen');
     const tapIndicator = document.getElementById('tap-indicator');
@@ -55,9 +58,42 @@
     // Состояние потока скриншотов
     let streamingActive = true;
     let isFetchingScreenshot = false;
+    let needsAnotherFrame = false;
     let screenshotTimer = null;
     let realScreenWidth = 0;
     let realScreenHeight = 0;
+    let lastFrameTime = 0;
+    const targetIntervalMs = 1000; // Целевой интервал по умолчанию 1 с
+
+    // Селектор качества (макс. ширина 360 / 540 / 720) и сохранение в localStorage
+    const STORAGE_KEY_QUALITY = 'screenshot_quality';
+    let currentQuality = '720';
+    try {
+      const savedQuality = localStorage.getItem(STORAGE_KEY_QUALITY) || localStorage.getItem('quality') || localStorage.getItem('max_width');
+      if (savedQuality && ['360', '540', '720'].includes(savedQuality)) {
+        currentQuality = savedQuality;
+      }
+    } catch (e) {
+      console.warn('Ошибка чтения localStorage:', e);
+    }
+
+    if (qualitySelect) {
+      qualitySelect.value = currentQuality;
+      qualitySelect.addEventListener('change', () => {
+        const val = qualitySelect.value;
+        if (['360', '540', '720'].includes(val)) {
+          currentQuality = val;
+          try {
+            localStorage.setItem(STORAGE_KEY_QUALITY, val);
+            localStorage.setItem('quality', val);
+            localStorage.setItem('max_width', val);
+          } catch (e) {
+            console.warn('Ошибка записи localStorage:', e);
+          }
+          requestImmediateFrame();
+        }
+      });
+    }
 
     function setStatus(type, msg) {
       if (statusDot) {
@@ -70,17 +106,37 @@
       }
     }
 
+    function setUpdating(updating) {
+      if (streamUpdating) {
+        streamUpdating.style.display = updating ? 'inline' : 'none';
+        streamUpdating.textContent = 'обновляется…';
+      }
+    }
+
+    function updateFrameAge() {
+      if (!frameAgeEl || !lastFrameTime) return;
+      const ageSec = Math.max(0, Math.floor((Date.now() - lastFrameTime) / 1000));
+      frameAgeEl.textContent = `кадр ${ageSec} с назад`;
+    }
+
+    // Регулярное обновление возраста кадра
+    setInterval(updateFrameAge, 1000);
+
     /* -----------------------------------------------------------------------
-       1. Скриншоты 1-3 раза/с без наложения запросов
+       1. Скриншоты с адаптивным интервалом, индикатором задержки и без наложения
        ----------------------------------------------------------------------- */
-    async function fetchScreenshot() {
-      if (isFetchingScreenshot || !streamingActive) {
+    async function fetchScreenshot(force = false) {
+      if (isFetchingScreenshot || (!streamingActive && !force) || document.hidden) {
         return;
       }
 
       isFetchingScreenshot = true;
+      setUpdating(true);
+      const startTime = Date.now();
+
       try {
-        const url = `/api/devices/${encodeURIComponent(deviceId)}/screenshot?max_width=720&_t=${Date.now()}`;
+        const maxWidth = currentQuality || '720';
+        const url = `/api/devices/${encodeURIComponent(deviceId)}/screenshot?max_width=${encodeURIComponent(maxWidth)}&_t=${Date.now()}`;
         const resp = await fetch(url, { cache: 'no-store' });
 
         if (!resp.ok) {
@@ -115,29 +171,60 @@
         };
         screenImg.src = objectUrl;
         setStatus('active', 'В сети');
+        lastFrameTime = Date.now();
+        updateFrameAge();
       } catch (err) {
         setStatus('error', 'Нет связи');
         console.warn('Screenshot fetch failed:', err);
       } finally {
+        const frameDuration = Date.now() - startTime;
         isFetchingScreenshot = false;
-        // Следующий запрос планируется только ПОСЛЕ завершения предыдущего (без наложения!)
-        if (streamingActive) {
-          screenshotTimer = setTimeout(fetchScreenshot, 500); // ~2 кадра/с (1-3 раза в сек)
+        setUpdating(false);
+
+        // Пауза обновления, когда вкладка скрыта
+        if (streamingActive && !document.hidden) {
+          if (needsAnotherFrame) {
+            needsAnotherFrame = false;
+            fetchScreenshot();
+          } else {
+            // Адаптивный интервал: max(0, целевой интервал − время предыдущего кадра)
+            const delay = Math.max(0, targetIntervalMs - frameDuration);
+            screenshotTimer = setTimeout(fetchScreenshot, delay);
+          }
         }
       }
     }
 
-    function triggerQuickRefresh() {
+    function requestImmediateFrame(force = false) {
       if (screenshotTimer) {
         clearTimeout(screenshotTimer);
         screenshotTimer = null;
       }
-      setTimeout(() => {
-        if (!isFetchingScreenshot && streamingActive) {
+      if ((!streamingActive && !force) || document.hidden) {
+        return;
+      }
+      if (isFetchingScreenshot) {
+        needsAnotherFrame = true;
+      } else {
+        fetchScreenshot(force);
+      }
+    }
+
+    const triggerQuickRefresh = requestImmediateFrame;
+
+    // Пауза обновления, когда вкладка скрыта (visibilitychange)
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        if (screenshotTimer) {
+          clearTimeout(screenshotTimer);
+          screenshotTimer = null;
+        }
+      } else {
+        if (streamingActive && !isFetchingScreenshot) {
           fetchScreenshot();
         }
-      }, 120);
-    }
+      }
+    });
 
     if (btnToggleStream) {
       btnToggleStream.addEventListener('click', () => {
@@ -151,6 +238,8 @@
             clearTimeout(screenshotTimer);
             screenshotTimer = null;
           }
+          needsAnotherFrame = false;
+          setUpdating(false);
           setStatus('paused', 'Приостановлено');
         }
       });
@@ -158,9 +247,7 @@
 
     if (btnRefreshScreen) {
       btnRefreshScreen.addEventListener('click', () => {
-        if (!isFetchingScreenshot) {
-          fetchScreenshot();
-        }
+        requestImmediateFrame(true);
       });
     }
 
@@ -199,19 +286,39 @@
       };
     }
 
+    let tapTimeout = null;
     function showTapEffect(clientX, clientY) {
-      if (!tapIndicator) return;
       const viewport = document.getElementById('screen-viewport');
       if (!viewport) return;
       const vRect = viewport.getBoundingClientRect();
 
-      tapIndicator.style.left = `${clientX - vRect.left}px`;
-      tapIndicator.style.top = `${clientY - vRect.top}px`;
-      tapIndicator.classList.remove('active');
-      // trigger reflow
-      void tapIndicator.offsetWidth;
-      tapIndicator.classList.add('active');
-      setTimeout(() => tapIndicator.classList.remove('active'), 260);
+      // Кружок в точке касания (исчезает через 600 мс)
+      const circle = document.createElement('div');
+      circle.className = 'tap-indicator active';
+      circle.style.left = `${clientX - vRect.left}px`;
+      circle.style.top = `${clientY - vRect.top}px`;
+      viewport.appendChild(circle);
+
+      if (tapIndicator) {
+        if (tapTimeout) clearTimeout(tapTimeout);
+        tapIndicator.style.left = `${clientX - vRect.left}px`;
+        tapIndicator.style.top = `${clientY - vRect.top}px`;
+        tapIndicator.classList.remove('active');
+        void tapIndicator.offsetWidth;
+        tapIndicator.classList.add('active');
+      }
+
+      setTimeout(() => {
+        circle.classList.remove('active');
+        if (tapIndicator) {
+          tapIndicator.classList.remove('active');
+        }
+        setTimeout(() => {
+          if (circle.parentNode) {
+            circle.parentNode.removeChild(circle);
+          }
+        }, 300);
+      }, 600);
     }
 
     async function sendTap(x, y) {
@@ -224,7 +331,7 @@
       } catch (err) {
         console.warn('Tap request failed:', err);
       } finally {
-        triggerQuickRefresh();
+        requestImmediateFrame();
       }
     }
 
@@ -238,7 +345,7 @@
       } catch (err) {
         console.warn('Swipe request failed:', err);
       } finally {
-        triggerQuickRefresh();
+        requestImmediateFrame();
       }
     }
 
@@ -360,7 +467,7 @@
       } catch (err) {
         console.warn(`Key "${keyName}" request failed:`, err);
       } finally {
-        triggerQuickRefresh();
+        requestImmediateFrame();
       }
     }
 
@@ -391,7 +498,7 @@
       } catch (err) {
         console.warn('Send text request failed:', err);
       } finally {
-        triggerQuickRefresh();
+        requestImmediateFrame();
       }
     }
 
@@ -424,7 +531,7 @@
       } catch (err) {
         console.warn('Open app request failed:', err);
       } finally {
-        triggerQuickRefresh();
+        requestImmediateFrame();
       }
     }
 

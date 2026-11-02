@@ -22,8 +22,15 @@
           <div class="screen-status-indicator">
             <span class="status-dot" id="stream-status-dot"></span>
             <span id="stream-status-text">Подключение...</span>
+            <span id="stream-updating" class="stream-updating" style="display: none;">обновляется…</span>
+            <span id="frame-age" class="frame-age"></span>
           </div>
           <div class="screen-controls">
+            <select id="quality-select" class="quality-select btn btn-xs btn-outline" title="Ширина кадра">
+              <option value="360">360</option>
+              <option value="540">540</option>
+              <option value="720" selected>720</option>
+            </select>
             <button id="btn-toggle-stream" class="btn btn-xs btn-outline">Пауза</button>
             <button id="btn-refresh-screen" class="btn btn-xs btn-outline">↻ Кадр</button>
           </div>

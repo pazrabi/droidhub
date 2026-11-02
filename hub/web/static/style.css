@@ -456,6 +456,32 @@ a:hover {
   gap: 0.5rem;
   font-size: 0.8rem;
   color: var(--text-secondary);
+  flex-wrap: wrap;
+}
+
+.stream-updating {
+  color: var(--accent-warning);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.frame-age {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+}
+
+.quality-select {
+  background-color: var(--bg-surface);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  padding: 0.2rem 0.4rem;
+  font-size: 0.75rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.quality-select:focus {
+  outline: none;
+  border-color: var(--accent-primary-hover);
 }
 
 .status-dot {
