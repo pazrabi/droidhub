@@ -1283,8 +1283,7 @@ async def test_screenshot_concurrency_different_devices(monkeypatch: pytest.Monk
 @pytest.mark.asyncio
 async def test_screenshot_concurrency_failure_propagates(monkeypatch: pytest.MonkeyPatch):
     async def mock_run_adb(args: list[str], *, serial: str | None = None, timeout: float = 15.0, binary: bool = False):
-        if args and args[0] == "pull":
-            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.02)
         raise RuntimeError("hardware screencap error")
 
     monkeypatch.setattr(actions, "run_adb", mock_run_adb)
@@ -1297,5 +1296,117 @@ async def test_screenshot_concurrency_failure_propagates(monkeypatch: pytest.Mon
     assert len(results) == 2
     assert isinstance(results[0], RuntimeError) and "hardware screencap error" in str(results[0])
     assert isinstance(results[1], RuntimeError) and "hardware screencap error" in str(results[1])
+
+
+@pytest.mark.asyncio
+async def test_screenshot_concurrency_different_max_widths(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
+    calls: list[Any] = []
+    sample_png = make_png_bytes(width=1000, height=2000)
+
+    async def mock_run_adb(args: list[str], *, serial: str | None = None, timeout: float = 15.0, binary: bool = False):
+        calls.append(args)
+        if args and args[0] == "pull":
+            await asyncio.sleep(0.02)
+            Path(args[2]).write_bytes(sample_png)
+        return sample_png
+
+    monkeypatch.setattr(actions, "run_adb", mock_run_adb)
+
+    # Запускаем два одновременных скриншота с разными max_width
+    r1, r2 = await asyncio.gather(
+        actions.screenshot("realme", max_width=200),
+        actions.screenshot("realme", max_width=500),
+    )
+
+    img1 = Image.open(BytesIO(r1))
+    img2 = Image.open(BytesIO(r2))
+
+    assert img1.width == 200
+    assert img2.width == 500
+
+    pull_calls = [c for c in calls if c and c[0] == "pull"]
+    assert len(pull_calls) == 1
+
+    assert len(setup_actions.entries) == 2
+    params_widths = [e["params"]["max_width"] for e in setup_actions.entries]
+    assert 200 in params_widths
+    assert 500 in params_widths
+
+
+@pytest.mark.asyncio
+async def test_screenshot_concurrency_initiator_cancellation(monkeypatch: pytest.MonkeyPatch):
+    sample_png = make_png_bytes(width=800, height=1200)
+
+    async def mock_run_adb(args: list[str], *, serial: str | None = None, timeout: float = 15.0, binary: bool = False):
+        if args and args[0] == "pull":
+            await asyncio.sleep(0.05)
+            Path(args[2]).write_bytes(sample_png)
+        return sample_png
+
+    monkeypatch.setattr(actions, "run_adb", mock_run_adb)
+
+    t1 = asyncio.create_task(actions.screenshot("realme", max_width=400))
+    await asyncio.sleep(0.01)
+    t2 = asyncio.create_task(actions.screenshot("realme", max_width=600))
+
+    # Отменяем первый запрос (инициатор)
+    t1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t1
+
+    # Второй параллельный запрос должен успешно завершиться
+    res2 = await t2
+    img2 = Image.open(BytesIO(res2))
+    assert img2.width == 600
+
+
+@pytest.mark.asyncio
+async def test_raw_screenshot_pull_cleanup_on_cancellation(monkeypatch: pytest.MonkeyPatch):
+    calls: list[Any] = []
+    pull_started = asyncio.Event()
+
+    async def mock_run_adb(args: list[str], *, serial: str | None = None, timeout: float = 15.0, binary: bool = False):
+        calls.append(args)
+        if args and args[0] == "pull":
+            pull_started.set()
+            await asyncio.sleep(1.0)
+        return b""
+
+    monkeypatch.setattr(actions, "run_adb", mock_run_adb)
+
+    t = asyncio.create_task(actions._raw_screenshot_pull("realme"))
+    await pull_started.wait()
+    t.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await t
+
+    # Проверяем, что в finally был вызван rm -f
+    rm_calls = [c for c in calls if len(c) > 1 and "rm -f" in c[1]]
+    assert len(rm_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_tap_element_no_redundant_reconnect_on_offline(monkeypatch: pytest.MonkeyPatch):
+    connect_calls: list[tuple[str, int]] = []
+
+    async def mock_connect(host: str, port: int = 5555) -> bool:
+        connect_calls.append((host, port))
+        return False
+
+    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
+        raise actions.DeviceOffline("error: device offline")
+
+    monkeypatch.setattr(actions, "connect", mock_connect)
+    if hasattr(actions, "adb") and actions.adb is not None:
+        monkeypatch.setattr(actions.adb, "connect", mock_connect)
+    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
+
+    with pytest.raises(actions.DeviceOffline):
+        await actions.tap_element("realme", text="Войти")
+
+    # Переподключение должно вызываться ровно 1 раз (из ui_dump), без повторов на уровне tap_element
+    assert len(connect_calls) == 1
+
 
 

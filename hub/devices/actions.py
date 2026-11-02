@@ -62,7 +62,7 @@ _SHELL_UNSAFE_CHARS = set(';&|`$"\'()<>\\!*?#~=\n\r\t')
 
 # Блокировки и задачи для скриншотов по устройствам
 _screenshot_locks: dict[str, asyncio.Lock] = {}
-_screenshot_inflight: dict[str, asyncio.Future[bytes]] = {}
+_screenshot_inflight: dict[str, asyncio.Task[bytes]] = {}
 
 
 def _get_screenshot_lock(device_id: str) -> asyncio.Lock:
@@ -261,8 +261,8 @@ async def _raw_screenshot_pull(device_id: str) -> bytes:
                 pass
         try:
             if run_adb is not None:
-                await run_adb(["shell", f"rm -f {remote_path}"], serial=serial)
-        except Exception:
+                await asyncio.shield(run_adb(["shell", f"rm -f {remote_path}"], serial=serial))
+        except BaseException:
             pass
 
 
@@ -287,64 +287,47 @@ async def _take_screenshot_raw(device_id: str) -> bytes:
         return await _raw_screenshot_exec_out(device_id)
 
 
+async def _take_screenshot_with_reconnect(device_id: str) -> bytes:
+    """Делает скриншот (pull с откатом на exec-out) с автопереподключением при DeviceOffline."""
+    try:
+        return await _take_screenshot_raw(device_id)
+    except Exception as exc:
+        if _is_offline_error(exc):
+            await _reconnect_for_device(device_id)
+            return await _take_screenshot_raw(device_id)
+        raise
+
+
+async def _capture_raw_task(device_id: str) -> bytes:
+    """Выполняет захват скриншота с автоподключением под блокировкой устройства."""
+    lock = _get_screenshot_lock(device_id)
+    async with lock:
+        try:
+            return await _take_screenshot_with_reconnect(device_id)
+        finally:
+            _screenshot_inflight.pop(device_id, None)
+
+
 async def screenshot(device_id: str, max_width: int = 720, *, actor: str = "system") -> bytes:
     """Делает скриншот через pull (с откатом на exec-out) и уменьшает до JPEG с помощью Pillow."""
     params = {"max_width": max_width}
-    lock = _get_screenshot_lock(device_id)
 
     # Не допускай гонок: на одно устройство одновременно один screenshot (asyncio.Lock на device_id),
     # параллельные запросы получают результат текущего.
-    if lock.locked() and device_id in _screenshot_inflight:
-        fut = _screenshot_inflight[device_id]
-        try:
-            res = await asyncio.shield(fut)
-            await _record_audit(device_id, "screenshot", params, ok=True, actor=actor)
-            return res
-        except Exception as e:
-            await _record_audit(device_id, "screenshot", params, ok=False, error=str(e), actor=actor)
-            raise
+    task = _screenshot_inflight.get(device_id)
+    if task is None or task.done():
+        task = asyncio.create_task(_capture_raw_task(device_id))
+        _screenshot_inflight[device_id] = task
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
-    async with lock:
-        if device_id in _screenshot_inflight:
-            fut = _screenshot_inflight[device_id]
-            try:
-                res = await asyncio.shield(fut)
-                await _record_audit(device_id, "screenshot", params, ok=True, actor=actor)
-                return res
-            except Exception as e:
-                await _record_audit(device_id, "screenshot", params, ok=False, error=str(e), actor=actor)
-                raise
-
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        _screenshot_inflight[device_id] = fut
-
-        async def _do_take() -> bytes:
-            raw_bytes = await _take_screenshot_raw(device_id)
-            return _process_image_to_jpeg(raw_bytes, max_width)
-
-        try:
-            try:
-                res = await _do_take()
-            except Exception as exc:
-                if _is_offline_error(exc):
-                    await _reconnect_for_device(device_id)
-                    res = await _do_take()
-                else:
-                    raise
-
-            if not fut.done():
-                fut.set_result(res)
-            await _record_audit(device_id, "screenshot", params, ok=True, actor=actor)
-            return res
-        except BaseException as e:
-            if not fut.done():
-                fut.set_exception(e)
-            if not isinstance(e, asyncio.CancelledError):
-                await _record_audit(device_id, "screenshot", params, ok=False, error=str(e), actor=actor)
-            raise
-        finally:
-            _screenshot_inflight.pop(device_id, None)
+    try:
+        raw_bytes = await asyncio.shield(task)
+        res = _process_image_to_jpeg(raw_bytes, max_width)
+        await _record_audit(device_id, "screenshot", params, ok=True, actor=actor)
+        return res
+    except Exception as e:
+        await _record_audit(device_id, "screenshot", params, ok=False, error=str(e), actor=actor)
+        raise
 
 
 async def tap(device_id: str, x: int, y: int, *, actor: str = "system") -> None:
@@ -652,14 +635,7 @@ async def tap_element(
         return matched
 
     try:
-        try:
-            res = await _action()
-        except Exception as exc:
-            if _is_offline_error(exc):
-                await _reconnect_for_device(device_id)
-                res = await _action()
-            else:
-                raise
+        res = await _action()
         await _record_audit(
             device_id,
             "tap_element",
