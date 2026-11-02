@@ -5,7 +5,7 @@ from collections import defaultdict
 import dataclasses
 import re
 import time
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel
@@ -14,6 +14,7 @@ import hub.audit as audit_module
 from hub.config import get_settings
 from hub.devices import actions
 from hub.devices.adb import AdbError, AdbTimeout, DeviceOffline, adb_shell
+from hub.devices.manager import DeviceStatus
 
 from hub.auth import require_api
 
@@ -43,6 +44,19 @@ class KeyRequest(BaseModel):
 
 class OpenAppRequest(BaseModel):
     package: str
+
+
+class PowerRequest(BaseModel):
+    action: Literal["wake", "sleep", "reboot", "shutdown"]
+    confirm: bool = False
+
+
+# actions.power разрабатывается параллельно другим разработчиком
+if not hasattr(actions, "power"):
+    async def _power_placeholder(device_id: str, action: str, *, actor: str = "system") -> None:
+        raise NotImplementedError("actions.power разрабатывается параллельно")
+
+    actions.power = _power_placeholder  # type: ignore
 
 
 # --- Лимитер действий на устройство (скользящее окно в памяти) ---
@@ -185,14 +199,15 @@ async def get_devices(actor: str = Depends(require_api)) -> list[dict[str, Any]]
     """Возвращает список устройств и их статусы."""
     mgr = actions.get_manager()
     statuses = mgr.statuses()
+    has_charging = hasattr(DeviceStatus, "charging") or "charging" in getattr(DeviceStatus, "__dataclass_fields__", {})
     results: list[dict[str, Any]] = []
     for s in statuses:
         if dataclasses.is_dataclass(s):
-            results.append(dataclasses.asdict(s))
+            item = dataclasses.asdict(s)
         elif isinstance(s, dict):
-            results.append(s)
+            item = dict(s)
         else:
-            results.append({
+            item = {
                 "id": getattr(s, "id", ""),
                 "name": getattr(s, "name", ""),
                 "online": getattr(s, "online", False),
@@ -201,7 +216,13 @@ async def get_devices(actor: str = Depends(require_api)) -> list[dict[str, Any]]
                 "screen_on": getattr(s, "screen_on", None),
                 "last_seen": getattr(s, "last_seen", None),
                 "error": getattr(s, "error", None),
-            })
+            }
+        if has_charging or hasattr(s, "charging") or (isinstance(s, dict) and "charging" in s):
+            if isinstance(s, dict):
+                item["charging"] = s.get("charging")
+            else:
+                item["charging"] = getattr(s, "charging", None)
+        results.append(item)
     return results
 
 
@@ -299,6 +320,30 @@ async def key_device(
     await _check_device_and_rate_limit(device_id)
     try:
         await actions.key(device_id, req.name, actor=actor)
+        return {"ok": True, "status": "ok"}
+    except (DeviceOffline, AdbTimeout, AdbError) as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Устройство '{device_id}' не найдено")
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@api_router.post("/devices/{device_id}/power")
+async def power_device(
+    device_id: str,
+    req: PowerRequest,
+    actor: str = Depends(require_api),
+) -> dict[str, Any]:
+    """Управление питанием устройства (wake, sleep, reboot, shutdown)."""
+    await _check_device_and_rate_limit(device_id)
+    if req.action in ("reboot", "shutdown") and not req.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Для действия '{req.action}' требуется подтверждение (confirm=true)",
+        )
+    try:
+        await actions.power(device_id, req.action, actor=actor)
         return {"ok": True, "status": "ok"}
     except (DeviceOffline, AdbTimeout, AdbError) as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
