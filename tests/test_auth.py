@@ -9,13 +9,13 @@ import time
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request, status
-from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 import pytest
 from starlette.middleware.sessions import SessionMiddleware
 
 from hub.auth import (
     LoginLimiter,
+    TRUSTED_PROXIES,
     auth_router,
     get_client_ip,
     get_login_limiter,
@@ -26,7 +26,6 @@ from hub.auth import (
     set_login_limiter,
     verify_password,
 )
-from hub.config import Settings, get_settings
 
 
 # =====================================================================
@@ -115,7 +114,7 @@ def test_verify_password_scrypt_raw_params() -> None:
 
 
 # =====================================================================
-# Тесты LoginLimiter
+# Тесты LoginLimiter и управления лимитером
 # =====================================================================
 
 
@@ -166,6 +165,87 @@ def test_login_limiter_window_expiry() -> None:
     # Ждём истечения временного окна
     time.sleep(0.07)
     assert limiter.check(key) is True
+
+
+def test_get_and_set_login_limiter() -> None:
+    original = get_login_limiter()
+    custom = LoginLimiter(max_attempts=10, window_s=600.0)
+    set_login_limiter(custom)
+    try:
+        assert get_login_limiter() is custom
+    finally:
+        set_login_limiter(original)
+
+
+# =====================================================================
+# Тесты get_client_ip и защиты от спуфинга
+# =====================================================================
+
+
+def test_get_client_ip_anti_spoofing() -> None:
+    assert "127.0.0.1" in TRUSTED_PROXIES
+    assert "::1" in TRUSTED_PROXIES
+
+    # 1. Прямое подключение (не доверенный прокси)
+    # Заголовок X-Forwarded-For должен игнорироваться, берется реальный адрес подключения
+    req_direct = Request(
+        scope={
+            "type": "http",
+            "client": ("198.51.100.25", 12345),
+            "headers": [(b"x-forwarded-for", b"203.0.113.1, 10.0.0.1")],
+        }
+    )
+    assert get_client_ip(req_direct) == "198.51.100.25"
+
+    # 2. Прямое подключение без заголовка X-Forwarded-For
+    req_direct_no_header = Request(
+        scope={
+            "type": "http",
+            "client": ("198.51.100.25", 12345),
+            "headers": [],
+        }
+    )
+    assert get_client_ip(req_direct_no_header) == "198.51.100.25"
+
+    # 3. Запрос через доверенный локальный прокси (127.0.0.1) с цепочкой IP
+    # Caddy дописывает реальный IP в конец, берем последний элемент
+    req_proxy_chain = Request(
+        scope={
+            "type": "http",
+            "client": ("127.0.0.1", 54321),
+            "headers": [(b"x-forwarded-for", b"spoofed_ip, 203.0.113.99")],
+        }
+    )
+    assert get_client_ip(req_proxy_chain) == "203.0.113.99"
+
+    # 4. Запрос через доверенный прокси (::1) с одним IP в заголовке
+    req_proxy_ipv6 = Request(
+        scope={
+            "type": "http",
+            "client": ("::1", 54321),
+            "headers": [(b"x-forwarded-for", b"203.0.113.50")],
+        }
+    )
+    assert get_client_ip(req_proxy_ipv6) == "203.0.113.50"
+
+    # 5. Запрос через доверенный прокси без X-Forwarded-For
+    req_proxy_no_header = Request(
+        scope={
+            "type": "http",
+            "client": ("127.0.0.1", 54321),
+            "headers": [],
+        }
+    )
+    assert get_client_ip(req_proxy_no_header) == "127.0.0.1"
+
+    # 6. Запрос без client (например, внутренний вызов/mock)
+    req_no_client = Request(
+        scope={
+            "type": "http",
+            "headers": [(b"x-forwarded-for", b"198.51.100.77")],
+        }
+    )
+    assert get_client_ip(req_no_client) == "198.51.100.77"
 
 
 # =====================================================================
@@ -257,16 +337,116 @@ def test_require_api_with_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
     assert res_valid.json() == {"actor": "api"}
 
 
-def test_require_api_when_api_token_empty(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HUB_API_TOKEN", "")
+def test_require_api_token_empty_and_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1. Токен в HUB_API_TOKEN пустой или состоит из пробелов
+    for empty_val in ["", "   "]:
+        monkeypatch.setenv("HUB_API_TOKEN", empty_val)
+        app = create_test_app()
+        client = TestClient(app)
+
+        res_empty = client.get(
+            "/api-protected",
+            headers={"Authorization": "Bearer "},
+        )
+        assert res_empty.status_code == status.HTTP_401_UNAUTHORIZED
+
+        res_spaces = client.get(
+            "/api-protected",
+            headers={"Authorization": "Bearer   "},
+        )
+        assert res_spaces.status_code == status.HTTP_401_UNAUTHORIZED
+
+        res_any = client.get(
+            "/api-protected",
+            headers={"Authorization": "Bearer some_token"},
+        )
+        assert res_any.status_code == status.HTTP_401_UNAUTHORIZED
+
+    # 2. Токен задан, но запрос шлет пустой или пробельный Bearer токен
+    monkeypatch.setenv("HUB_API_TOKEN", "my_secret_token")
     app = create_test_app()
     client = TestClient(app)
 
-    res = client.get(
-        "/api-protected",
-        headers={"Authorization": "Bearer "},
+    assert client.get("/api-protected", headers={"Authorization": "Bearer"}).status_code == 401
+    assert client.get("/api-protected", headers={"Authorization": "Bearer "}).status_code == 401
+    assert client.get("/api-protected", headers={"Authorization": "Bearer   "}).status_code == 401
+    assert (
+        client.get("/api-protected", headers={"Authorization": "Bearer  my_secret_token  "}).status_code
+        == 200
     )
-    assert res.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+# =====================================================================
+# Тесты работы без SessionMiddleware
+# =====================================================================
+
+
+def test_require_user_without_session_middleware() -> None:
+    app = FastAPI()
+
+    @app.get("/user-only")
+    def user_only(user: str = Depends(require_user)) -> dict[str, str]:
+        return {"user": user}
+
+    client = TestClient(app)
+    # Должен возвращаться 401 Unauthorized, а не падать с 500 / AssertionError
+    response = client.get("/user-only")
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["detail"] == "Требуется авторизация"
+
+
+def test_require_api_without_session_middleware(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HUB_API_TOKEN", "api_token_no_session")
+    app = FastAPI()
+
+    @app.get("/api-protected")
+    def api_protected(actor: str = Depends(require_api)) -> dict[str, str]:
+        return {"actor": actor}
+
+    client = TestClient(app)
+
+    # Без заголовка -> 401
+    res_no_auth = client.get("/api-protected")
+    assert res_no_auth.status_code == status.HTTP_401_UNAUTHORIZED
+
+    # С неверным токеном -> 401
+    res_wrong = client.get(
+        "/api-protected",
+        headers={"Authorization": "Bearer wrong_token"},
+    )
+    assert res_wrong.status_code == status.HTTP_401_UNAUTHORIZED
+
+    # С валидным Bearer-токеном -> 200, actor='api' (без 500 из-за отсутствия SessionMiddleware)
+    res_valid = client.get(
+        "/api-protected",
+        headers={"Authorization": "Bearer api_token_no_session"},
+    )
+    assert res_valid.status_code == status.HTTP_200_OK
+    assert res_valid.json() == {"actor": "api"}
+
+
+def test_auth_router_without_session_middleware(monkeypatch: pytest.MonkeyPatch) -> None:
+    admin_pw = "pass_no_session"
+    hashed = hash_password(admin_pw)
+    monkeypatch.setenv("HUB_ADMIN_USER", "admin")
+    monkeypatch.setenv("HUB_ADMIN_PASSWORD_HASH", hashed)
+
+    app = FastAPI()
+    app.include_router(auth_router)
+    client = TestClient(app, follow_redirects=False)
+
+    # Успешный вход без SessionMiddleware не падает с 500, а выполняет редирект на /
+    res_login = client.post(
+        "/login",
+        data={"username": "admin", "password": admin_pw},
+    )
+    assert res_login.status_code == status.HTTP_303_SEE_OTHER
+    assert res_login.headers["location"] == "/"
+
+    # Выход без SessionMiddleware также не падает с 500
+    res_logout = client.post("/logout")
+    assert res_logout.status_code == status.HTTP_303_SEE_OTHER
+    assert res_logout.headers["location"] == "/login"
 
 
 # =====================================================================
@@ -371,42 +551,46 @@ def test_auth_router_login_rate_limiting(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("HUB_ADMIN_PASSWORD_HASH", hashed)
 
     # Устанавливаем лимитер с ограничением в 3 попытки
+    original_limiter = get_login_limiter()
     limiter = LoginLimiter(max_attempts=3, window_s=60.0)
     set_login_limiter(limiter)
 
-    app = create_auth_app()
-    client = TestClient(app, follow_redirects=False)
+    try:
+        app = create_auth_app()
+        client = TestClient(app, follow_redirects=False)
 
-    # 3 неудачные попытки
-    for _ in range(3):
-        res = client.post(
+        # 3 неудачные попытки
+        for _ in range(3):
+            res = client.post(
+                "/login",
+                data={"username": "admin", "password": "bad_password"},
+                headers={"X-Forwarded-For": "203.0.113.1"},
+            )
+            assert res.status_code == status.HTTP_303_SEE_OTHER
+            assert res.headers["location"] == "/login?error=1"
+
+        # 4-я попытка с ПРАВИЛЬНЫМ паролем с того же IP блокируется
+        res_blocked = client.post(
             "/login",
-            data={"username": "admin", "password": "bad_password"},
+            data={"username": "admin", "password": admin_pw},
             headers={"X-Forwarded-For": "203.0.113.1"},
         )
-        assert res.status_code == status.HTTP_303_SEE_OTHER
-        assert res.headers["location"] == "/login?error=1"
+        assert res_blocked.status_code == status.HTTP_303_SEE_OTHER
+        assert res_blocked.headers["location"] == "/login?error=1"
 
-    # 4-я попытка с ПРАВИЛЬНЫМ паролем с того же IP блокируется
-    res_blocked = client.post(
-        "/login",
-        data={"username": "admin", "password": admin_pw},
-        headers={"X-Forwarded-For": "203.0.113.1"},
-    )
-    assert res_blocked.status_code == status.HTTP_303_SEE_OTHER
-    assert res_blocked.headers["location"] == "/login?error=1"
+        check = client.get("/check-session")
+        assert check.json() == {"user": None}
 
-    check = client.get("/check-session")
-    assert check.json() == {"user": None}
-
-    # Попытка с другого IP проходит успешно
-    res_other_ip = client.post(
-        "/login",
-        data={"username": "admin", "password": admin_pw},
-        headers={"X-Forwarded-For": "203.0.113.2"},
-    )
-    assert res_other_ip.status_code == status.HTTP_303_SEE_OTHER
-    assert res_other_ip.headers["location"] == "/"
+        # Попытка с другого IP проходит успешно
+        res_other_ip = client.post(
+            "/login",
+            data={"username": "admin", "password": admin_pw},
+            headers={"X-Forwarded-For": "203.0.113.2"},
+        )
+        assert res_other_ip.status_code == status.HTTP_303_SEE_OTHER
+        assert res_other_ip.headers["location"] == "/"
+    finally:
+        set_login_limiter(original_limiter)
 
 
 def test_auth_router_logout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -510,4 +694,3 @@ def test_cli_subprocess_pipe() -> None:
     assert res.returncode == 0
     hashed = res.stdout.strip()
     assert verify_password("pipe_cli_secret", hashed) is True
-

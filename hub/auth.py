@@ -5,12 +5,10 @@ import getpass
 import hashlib
 import hmac
 import io
-import json
 import secrets
 import sys
 import time
 import urllib.parse
-from typing import Any
 
 from fastapi import APIRouter, Form, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
@@ -168,14 +166,28 @@ def set_login_limiter(limiter: LoginLimiter) -> None:
     login_limiter = limiter
 
 
+TRUSTED_PROXIES: set[str] = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
 def get_client_ip(request: Request) -> str:
-    """Извлекает IP-адрес клиента с учётом заголовков обратного прокси."""
+    """Извлекает IP-адрес клиента с защитой от спуфинга заголовков."""
+    client_host = request.client.host if request.client and request.client.host else ""
+
+    # Если клиент подключился напрямую (не через доверенный прокси),
+    # возвращаем его реальный IP без доверия к X-Forwarded-For
+    if client_host and client_host not in TRUSTED_PROXIES:
+        return client_host
+
+    # Если запрос пришел через доверенный прокси, извлекаем IP из X-Forwarded-For.
+    # Обратный прокси (Caddy) дописывает реальный IP клиента в конец цепочки,
+    # поэтому берем последний непустой IP из заголовка.
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
-        return forwarded.split(",")[0].strip()
-    if request.client and request.client.host:
-        return request.client.host
-    return "127.0.0.1"
+        parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
+
+    return client_host or "127.0.0.1"
 
 
 def require_user(request: Request) -> str:
@@ -184,11 +196,8 @@ def require_user(request: Request) -> str:
     Возвращает логин пользователя или вызывает HTTPException(401).
     """
     user = None
-    if hasattr(request, "session"):
-        try:
-            user = request.session.get("user")
-        except AssertionError:
-            user = None
+    if "session" in request.scope:
+        user = request.session.get("user")
 
     if user and isinstance(user, str) and user.strip():
         return user.strip()
@@ -205,23 +214,26 @@ def require_api(request: Request) -> str:
     Возвращает actor: логин из сессии или 'api'. Сравнение токенов через compare_digest.
     """
     # 1. Сессия панели
-    if hasattr(request, "session"):
-        try:
-            user = request.session.get("user")
-            if user and isinstance(user, str) and user.strip():
-                return user.strip()
-        except AssertionError:
-            pass
+    if "session" in request.scope:
+        user = request.session.get("user")
+        if user and isinstance(user, str) and user.strip():
+            return user.strip()
 
     # 2. Bearer токен API
+    api_token = (get_settings().api_token or "").strip()
+    if not api_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Не авторизован",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     auth_header = request.headers.get("Authorization")
     if auth_header:
-        scheme, _, token = auth_header.partition(" ")
+        scheme, _, raw_token = auth_header.partition(" ")
+        token = raw_token.strip()
         if scheme.lower() == "bearer" and token:
-            token = token.strip()
-            settings = get_settings()
-            api_token = settings.api_token
-            if api_token and hmac.compare_digest(token, api_token.strip()):
+            if hmac.compare_digest(token, api_token):
                 return "api"
 
     raise HTTPException(
@@ -290,7 +302,7 @@ async def login(
 
     if success:
         limiter.reset(client_ip)
-        if hasattr(request, "session"):
+        if "session" in request.scope:
             request.session["user"] = expected_user
         return RedirectResponse(
             url="/",
@@ -308,11 +320,8 @@ async def login(
 @auth_router.get("/logout")
 async def logout(request: Request) -> Response:
     """Выход из панели: очистка сессии и редирект 303 на /login."""
-    if hasattr(request, "session"):
-        try:
-            request.session.clear()
-        except AssertionError:
-            pass
+    if "session" in request.scope:
+        request.session.clear()
     return RedirectResponse(
         url="/login",
         status_code=status.HTTP_303_SEE_OTHER,
@@ -362,6 +371,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "TRUSTED_PROXIES",
     "hash_password",
     "verify_password",
     "LoginLimiter",
