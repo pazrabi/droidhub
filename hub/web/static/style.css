@@ -1006,3 +1006,35 @@ a:hover {
 html.embed .owner-nav-bar,
 html.embed .app-footer,
 html.embed .logout-form { display: none; }
+
+/* Единый стиль с Gemini Pool: те же цвета и ширина, тема следует системной (светлая/тёмная) */
+:root {
+  --bg-body: #f6f7f9; --bg-surface: #ffffff; --bg-surface-elevated: #f1f3f6; --bg-surface-hover: #e3e6eb;
+  --border-color: #e3e6eb; --border-muted: #eceef2;
+  --text-primary: #1b1f27; --text-secondary: #6b7380; --text-muted: #6b7380;
+  --accent-primary: #2f6fed; --accent-primary-hover: #2f6fed;
+  --accent-success: #1a8f4d; --accent-success-hover: #1a8f4d;
+  --accent-danger: #c8382d; --accent-danger-hover: #c8382d; --accent-warning: #9a6b00;
+  --shadow: none;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-body: #0f1218; --bg-surface: #171b23; --bg-surface-elevated: #232833; --bg-surface-hover: #272d38;
+    --border-color: #272d38; --border-muted: #232833;
+    --text-primary: #e8ebf0; --text-secondary: #8b94a3; --text-muted: #8b94a3;
+    --accent-primary: #6b9bff; --accent-primary-hover: #6b9bff;
+    --accent-success: #4ccb82; --accent-success-hover: #4ccb82;
+    --accent-danger: #ff7b70; --accent-danger-hover: #ff7b70; --accent-warning: #e8b94a;
+  }
+}
+body { font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.owner-nav-container, .header-container, .main-content { max-width: 1100px; }
+.main-content { padding: 16px; min-height: 0; }
+.device-card, .card { border-radius: 12px; }
+.badge-success { background-color: var(--ok-bg, rgba(76, 203, 130, 0.15)); color: var(--accent-success); border-color: var(--accent-success); }
+.btn-primary, .btn-primary:hover { color: #fff; }
+@media (prefers-color-scheme: dark) { .btn-primary, .btn-primary:hover { color: #0f1218; } }
+
+/* Внутри molokohub: шапку и вкладки рисует оболочка, своя серая полоска не нужна */
+html.embed .app-header { display: none; }
+html.embed body { background: var(--bg-body); }
