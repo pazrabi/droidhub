@@ -43,6 +43,7 @@ class Settings:
     alert_cooldown_min: float = 30.0
     alert_tag: str = "droidhub"
     public_url: str = ""
+    client_tokens: str = ""
 
     def __post_init__(self) -> None:
         if self.public_url:
@@ -175,6 +176,7 @@ def get_settings(env_file: str | Path | None = None) -> Settings:
     alert_cooldown_min = parse_float("HUB_ALERT_COOLDOWN_MIN", 30.0)
     alert_tag = get_val("HUB_ALERT_TAG", "droidhub").strip() or "droidhub"
     public_url = get_val("HUB_PUBLIC_URL", "").strip().rstrip("/")
+    client_tokens = get_val("HUB_CLIENT_TOKENS", "").strip()
 
     return Settings(
         devices_file=get_val("HUB_DEVICES_FILE", "config/devices.yaml"),
@@ -197,6 +199,7 @@ def get_settings(env_file: str | Path | None = None) -> Settings:
         alert_cooldown_min=alert_cooldown_min,
         alert_tag=alert_tag,
         public_url=public_url,
+        client_tokens=client_tokens,
     )
 
 
