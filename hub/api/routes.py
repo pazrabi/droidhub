@@ -7,7 +7,7 @@ import re
 import time
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel
 
 import hub.audit as audit_module
@@ -61,49 +61,99 @@ if not hasattr(actions, "power"):
 
 # --- Лимитер действий на устройство (скользящее окно в памяти) ---
 
+def _client_attr(client: Any, attr: str, default: Any = None) -> Any:
+    if client is None:
+        return default
+    if isinstance(client, dict):
+        return client.get(attr, default)
+    return getattr(client, attr, default)
+
+
+def _get_client_key(client: Any) -> str | None:
+    if client is None:
+        return None
+    if isinstance(client, str):
+        return client
+    name = _client_attr(client, "name", None)
+    if name is not None:
+        return str(name)
+    return str(client)
+
+
 class DeviceRateLimiter:
-    """Ограничитель действий на устройство со скользящим окном в памяти."""
+    """Ограничитель действий на пару (клиент, устройство) со скользящим окном в памяти."""
 
     def __init__(self, window_seconds: float = 60.0) -> None:
         self.window_seconds = window_seconds
-        self._history: dict[str, list[float]] = defaultdict(list)
+        self._history: dict[tuple[str | None, str] | str, list[float]] = defaultdict(list)
         self._lock = asyncio.Lock()
 
-    async def check(self, device_id: str, limit: int | None = None) -> bool:
+    async def check(
+        self,
+        device_id: str,
+        limit: int | None = None,
+        client: Any = None,
+        **kwargs: Any,
+    ) -> bool:
+        if "client" in kwargs and client is None:
+            client = kwargs["client"]
+        if limit is not None and not isinstance(limit, int):
+            if client is None:
+                client = limit
+            limit = None
+
         if limit is None:
-            try:
-                settings = get_settings()
-                limit = getattr(settings, "rate_limit_per_min", 60)
-            except Exception:
-                limit = 60
+            if client is not None:
+                client_limit = _client_attr(client, "rate_limit_per_min", None)
+                if client_limit is not None:
+                    try:
+                        limit = int(client_limit)
+                    except (ValueError, TypeError):
+                        limit = None
+
+            if limit is None:
+                try:
+                    settings = get_settings()
+                    limit = getattr(settings, "rate_limit_per_min", 60)
+                except Exception:
+                    limit = 60
 
         if limit <= 0:
             return True
 
+        client_key = _get_client_key(client)
+        key = (client_key, device_id)
         now = time.monotonic()
         cutoff = now - self.window_seconds
 
         async with self._lock:
-            history = [t for t in self._history[device_id] if t > cutoff]
+            history = [t for t in self._history[key] if t > cutoff]
             if len(history) >= limit:
-                self._history[device_id] = history
+                self._history[key] = history
                 return False
             history.append(now)
-            self._history[device_id] = history
+            self._history[key] = history
             return True
 
-    def reset(self, device_id: str | None = None) -> None:
-        if device_id is not None:
-            self._history.pop(device_id, None)
-        else:
+    def reset(self, target: Any = None) -> None:
+        if target is None:
             self._history.clear()
+        elif isinstance(target, tuple):
+            self._history.pop(target, None)
+        else:
+            to_remove = [
+                k for k in self._history
+                if k == target or (isinstance(k, tuple) and target in k)
+            ]
+            for k in to_remove:
+                self._history.pop(k, None)
 
 
 limiter = DeviceRateLimiter()
 
 
-def reset_rate_limiter() -> None:
-    limiter.reset()
+def reset_rate_limiter(target: Any = None) -> None:
+    limiter.reset(target)
 
 
 # --- Кеш размеров экранов телефонов (wm size) ---
@@ -171,15 +221,30 @@ def _verify_device_exists(device_id: str) -> None:
         )
 
 
-async def _check_device_and_rate_limit(device_id: str) -> None:
-    """Проверяет наличие устройства и лимит действий."""
-    _verify_device_exists(device_id)
-    allowed = await limiter.check(device_id)
+async def _check_rate_limit(
+    device_id: str,
+    request: Request | None = None,
+    client: Any = None,
+) -> None:
+    """Проверяет лимит действий на пару (клиент, устройство)."""
+    if client is None and request is not None:
+        client = getattr(request.state, "client", None)
+    allowed = await limiter.check(device_id, client=client)
     if not allowed:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Превышен лимит действий на устройство",
         )
+
+
+async def _check_device_and_rate_limit(
+    device_id: str,
+    request: Request | None = None,
+    client: Any = None,
+) -> None:
+    """Проверяет наличие устройства и лимит действий."""
+    _verify_device_exists(device_id)
+    await _check_rate_limit(device_id, request=request, client=client)
 
 
 # --- Роутеры ---
@@ -229,11 +294,12 @@ async def get_devices(actor: str = Depends(require_api)) -> list[dict[str, Any]]
 @api_router.get("/devices/{device_id}/screenshot")
 async def get_screenshot(
     device_id: str,
+    request: Request,
     max_width: int = Query(default=720, ge=1),
     actor: str = Depends(require_api),
 ) -> Response:
     """Возвращает JPEG-скриншот и заголовки X-Screen-Width / X-Screen-Height с реальным размером экрана."""
-    await _check_device_and_rate_limit(device_id)
+    await _check_device_and_rate_limit(device_id, request=request)
     try:
         jpeg_bytes = await actions.screenshot(device_id, max_width=max_width, actor=actor)
         width, height = await get_screen_size(device_id)
@@ -257,10 +323,11 @@ async def get_screenshot(
 async def tap_device(
     device_id: str,
     req: TapRequest,
+    request: Request,
     actor: str = Depends(require_api),
 ) -> dict[str, Any]:
     """Нажатие (тап) по координатам."""
-    await _check_device_and_rate_limit(device_id)
+    await _check_device_and_rate_limit(device_id, request=request)
     try:
         await actions.tap(device_id, req.x, req.y, actor=actor)
         return {"ok": True, "status": "ok"}
@@ -276,10 +343,11 @@ async def tap_device(
 async def swipe_device(
     device_id: str,
     req: SwipeRequest,
+    request: Request,
     actor: str = Depends(require_api),
 ) -> dict[str, Any]:
     """Свайп от (x1, y1) до (x2, y2)."""
-    await _check_device_and_rate_limit(device_id)
+    await _check_device_and_rate_limit(device_id, request=request)
     try:
         await actions.swipe(device_id, req.x1, req.y1, req.x2, req.y2, ms=req.ms, actor=actor)
         return {"ok": True, "status": "ok"}
@@ -295,10 +363,11 @@ async def swipe_device(
 async def type_text_device(
     device_id: str,
     req: TextRequest,
+    request: Request,
     actor: str = Depends(require_api),
 ) -> dict[str, Any]:
     """Ввод текста на устройстве."""
-    await _check_device_and_rate_limit(device_id)
+    await _check_device_and_rate_limit(device_id, request=request)
     try:
         await actions.type_text(device_id, req.text, actor=actor)
         return {"ok": True, "status": "ok"}
@@ -314,10 +383,11 @@ async def type_text_device(
 async def key_device(
     device_id: str,
     req: KeyRequest,
+    request: Request,
     actor: str = Depends(require_api),
 ) -> dict[str, Any]:
     """Нажатие аппаратной клавиши."""
-    await _check_device_and_rate_limit(device_id)
+    await _check_device_and_rate_limit(device_id, request=request)
     try:
         await actions.key(device_id, req.name, actor=actor)
         return {"ok": True, "status": "ok"}
@@ -333,15 +403,25 @@ async def key_device(
 async def power_device(
     device_id: str,
     req: PowerRequest,
+    request: Request,
     actor: str = Depends(require_api),
 ) -> dict[str, Any]:
     """Управление питанием устройства (wake, sleep, reboot, shutdown)."""
-    await _check_device_and_rate_limit(device_id)
-    if req.action in ("reboot", "shutdown") and not req.confirm:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Для действия '{req.action}' требуется подтверждение (confirm=true)",
-        )
+    _verify_device_exists(device_id)
+    if req.action in ("reboot", "shutdown"):
+        client = getattr(request.state, "client", None)
+        allow_power = _client_attr(client, "allow_power", True) if client is not None else True
+        if allow_power is False:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Действие '{req.action}' запрещено для данного клиента",
+            )
+        if not req.confirm:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Для действия '{req.action}' требуется подтверждение (confirm=true)",
+            )
+    await _check_rate_limit(device_id, request=request)
     try:
         await actions.power(device_id, req.action, actor=actor)
         return {"ok": True, "status": "ok"}
@@ -357,10 +437,11 @@ async def power_device(
 async def open_app_device(
     device_id: str,
     req: OpenAppRequest,
+    request: Request,
     actor: str = Depends(require_api),
 ) -> dict[str, Any]:
     """Запуск приложения по пакету."""
-    await _check_device_and_rate_limit(device_id)
+    await _check_device_and_rate_limit(device_id, request=request)
     try:
         await actions.open_app(device_id, req.package, actor=actor)
         return {"ok": True, "status": "ok"}
@@ -375,10 +456,11 @@ async def open_app_device(
 @api_router.get("/devices/{device_id}/apps")
 async def get_apps_device(
     device_id: str,
+    request: Request,
     actor: str = Depends(require_api),
 ) -> list[str]:
     """Список установленных приложений."""
-    await _check_device_and_rate_limit(device_id)
+    await _check_device_and_rate_limit(device_id, request=request)
     try:
         return await actions.list_apps(device_id, actor=actor)
     except (DeviceOffline, AdbTimeout, AdbError) as exc:
@@ -392,10 +474,11 @@ async def get_apps_device(
 @api_router.get("/devices/{device_id}/ui")
 async def get_ui_device(
     device_id: str,
+    request: Request,
     actor: str = Depends(require_api),
 ) -> list[dict[str, Any]]:
     """Дамп иерархии UI элементов."""
-    await _check_device_and_rate_limit(device_id)
+    await _check_device_and_rate_limit(device_id, request=request)
     try:
         return await actions.ui_dump(device_id, actor=actor)
     except (DeviceOffline, AdbTimeout, AdbError) as exc:
