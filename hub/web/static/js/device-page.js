@@ -14,8 +14,6 @@
     if (!deviceId) return;
 
     const screenImg = document.getElementById('screen-img');
-    const screenCanvas = document.getElementById('screen-canvas');
-    const btnToggleVideo = document.getElementById('btn-toggle-video');
     const screenPlaceholder = document.getElementById('screen-placeholder');
     const statusDot = document.getElementById('stream-status-dot');
     const statusText = document.getElementById('stream-status-text');
@@ -33,8 +31,6 @@
     let screenshotTimer = null;
     let realScreenWidth = 0;
     let realScreenHeight = 0;
-    let videoActive = false; // живое видео вместо скриншотов
-    let videoStream = null;
     let lastFrameTime = 0;
     const targetIntervalMs = 1000; // Целевой интервал по умолчанию 1 с
 
@@ -99,7 +95,7 @@
        1. Скриншоты с адаптивным интервалом, индикатором задержки и без наложения
        ----------------------------------------------------------------------- */
     async function fetchScreenshot(force = false) {
-      if (isFetchingScreenshot || (!streamingActive && !force) || document.hidden || (videoActive && !force)) {
+      if (isFetchingScreenshot || (!streamingActive && !force) || document.hidden) {
         return;
       }
 
@@ -173,7 +169,7 @@
         clearTimeout(screenshotTimer);
         screenshotTimer = null;
       }
-      if ((!streamingActive && !force) || document.hidden || (videoActive && !force)) {
+      if ((!streamingActive && !force) || document.hidden) {
         return;
       }
       if (isFetchingScreenshot) {
@@ -224,124 +220,16 @@
       });
     }
 
-    /* -----------------------------------------------------------------------
-       1б. Живое видео (WebCodecs); при ошибке возвращаемся к скриншотам
-       ----------------------------------------------------------------------- */
-    const STORAGE_KEY_VIDEO = 'screen_video';
-    const VideoStream = window.DroidHub.VideoStream;
-    let videoWanted = VideoStream.supported();
-    try {
-      if (localStorage.getItem(STORAGE_KEY_VIDEO) === 'off') videoWanted = false;
-    } catch (e) { /* localStorage недоступен */ }
-
-    function activeScreenEl() {
-      return videoActive ? screenCanvas : screenImg;
-    }
-
-    function showVideoSurface(on) {
-      screenCanvas.style.display = on ? 'block' : 'none';
-      if (on) {
-        screenImg.style.display = 'none';
-        if (screenPlaceholder) screenPlaceholder.style.display = 'none';
-      } else if (screenImg.src) {
-        screenImg.style.display = 'block';
-      }
-    }
-
-    function updateVideoButton() {
-      if (!btnToggleVideo) return;
-      btnToggleVideo.textContent = videoActive || videoWanted ? 'Видео' : 'Фото';
-      btnToggleVideo.disabled = !VideoStream.supported();
-      btnToggleVideo.title = VideoStream.supported()
-        ? 'Живое видео или скриншоты'
-        : 'Этот браузер не умеет показывать видео, работают скриншоты';
-    }
-
-    function stopVideo() {
-      if (videoStream) { videoStream.stop(); videoStream = null; }
-      if (videoActive) {
-        videoActive = false;
-        showVideoSurface(false);
-      }
-    }
-
-    function startVideo() {
-      stopVideo();
-      if (!VideoStream.supported()) { updateVideoButton(); return; }
-      setStatus('paused', 'Подключение видео…');
-      const stream = new VideoStream(deviceId, screenCanvas, {
-        onConfig: (cfg) => {
-          if (cfg.real_width > 0 && cfg.real_height > 0) {
-            realScreenWidth = cfg.real_width;
-            realScreenHeight = cfg.real_height;
-          }
-          videoActive = true;
-          showVideoSurface(true);
-          if (screenshotTimer) { clearTimeout(screenshotTimer); screenshotTimer = null; }
-          setStatus('active', 'Видео');
-          updateVideoButton();
-        },
-        onFrame: () => {
-          lastFrameTime = Date.now();
-          if (frameAgeEl) frameAgeEl.textContent = '';
-        },
-        onClose: (reason) => {
-          if (videoStream !== stream) return;
-          videoStream = null;
-          const wasActive = videoActive;
-          videoActive = false;
-          showVideoSurface(false);
-          if (reason === 'unsupported') videoWanted = false;
-          setStatus('error', wasActive ? 'Видео прервано, скриншоты' : 'Видео недоступно, скриншоты');
-          updateVideoButton();
-          requestImmediateFrame(true);
-        },
-      });
-      videoStream = stream;
-      stream.start(currentQuality);
-    }
-
-    if (btnToggleVideo) {
-      updateVideoButton();
-      btnToggleVideo.addEventListener('click', () => {
-        videoWanted = !(videoActive || videoStream);
-        try { localStorage.setItem(STORAGE_KEY_VIDEO, videoWanted ? 'on' : 'off'); } catch (e) { /* ignore */ }
-        if (videoWanted) {
-          startVideo();
-        } else {
-          stopVideo();
-          btnToggleVideo.textContent = 'Фото';
-          requestImmediateFrame(true);
-        }
-      });
-    }
-
-    // При смене качества видео переподключается с новой шириной
-    if (qualitySelect) {
-      qualitySelect.addEventListener('change', () => { if (videoStream || videoActive) startVideo(); });
-    }
-
-    // Вкладка скрыта — видео не нужно; вернулись — подключаем снова
-    document.addEventListener('visibilitychange', () => {
-      if (document.hidden) {
-        if (videoStream || videoActive) { stopVideo(); videoWanted = true; }
-      } else if (videoWanted && !videoStream) {
-        startVideo();
-      }
-    });
-
     // Запуск первого кадра
     fetchScreenshot();
-    if (videoWanted) startVideo();
 
     /* -----------------------------------------------------------------------
        2. Тап и свайп с пересчетом координат через X-Screen-Width/Height
        ----------------------------------------------------------------------- */
     function getNormalizedCoords(clientX, clientY) {
-      const screenEl = activeScreenEl();
-      if (!screenEl || screenEl.style.display === 'none') return null;
+      if (!screenImg || screenImg.style.display === 'none') return null;
 
-      const rect = screenEl.getBoundingClientRect();
+      const rect = screenImg.getBoundingClientRect();
       const displayW = rect.width;
       const displayH = rect.height;
       if (displayW <= 0 || displayH <= 0) return null;
@@ -353,8 +241,8 @@
       relX = Math.max(0, Math.min(displayW, relX));
       relY = Math.max(0, Math.min(displayH, relY));
 
-      const targetW = realScreenWidth > 0 ? realScreenWidth : ((screenEl === screenCanvas ? screenCanvas.width : screenEl.naturalWidth) || displayW);
-      const targetH = realScreenHeight > 0 ? realScreenHeight : ((screenEl === screenCanvas ? screenCanvas.height : screenEl.naturalHeight) || displayH);
+      const targetW = realScreenWidth > 0 ? realScreenWidth : (screenImg.naturalWidth || displayW);
+      const targetH = realScreenHeight > 0 ? realScreenHeight : (screenImg.naturalHeight || displayH);
 
       const realX = Math.round((relX / displayW) * targetW);
       const realY = Math.round((relY / displayH) * targetH);
@@ -484,13 +372,8 @@
       }
     }
 
-    // События мыши и тача: на скриншоте и на видео
-    function onScreen(type, handler, options) {
-      [screenImg, screenCanvas].forEach((el) => el && el.addEventListener(type, handler, options));
-    }
-
     // События мыши
-    onScreen('mousedown', (e) => {
+    screenImg.addEventListener('mousedown', (e) => {
       e.preventDefault();
       handlePointerStart(e.clientX, e.clientY);
     });
@@ -510,21 +393,21 @@
     });
 
     // События тача
-    onScreen('touchstart', (e) => {
+    screenImg.addEventListener('touchstart', (e) => {
       if (e.touches.length === 1) {
         e.preventDefault();
         handlePointerStart(e.touches[0].clientX, e.touches[0].clientY);
       }
     }, { passive: false });
 
-    onScreen('touchmove', (e) => {
+    screenImg.addEventListener('touchmove', (e) => {
       if (e.touches.length === 1 && isPointerDown) {
         e.preventDefault();
         handlePointerMove(e.touches[0].clientX, e.touches[0].clientY);
       }
     }, { passive: false });
 
-    onScreen('touchend', (e) => {
+    screenImg.addEventListener('touchend', (e) => {
       if (isPointerDown) {
         e.preventDefault();
         if (e.changedTouches.length === 1) {
@@ -535,7 +418,7 @@
       }
     }, { passive: false });
 
-    onScreen('touchcancel', () => {
+    screenImg.addEventListener('touchcancel', () => {
       isPointerDown = false;
     });
 

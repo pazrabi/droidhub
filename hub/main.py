@@ -12,13 +12,11 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from hub.alerts import AlertMonitor
 from hub.api.routes import api_router, public_router
-from hub.api.stream import stream_router
 from hub.audit import init_audit
 from hub.config import Settings, get_settings, load_devices
 from hub.devices import actions
 from hub.devices.adb import AdbError
 from hub.devices.manager import DeviceManager
-from hub.devices.stream import streams
 from hub.auth import auth_router
 from hub.mcp_server import create_mcp_app
 from hub.sso_routes import sso_router
@@ -64,7 +62,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 yield
         finally:
-            streams.stop_all()
             await monitor.stop()
             await manager.stop()
 
@@ -94,7 +91,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Подключение роутеров
     app.include_router(public_router)
     app.include_router(api_router)
-    app.include_router(stream_router)
     app.include_router(auth_router)
     app.include_router(web_router)
     if settings.sso_secret:
