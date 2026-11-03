@@ -93,6 +93,7 @@ def test_settings_defaults() -> None:
     assert settings.alert_cooldown_min == 30.0
     assert settings.alert_tag == "droidhub"
     assert settings.public_url == ""
+    assert settings.client_tokens == ""
 
 
 def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -109,6 +110,7 @@ def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
         "HUB_DEVICES_FILE",
         "HUB_DB_PATH",
         "HUB_ENV_FILE",
+        "HUB_CLIENT_TOKENS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -122,6 +124,7 @@ def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HUB_RATE_LIMIT_PER_MIN", "120")
     monkeypatch.setenv("HUB_DEVICES_FILE", "custom/devices.yaml")
     monkeypatch.setenv("HUB_DB_PATH", "custom/hub.db")
+    monkeypatch.setenv("HUB_CLIENT_TOKENS", "pool:Abc-123_x:30:nopower")
 
     settings = get_settings()
     assert settings.admin_user == "superadmin"
@@ -134,6 +137,7 @@ def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.rate_limit_per_min == 120
     assert settings.devices_file == "custom/devices.yaml"
     assert settings.db_path == "custom/hub.db"
+    assert settings.client_tokens == "pool:Abc-123_x:30:nopower"
 
 
 def test_get_settings_default_call(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -150,6 +154,7 @@ def test_get_settings_default_call(monkeypatch: pytest.MonkeyPatch) -> None:
         "HUB_DEVICES_FILE",
         "HUB_DB_PATH",
         "HUB_ENV_FILE",
+        "HUB_CLIENT_TOKENS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -166,16 +171,19 @@ def test_get_settings_default_call(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.adb_path == "adb"
     assert settings.allow_shell is False
     assert settings.rate_limit_per_min == 60
+    assert settings.client_tokens == ""
 
     # Проверяем чтение переменных окружения при вызове без аргументов
     monkeypatch.setenv("HUB_ADMIN_USER", "default_caller")
     monkeypatch.setenv("HUB_ALLOW_SHELL", "true")
     monkeypatch.setenv("HUB_RATE_LIMIT_PER_MIN", "45")
+    monkeypatch.setenv("HUB_CLIENT_TOKENS", "default:tok_123")
 
     settings_env = get_settings()
     assert settings_env.admin_user == "default_caller"
     assert settings_env.allow_shell is True
     assert settings_env.rate_limit_per_min == 45
+    assert settings_env.client_tokens == "default:tok_123"
 
 
 def test_get_settings_from_env_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -265,3 +273,23 @@ def test_settings_public_url_strips_slash() -> None:
     assert settings_no_slash.public_url == "https://hub.example.com"
     settings_empty = Settings(public_url="")
     assert settings_empty.public_url == ""
+
+
+def test_get_settings_client_tokens(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in ("HUB_CLIENT_TOKENS", "HUB_ENV_FILE"):
+        monkeypatch.delenv(key, raising=False)
+
+    # 1. Default empty
+    settings = get_settings()
+    assert settings.client_tokens == ""
+
+    # 2. From env file
+    env_file = tmp_path / ".env"
+    env_file.write_text("HUB_CLIENT_TOKENS=pool:tok1:30:nopower,claude:tok2\n", encoding="utf-8")
+    settings_file = get_settings(env_file=env_file)
+    assert settings_file.client_tokens == "pool:tok1:30:nopower,claude:tok2"
+
+    # 3. Process env overrides env file
+    monkeypatch.setenv("HUB_CLIENT_TOKENS", "custom:env_override_tok")
+    settings_override = get_settings(env_file=env_file)
+    assert settings_override.client_tokens == "custom:env_override_tok"

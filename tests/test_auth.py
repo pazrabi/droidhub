@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 import getpass
 import hashlib
 import io
+import logging
 import subprocess
 import sys
 import time
@@ -14,6 +16,7 @@ import pytest
 from starlette.middleware.sessions import SessionMiddleware
 
 from hub.auth import (
+    Client,
     LoginLimiter,
     TRUSTED_PROXIES,
     auth_router,
@@ -21,11 +24,14 @@ from hub.auth import (
     get_login_limiter,
     hash_password,
     main as cli_main,
+    parse_client_tokens,
     require_api,
     require_user,
+    resolve_token,
     set_login_limiter,
     verify_password,
 )
+from hub.config import Settings
 
 
 # =====================================================================
@@ -696,3 +702,344 @@ def test_cli_subprocess_pipe() -> None:
     assert res.returncode == 0
     hashed = res.stdout.strip()
     assert verify_password("pipe_cli_secret", hashed) is True
+
+
+# =====================================================================
+# Тесты этапа 4: токены по клиентам (Client, parse_client_tokens, resolve_token, require_api)
+# =====================================================================
+
+
+def test_client_dataclass() -> None:
+    # Дефолтные значения
+    c1 = Client(name="test_client")
+    assert c1.name == "test_client"
+    assert c1.rate_limit_per_min is None
+    assert c1.allow_power is True
+
+    # Пользовательские значения
+    c2 = Client(name="pool", rate_limit_per_min=30, allow_power=False)
+    assert c2.name == "pool"
+    assert c2.rate_limit_per_min == 30
+    assert c2.allow_power is False
+
+    # Неизменяемость (frozen=True)
+    with pytest.raises(FrozenInstanceError):
+        c1.name = "new_name"  # type: ignore[misc]
+
+
+def test_parse_client_tokens_format_with_limit_and_flags() -> None:
+    # 1. Формат с лимитом и флагом nopower
+    raw1 = "pool:Abc-123_x:30:nopower"
+    res1 = parse_client_tokens(raw1)
+    assert len(res1) == 1
+    assert "Abc-123_x" in res1
+    assert res1["Abc-123_x"] == Client(name="pool", rate_limit_per_min=30, allow_power=False)
+
+    # 2. Формат только с лимитом
+    raw2 = "claude:Def-456_y:60"
+    res2 = parse_client_tokens(raw2)
+    assert res2["Def-456_y"] == Client(name="claude", rate_limit_per_min=60, allow_power=True)
+
+    # 3. Формат без лимита и флагов (только имя и токен)
+    raw3 = "bot:Ghi-789_z"
+    res3 = parse_client_tokens(raw3)
+    assert res3["Ghi-789_z"] == Client(name="bot", rate_limit_per_min=None, allow_power=True)
+
+    # 4. Несколько флагов через '+' включая nopower
+    raw4 = "agent:Jkl-012_w:10:otherflag+nopower+audit"
+    res4 = parse_client_tokens(raw4)
+    assert res4["Jkl-012_w"] == Client(name="agent", rate_limit_per_min=10, allow_power=False)
+
+    # 5. Флаги через '+' без nopower
+    raw5 = "admin:Mno-345_v:100:audit+readonly"
+    res5 = parse_client_tokens(raw5)
+    assert res5["Mno-345_v"] == Client(name="admin", rate_limit_per_min=100, allow_power=True)
+
+    # 6. Пустой сегмент флага
+    raw6 = "service:Pqr-678_u:20:"
+    res6 = parse_client_tokens(raw6)
+    assert res6["Pqr-678_u"] == Client(name="service", rate_limit_per_min=20, allow_power=True)
+
+
+def test_parse_client_tokens_multiple_clients() -> None:
+    raw = (
+        " pool:Abc-123_x:30:nopower , "
+        "claude:Def-456_y:60, "
+        "bot:Ghi-789_z , "
+        "pool:Backup-Token_99:10 "
+    )
+    res = parse_client_tokens(raw)
+    assert len(res) == 4
+    assert res["Abc-123_x"] == Client(name="pool", rate_limit_per_min=30, allow_power=False)
+    assert res["Def-456_y"] == Client(name="claude", rate_limit_per_min=60, allow_power=True)
+    assert res["Ghi-789_z"] == Client(name="bot", rate_limit_per_min=None, allow_power=True)
+    assert res["Backup-Token_99"] == Client(name="pool", rate_limit_per_min=10, allow_power=True)
+
+
+def test_parse_client_tokens_invalid_records(caplog: pytest.LogCaptureFixture) -> None:
+    secret_bad_token1 = "SECRET_BAD_TOKEN_1"
+    secret_bad_token2 = "SECRET_BAD_TOKEN_2"
+
+    raw = (
+        f"valid_one:Valid-Token_1:15,"
+        f"bad_no_colon,"
+        f"too:many:colons:in:this:record,"
+        f"UPPERCASE:{secret_bad_token1}:10,"
+        f"name with space:Tok1:10,"
+        f"name@bad:Tok2:10,"
+        f":EmptyNameTok:10,"
+        f"client_empty_token:,"
+        f"client_spaces_token:   :20,"
+        f"client_bad_chars:bad tok space:10,"
+        f"client_bad_symbol:bad!token:10,"
+        f"client_bad_limit:Tok3:notanumber,"
+        f"client_zero_limit:Tok4:0,"
+        f"client_neg_limit:Tok5:-5,"
+        f"client_bad_flag:Tok6:10:bad!flag,"
+        f"client_empty_flag:Tok7:10:flag1++flag2,"
+        f"valid_two:Valid-Token_2:25:nopower"
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        res = parse_client_tokens(raw)
+
+    # Только корректные записи попали в результат
+    assert len(res) == 2
+    assert "Valid-Token_1" in res
+    assert "Valid-Token_2" in res
+    assert res["Valid-Token_1"] == Client(name="valid_one", rate_limit_per_min=15, allow_power=True)
+    assert res["Valid-Token_2"] == Client(name="valid_two", rate_limit_per_min=25, allow_power=False)
+
+    # Проверяем логирование предупреждений
+    assert len(caplog.records) > 0
+    all_log_text = " ".join(record.message for record in caplog.records)
+
+    # КРИТИЧНО: токены не должны утекать в лог
+    for bad_tok in (
+        secret_bad_token1,
+        secret_bad_token2,
+        "Valid-Token_1",
+        "Valid-Token_2",
+        "Tok1",
+        "Tok2",
+        "Tok3",
+        "Tok4",
+        "Tok5",
+        "Tok6",
+        "Tok7",
+        "bad tok space",
+        "bad!token",
+    ):
+        assert bad_tok not in all_log_text
+
+
+def test_parse_client_tokens_duplicate_tokens(caplog: pytest.LogCaptureFixture) -> None:
+    raw = "client1:Duplicate-Token-123:30, client2:Duplicate-Token-123:60"
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        res = parse_client_tokens(raw)
+
+    assert len(res) == 1
+    assert res["Duplicate-Token-123"] == Client(name="client1", rate_limit_per_min=30, allow_power=True)
+    all_log_text = " ".join(record.message for record in caplog.records)
+    assert "Duplicate-Token-123" not in all_log_text
+    assert "client2" in all_log_text
+
+
+def test_empty_tokens_do_not_match() -> None:
+    # 1. parse_client_tokens при пустых входных данных
+    assert parse_client_tokens("") == {}
+    assert parse_client_tokens("   ") == {}
+    assert parse_client_tokens(",  ,  ,") == {}
+
+    # 2. resolve_token с пустыми токенами
+    settings = Settings(
+        client_tokens="pool:valid_tok:30",
+        api_token="",
+        mcp_token="",
+    )
+    assert resolve_token("", settings=settings) is None
+    assert resolve_token("   ", settings=settings) is None
+
+    # 3. Пустой токен запроса не совпадает даже с пустым legacy api_token или mcp_token
+    settings_all_empty = Settings(client_tokens="", api_token="", mcp_token="")
+    assert resolve_token("", settings=settings_all_empty) is None
+    assert resolve_token("   ", settings=settings_all_empty) is None
+    assert resolve_token("api", settings=settings_all_empty) is None
+    assert resolve_token("mcp", settings=settings_all_empty) is None
+
+
+def test_resolve_token_legacy_and_priority(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1. Legacy api_token -> Client(name="api")
+    settings_api = Settings(api_token="legacy_api_token_val")
+    res_api = resolve_token("legacy_api_token_val", settings=settings_api)
+    assert res_api == Client(name="api", rate_limit_per_min=None, allow_power=True)
+
+    # 2. Legacy mcp_token -> Client(name="mcp")
+    settings_mcp = Settings(mcp_token="legacy_mcp_token_val")
+    res_mcp = resolve_token("legacy_mcp_token_val", settings=settings_mcp)
+    assert res_mcp == Client(name="mcp", rate_limit_per_min=None, allow_power=True)
+
+    # 3. Приоритет: client_tokens выше legacy api_token и mcp_token
+    settings_priority = Settings(
+        client_tokens="pool:shared_token_1:30:nopower",
+        api_token="shared_token_1",
+        mcp_token="shared_token_2",
+    )
+    res_priority = resolve_token("shared_token_1", settings=settings_priority)
+    assert res_priority == Client(name="pool", rate_limit_per_min=30, allow_power=False)
+
+    # 4. Приоритет: legacy api_token выше legacy mcp_token
+    settings_both_legacy = Settings(
+        api_token="same_legacy_token",
+        mcp_token="same_legacy_token",
+    )
+    res_both = resolve_token("same_legacy_token", settings=settings_both_legacy)
+    assert res_both == Client(name="api")
+
+    # 5. Неверный токен
+    assert resolve_token("completely_unknown_token", settings=settings_priority) is None
+
+    # 6. Чтение настроек по умолчанию из get_settings() при settings=None
+    monkeypatch.setenv("HUB_CLIENT_TOKENS", "agent:env_agent_tok_456:15")
+    monkeypatch.delenv("HUB_API_TOKEN", raising=False)
+    monkeypatch.delenv("HUB_MCP_TOKEN", raising=False)
+    res_default_settings = resolve_token("env_agent_tok_456")
+    assert res_default_settings == Client(name="agent", rate_limit_per_min=15, allow_power=True)
+
+
+def test_resolve_token_constant_time_evaluates_all_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        client_tokens="c1:tok1:10, c2:tok2:20, c3:tok3:30",
+        api_token="legacy_api",
+        mcp_token="legacy_mcp",
+    )
+    # Всего кандидатов: 3 client_tokens + 1 api_token + 1 mcp_token = 5
+
+    calls: list[tuple[str, str]] = []
+    real_compare = hashlib.sha256  # just reference
+
+    import hmac
+
+    original_compare = hmac.compare_digest
+
+    def spy_compare(a: Any, b: Any) -> bool:
+        calls.append((str(a), str(b)))
+        return original_compare(a, b)
+
+    monkeypatch.setattr(hmac, "compare_digest", spy_compare)
+
+    # Проверяем первый же токен кандидата: совпадение на шаге 1,
+    # но цикл обязан проверить ВСЕ 5 кандидатов без раннего break/return
+    calls.clear()
+    res = resolve_token("tok1", settings=settings)
+    assert res == Client(name="c1", rate_limit_per_min=10, allow_power=True)
+    assert len(calls) == 5
+
+    # Проверяем несуществующий токен: также ровно 5 сравнений
+    calls.clear()
+    res_none = resolve_token("nonexistent", settings=settings)
+    assert res_none is None
+    assert len(calls) == 5
+
+
+def test_require_api_client_and_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test_state_secret")
+
+    @app.get("/api/state-info")
+    def state_info(request: Request, actor: str = Depends(require_api)) -> dict[str, Any]:
+        client = getattr(request.state, "client", None)
+        return {
+            "actor": actor,
+            "has_client": client is not None,
+            "client_name": client.name if client else None,
+            "rate_limit_per_min": client.rate_limit_per_min if client else None,
+            "allow_power": client.allow_power if client else None,
+        }
+
+    @app.post("/set-user-session")
+    def set_user_session(request: Request) -> dict[str, bool]:
+        request.session["user"] = "login_user_bob"
+        return {"ok": True}
+
+    client = TestClient(app)
+
+    # 1. Авторизация через сессию панели -> Client(name=логин)
+    client.post("/set-user-session")
+    res_session = client.get("/api/state-info")
+    assert res_session.status_code == 200
+    data_session = res_session.json()
+    assert data_session["actor"] == "login_user_bob"
+    assert data_session["has_client"] is True
+    assert data_session["client_name"] == "login_user_bob"
+    assert data_session["rate_limit_per_min"] is None
+    assert data_session["allow_power"] is True
+
+    # 2. Клиент без сессии, токен из client_tokens
+    monkeypatch.setenv("HUB_CLIENT_TOKENS", "pool:pool_token_xyz:40:nopower")
+    monkeypatch.delenv("HUB_API_TOKEN", raising=False)
+    monkeypatch.delenv("HUB_MCP_TOKEN", raising=False)
+    app2 = FastAPI()
+    app2.add_middleware(SessionMiddleware, secret_key="test_state_secret_2")
+
+    @app2.get("/api/state-info")
+    def state_info2(request: Request, actor: str = Depends(require_api)) -> dict[str, Any]:
+        client_obj = getattr(request.state, "client", None)
+        return {
+            "actor": actor,
+            "client_name": client_obj.name if client_obj else None,
+            "rate_limit_per_min": client_obj.rate_limit_per_min if client_obj else None,
+            "allow_power": client_obj.allow_power if client_obj else None,
+        }
+
+    client2 = TestClient(app2)
+    res_bearer_pool = client2.get(
+        "/api/state-info",
+        headers={"Authorization": "Bearer pool_token_xyz"},
+    )
+    assert res_bearer_pool.status_code == 200
+    data_pool = res_bearer_pool.json()
+    assert data_pool["actor"] == "pool"
+    assert data_pool["client_name"] == "pool"
+    assert data_pool["rate_limit_per_min"] == 40
+    assert data_pool["allow_power"] is False
+
+    # 3. Клиент через legacy api_token -> Client(name="api")
+    monkeypatch.delenv("HUB_CLIENT_TOKENS", raising=False)
+    monkeypatch.setenv("HUB_API_TOKEN", "legacy_token_api_999")
+    res_bearer_api = client2.get(
+        "/api/state-info",
+        headers={"Authorization": "Bearer legacy_token_api_999"},
+    )
+    assert res_bearer_api.status_code == 200
+    data_api = res_bearer_api.json()
+    assert data_api["actor"] == "api"
+    assert data_api["client_name"] == "api"
+    assert data_api["rate_limit_per_min"] is None
+    assert data_api["allow_power"] is True
+
+    # 4. Клиент через legacy mcp_token -> Client(name="mcp")
+    monkeypatch.delenv("HUB_API_TOKEN", raising=False)
+    monkeypatch.setenv("HUB_MCP_TOKEN", "legacy_token_mcp_555")
+    res_bearer_mcp = client2.get(
+        "/api/state-info",
+        headers={"Authorization": "Bearer legacy_token_mcp_555"},
+    )
+    assert res_bearer_mcp.status_code == 200
+    data_mcp = res_bearer_mcp.json()
+    assert data_mcp["actor"] == "mcp"
+    assert data_mcp["client_name"] == "mcp"
+    assert data_mcp["rate_limit_per_min"] is None
+    assert data_mcp["allow_power"] is True
+
+    # 5. Ошибочный токен
+    res_unauth = client2.get(
+        "/api/state-info",
+        headers={"Authorization": "Bearer invalid_tok"},
+    )
+    assert res_unauth.status_code == status.HTTP_401_UNAUTHORIZED
+
