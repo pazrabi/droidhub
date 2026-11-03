@@ -62,6 +62,9 @@ def test_tool_list_and_no_shell() -> None:
         "list_apps",
         "open_url",
         "wait",
+        "fetch_page",
+        "browser_tabs",
+        "page_text",
     }
     assert expected_tools.issubset(tool_names), f"Не хватает инструментов: {expected_tools - tool_names}"
     assert "shell" not in tool_names, "Инструмент 'shell' НЕ должен быть зарегистрирован!"

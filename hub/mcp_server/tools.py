@@ -9,7 +9,7 @@ from mcp.server.mcpserver import Image, MCPServer
 
 import hub.audit as audit_module
 from hub.auth import Client
-from hub.devices import actions
+from hub.devices import actions, browser
 from hub.mcp_server.context import _current_client, get_current_client
 from hub.mcp_server.look import CACHE_TTL_SECONDS, LookCacheEntry, build_look, look_cache
 from hub.mcp_server.ratelimit import enforce_rate_limit
@@ -255,3 +255,35 @@ Pause execution for specified number of seconds; after waiting inspect screen vi
     client = await _begin(device_id)
     await actions.wait(device_id, seconds, actor=client.name)
     return {"ok": True, "waited": seconds}
+
+
+@mcp_server.tool()
+async def fetch_page(
+    device_id: str,
+    url: str,
+    wait_seconds: float = 15.0,
+    capture_json: list[str] | None = None,
+    max_chars: int = 200000,
+) -> dict[str, Any]:
+    """Открыть адрес в Chrome телефона и вернуть текст всей страницы (не пиксели) и JSON-ответы сайта; capture_json: подстроки адресов нужных ответов, wait_seconds: сколько ждать догрузки; в ответе captcha=true, если показана капча.
+Open URL in phone's Chrome and return full page text (no pixels) plus the site's JSON responses; capture_json: URL substrings of wanted responses, wait_seconds: max wait for content; captcha=true when a captcha is shown."""
+    client = await _begin(device_id)
+    return await browser.fetch_page(
+        device_id, url, wait_seconds, capture_json, max_chars, actor=client.name
+    )
+
+
+@mcp_server.tool()
+async def browser_tabs(device_id: str) -> list[dict[str, Any]]:
+    """Список открытых вкладок Chrome на телефоне (index, title, url); индекс нужен для page_text.
+List open Chrome tabs on the phone (index, title, url); the index is used by page_text."""
+    client = await _begin(device_id)
+    return await browser.browser_tabs(device_id, actor=client.name)
+
+
+@mcp_server.tool()
+async def page_text(device_id: str, tab_index: int = 0, max_chars: int = 200000) -> dict[str, Any]:
+    """Текст всей страницы уже открытой вкладки Chrome по индексу из browser_tabs, а не только видимой части экрана.
+Full text of an already open Chrome tab by index from browser_tabs, not only the visible part of the screen."""
+    client = await _begin(device_id)
+    return await browser.page_text(device_id, tab_index, max_chars, actor=client.name)

@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 import hub.audit as audit_module
 from hub.config import get_settings
-from hub.devices import actions
+from hub.devices import actions, browser
 from hub.devices.adb import AdbError, AdbTimeout, DeviceOffline, adb_shell
 from hub.devices.manager import DeviceStatus
 
@@ -44,6 +44,13 @@ class KeyRequest(BaseModel):
 
 class OpenAppRequest(BaseModel):
     package: str
+
+
+class FetchPageRequest(BaseModel):
+    url: str
+    wait_seconds: float = 15.0
+    capture_json: list[str] = []
+    max_chars: int = 200000
 
 
 class PowerRequest(BaseModel):
@@ -487,6 +494,65 @@ async def get_ui_device(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Устройство '{device_id}' не найдено")
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+def _browser_http_error(exc: Exception) -> HTTPException:
+    """Ошибки чтения страниц: занято 429, остальное про браузер 502, неверный запрос 400."""
+    if isinstance(exc, browser.BrowserBusy):
+        return HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc))
+    if isinstance(exc, ValueError):
+        return HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    return HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc) or "Ошибка ADB")
+
+
+_BROWSER_ERRORS = (browser.BrowserError, DeviceOffline, AdbTimeout, AdbError, ValueError)
+
+
+@api_router.post("/devices/{device_id}/fetch_page")
+async def fetch_page_device(
+    device_id: str,
+    req: FetchPageRequest,
+    request: Request,
+    actor: str = Depends(require_api),
+) -> dict[str, Any]:
+    """Открыть адрес в Chrome телефона и вернуть текст страницы и JSON-ответы сайта."""
+    await _check_device_and_rate_limit(device_id, request=request)
+    try:
+        return await browser.fetch_page(
+            device_id, req.url, req.wait_seconds, req.capture_json, req.max_chars, actor=actor
+        )
+    except _BROWSER_ERRORS as exc:
+        raise _browser_http_error(exc)
+
+
+@api_router.get("/devices/{device_id}/browser/tabs")
+async def browser_tabs_device(
+    device_id: str,
+    request: Request,
+    actor: str = Depends(require_api),
+) -> list[dict[str, Any]]:
+    """Открытые вкладки Chrome на телефоне."""
+    await _check_device_and_rate_limit(device_id, request=request)
+    try:
+        return await browser.browser_tabs(device_id, actor=actor)
+    except _BROWSER_ERRORS as exc:
+        raise _browser_http_error(exc)
+
+
+@api_router.get("/devices/{device_id}/browser/text")
+async def browser_text_device(
+    device_id: str,
+    request: Request,
+    tab_index: int = Query(default=0, ge=0),
+    max_chars: int = Query(default=200000, ge=1000, le=1000000),
+    actor: str = Depends(require_api),
+) -> dict[str, Any]:
+    """Текст всей страницы открытой вкладки Chrome."""
+    await _check_device_and_rate_limit(device_id, request=request)
+    try:
+        return await browser.page_text(device_id, tab_index, max_chars, actor=actor)
+    except _BROWSER_ERRORS as exc:
+        raise _browser_http_error(exc)
 
 
 @api_router.get("/audit")

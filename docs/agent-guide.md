@@ -40,6 +40,15 @@
 - `ui_dump(device_id)` — полное дерево UI в XML/JSON (если возможностей `look` недостаточно).
 - `wait(device_id, seconds=1.0)` — приостановка выполнения на указанное время.
 
+### Чтение сайтов текстом (Chrome, через DevTools)
+Для ботов и парсеров: тапами экран управлять не нужно.
+- `fetch_page(device_id, url, wait_seconds=15, capture_json=[], max_chars=200000)` — открывает адрес в новой вкладке Chrome, ждёт загрузки и затишья сети (не дольше `wait_seconds`, максимум 60), возвращает `{url, title, text, truncated, captcha, finished, seconds, json_responses: [{url, status, body}]}` и закрывает вкладку. `text` — весь `document.body.innerText`, а не видимая часть экрана. `capture_json` — подстроки адресов, ответы которых нужны (например `["/search/v3.2/results"]`); пусто = все JSON-ответы XHR/fetch (до 50, включая трекеры, так что лучше указывать подстроку). `captcha=true` — на странице капча или проверка на робота. `finished=false` — выдача не успела догрузиться за `wait_seconds`, данные частичные.
+- `browser_tabs(device_id)` — открытые вкладки Chrome: `index`, `title`, `url`.
+- `page_text(device_id, tab_index=0, max_chars=200000)` — полный текст уже открытой вкладки.
+- Те же операции по HTTP: `POST /api/devices/{id}/fetch_page` (JSON-тело: `url`, `wait_seconds`, `capture_json`, `max_chars`), `GET /api/devices/{id}/browser/tabs`, `GET /api/devices/{id}/browser/text?tab_index=`; заголовок `Authorization: Bearer <токен>`.
+- На один телефон одновременно выполняется один браузерный запрос, остальные ждут в очереди до 90 с (потом 429). Ошибки: телефон недоступен или Chrome не отвечает — 502 с понятным текстом; страница не открылась (нет интернета, DNS) — 502 с кодом ошибки Chrome.
+- Только чтение: выполнять произвольный JS нельзя. Вкладка в режиме инкогнито по DevTools не видна. Телефон будится автоматически.
+
 ## 5. СТРОГИЕ ЗАПРЕТЫ
 Телефоны являются **реальными физическими устройствами и общими для пользователей**.
 Категорически запрещено:
