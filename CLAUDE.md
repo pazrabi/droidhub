@@ -103,3 +103,24 @@ FastAPI-зависимости: `require_user(request) -> str` (логин из 
 
 ### docs/agent-guide.md
 Инструкция для ИИ-агентов, использующих MCP хаба: порядок работы (`list_devices` → `look` → `tap_index`/`type_text` → снова `look`), когда скриншот, ввод русского, ожидания (`wait`), что нельзя (телефоны общие и реальные: не логиниться в важные аккаунты, не платить, не удалять данные, не менять настройки безопасности), лимиты и поведение при ошибках (оффлайн, 429), как завершать (вернуть телефон на домашний экран).
+
+## Контракты этапа 5: единый вход (SSO) на домене molokohub.site
+
+Идея: один логин/пароль владельца на `https://molokohub.site/sso/login`, подписанный cookie на `.molokohub.site` действует на поддоменах `pool.` и `droidhub.`. Вход встроен в приложение DroidHub (новых процессов нет). Caddy: `molokohub.site` проксирует `/sso/*` на 127.0.0.1:8090, остальное редиректит на `https://pool.molokohub.site/`; `pool.molokohub.site` защищается `forward_auth` на `/sso/verify`.
+
+### hub/config.py (новые поля Settings, все с дефолтами, env HUB_*)
+`sso_secret: str = ""` (HUB_SSO_SECRET; пусто = SSO выключен), `sso_cookie_domain: str = ""` (HUB_SSO_COOKIE_DOMAIN, например `.molokohub.site`), `sso_login_url: str = ""` (HUB_SSO_LOGIN_URL, например `https://molokohub.site/sso/login`), `sso_allowed_suffix: str = ""` (HUB_SSO_ALLOWED_SUFFIX, например `molokohub.site`), `sso_ttl_hours: int = 168` (HUB_SSO_TTL_HOURS), `sso_cookie_name: str = "molokohub_sso"`.
+
+### hub/sso.py (только функции, без FastAPI-зависимостей, импортируется и из auth.py)
+`make_cookie(user: str, secret: str, ttl_seconds: int, now: float | None = None) -> str`: значение `<user>|<expires_epoch>|<hmac_sha256_hex>`, HMAC по `<user>|<expires_epoch>` ключом secret; user только `[A-Za-z0-9_.@-]`.
+`verify_cookie(value: str, secret: str, now: float | None = None) -> str | None`: возвращает user, если подпись верна (hmac.compare_digest), срок не истёк и secret не пуст; иначе None; никаких исключений наружу.
+`safe_next(url: str, allowed_suffix: str) -> str | None`: принимает только `https://` URL, чей host равен `allowed_suffix` или оканчивается на `.`+allowed_suffix, без userinfo (`@`), без `\`, длиной до 500; иначе None (защита от open redirect).
+
+### hub/sso_routes.py: `sso_router = APIRouter(prefix="/sso")`
+`GET /sso/login?next=` — страница входа (форма логин/пароль, в стиле панели DroidHub, без CDN; если уже есть валидный SSO-cookie, сразу 303 на `next`/панель); `POST /sso/login` (form username, password, next) — проверка через `verify_password` по `admin_user`/`admin_password_hash` и `LoginLimiter` по IP (учитывать `X-Forwarded-For` от Caddy только последний элемент); успех: установить cookie `sso_cookie_name` (domain=`sso_cookie_domain` если задан, Secure, HttpOnly, SameSite=Lax, max-age=ttl) и 303 на `safe_next(next)` или `https://pool.molokohub.site/` если next нет/небезопасен; ошибка: снова форма с русским сообщением, статус 401.
+`POST /sso/logout` и `GET /sso/logout` — стереть cookie, 303 на `/sso/login`.
+`GET /sso/verify` — для Caddy forward_auth: при валидном cookie 200 и заголовок ответа `X-Sso-User: <user>`; иначе 302 `Location: <sso_login_url>?next=<urlencoded https://{X-Forwarded-Host}{X-Forwarded-Uri}>`. Если `sso_secret` пуст — 503.
+В `hub/main.py` подключить `sso_router` только если `sso_secret` непуст. Токены и секрет никогда не логировать.
+
+### hub/auth.py и веб-слой DroidHub
+`get_sso_user(request, settings=None) -> str | None` (cookie -> verify_cookie). `require_user` и `require_api`: если сессии/Bearer нет, но валидный SSO-cookie, то доступ разрешён, actor = user, `request.state.client = Client(name=user)`. Если SSO включён и сессии нет, страницы панели (не /api) вместо локальной формы входа редиректят на `sso_login_url?next=<текущий URL>`; локальный `/login` при включённом SSO тоже редиректит туда. `POST /logout` панели дополнительно стирает SSO-cookie.
