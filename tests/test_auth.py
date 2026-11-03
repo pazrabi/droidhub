@@ -1052,10 +1052,9 @@ def test_require_api_client_and_state(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _setup_sso_mock(monkeypatch: pytest.MonkeyPatch, secret: str = "test_sso_secret") -> None:
-    monkeypatch.setattr(Settings, "sso_secret", secret, raising=False)
-    monkeypatch.setattr(Settings, "sso_cookie_name", "molokohub_sso", raising=False)
-    monkeypatch.setattr(Settings, "sso_login_url", "https://molokohub.site/sso/login", raising=False)
-    monkeypatch.setattr(Settings, "sso_cookie_domain", ".molokohub.site", raising=False)
+    monkeypatch.setenv("HUB_SSO_SECRET", secret)
+    monkeypatch.setenv("HUB_SSO_LOGIN_URL", "https://molokohub.site/sso/login")
+    monkeypatch.setenv("HUB_SSO_COOKIE_DOMAIN", ".molokohub.site")
 
     def mock_verify_cookie(value: str, sec: str, now: float | None = None) -> str | None:
         if sec != secret:

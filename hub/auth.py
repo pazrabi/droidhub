@@ -18,21 +18,7 @@ from fastapi.responses import RedirectResponse
 
 from hub.config import Settings, get_settings
 
-# Контракт этапа 5: импорт модуля единого входа (SSO)
-try:
-    from hub import sso
-except (ImportError, ModuleNotFoundError):
-    import types
-    sso = types.ModuleType("hub.sso")
-    def _verify_cookie_stub(value: str, secret: str, now: float | None = None) -> str | None:
-        return None
-    sso.verify_cookie = _verify_cookie_stub  # type: ignore[attr-defined]
-    sys.modules["hub.sso"] = sso
-    try:
-        import hub
-        setattr(hub, "sso", sso)
-    except Exception:
-        pass
+from hub import sso
 
 logger = logging.getLogger(__name__)
 

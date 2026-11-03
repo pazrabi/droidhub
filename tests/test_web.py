@@ -876,10 +876,9 @@ def _setup_web_sso_mock(
     cookie_domain: str = ".molokohub.site",
     cookie_name: str = "molokohub_sso",
 ) -> None:
-    monkeypatch.setattr(Settings, "sso_secret", secret, raising=False)
-    monkeypatch.setattr(Settings, "sso_login_url", login_url, raising=False)
-    monkeypatch.setattr(Settings, "sso_cookie_domain", cookie_domain, raising=False)
-    monkeypatch.setattr(Settings, "sso_cookie_name", cookie_name, raising=False)
+    monkeypatch.setenv("HUB_SSO_SECRET", secret)
+    monkeypatch.setenv("HUB_SSO_LOGIN_URL", login_url)
+    monkeypatch.setenv("HUB_SSO_COOKIE_DOMAIN", cookie_domain)
 
     def mock_verify_cookie(value: str, sec: str, now: float | None = None) -> str | None:
         if sec != secret:
