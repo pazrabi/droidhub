@@ -51,7 +51,7 @@
 
 ## Контракты этапа 2
 
-### hub/auth.py
+### hub/auth/ (пакет: passwords, limiter, clients, guards, routes, cli)
 `hash_password(pw: str) -> str` (stdlib scrypt/pbkdf2, формат `algo$params$salt$hash`), `verify_password(pw, hashed) -> bool` (constant-time). `class LoginLimiter`: `__init__(max_attempts=5, window_s=300)`, `check(key: str) -> bool` (можно ли пробовать), `fail(key)`, `reset(key)`.
 FastAPI-зависимости: `require_user(request) -> str` (логин из сессии, иначе 401 для /api и редирект на /login для страниц обрабатывает веб-слой), `require_api(request) -> str` (сессия ИЛИ `Authorization: Bearer <api_token>`, возвращает actor: логин или `"api"`; токены сравнивать через `hmac.compare_digest`).
 `auth_router` (APIRouter без префикса): `POST /login` (form: username, password; ограничение попыток по IP; успех -> сессия `request.session["user"]`, редирект 303 на `/`; ошибка -> редирект на `/login?error=1`), `POST /logout`.
@@ -90,7 +90,7 @@ FastAPI-зависимости: `require_user(request) -> str` (логин из 
 ### hub/config.py
 Новое поле `Settings.client_tokens: str = ""` (env `HUB_CLIENT_TOKENS`). Формат: записи через запятую `имя:токен[:лимит_в_минуту[:флаги]]`, флаги через `+`; пример `pool:Abc-123_x:30:nopower`. Имя `[a-z0-9_-]+`, токен urlsafe-base64 (без `:` и `,`). Флаг `nopower` запрещает reboot/shutdown. Некорректные записи пропускать с предупреждением в лог (без токена в тексте).
 
-### hub/auth.py
+### hub/auth/ (пакет: passwords, limiter, clients, guards, routes, cli)
 `@dataclass(frozen=True) class Client: name: str; rate_limit_per_min: int | None = None; allow_power: bool = True`.
 `parse_client_tokens(raw: str) -> dict[str, Client]` (ключ токен) и `resolve_token(token: str, settings=None) -> Client | None`: сначала токены из client_tokens, затем legacy `api_token` -> `Client("api")` и `mcp_token` -> `Client("mcp")`; сравнение constant-time (`hmac.compare_digest`) по всем кандидатам, пустые токены никогда не совпадают.
 `require_api` теперь использует `resolve_token` для Bearer, кладёт `request.state.client` (для сессии панели `Client(name=<логин>)`) и возвращает `client.name` как actor.
@@ -122,5 +122,5 @@ FastAPI-зависимости: `require_user(request) -> str` (логин из 
 `GET /sso/verify` — для Caddy forward_auth: при валидном cookie 200 и заголовок ответа `X-Sso-User: <user>`; иначе 302 `Location: <sso_login_url>?next=<urlencoded https://{X-Forwarded-Host}{X-Forwarded-Uri}>`. Если `sso_secret` пуст — 503.
 В `hub/main.py` подключить `sso_router` только если `sso_secret` непуст. Токены и секрет никогда не логировать.
 
-### hub/auth.py и веб-слой DroidHub
+### hub/auth/ и веб-слой DroidHub
 `get_sso_user(request, settings=None) -> str | None` (cookie -> verify_cookie). `require_user` и `require_api`: если сессии/Bearer нет, но валидный SSO-cookie, то доступ разрешён, actor = user, `request.state.client = Client(name=user)`. Если SSO включён и сессии нет, страницы панели (не /api) вместо локальной формы входа редиректят на `sso_login_url?next=<текущий URL>`; локальный `/login` при включённом SSO тоже редиректит туда. `POST /logout` панели дополнительно стирает SSO-cookie.

@@ -249,7 +249,7 @@ droidhub/
 ├── hub/
 │   ├── main.py               # Точка входа FastAPI приложения
 │   ├── config.py             # Настройки из .env и devices.yaml
-│   ├── auth.py               # Авторизация (сессии, Bearer-токены, хэширование)
+│   ├── auth/                 # Авторизация: passwords, limiter, clients, guards, routes, cli
 │   ├── audit.py              # Журнал аудита действий
 │   ├── alerts.py             # Оповещения Telegram, автовыключение при перегреве
 │   ├── sso.py, sso_routes.py # Единый вход molokohub (cookie, /sso/*)

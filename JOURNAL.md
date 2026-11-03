@@ -84,3 +84,4 @@
 
 ## 2026-11-03 — рефакторинг хаба
 - `web/views.py`: убраны запасные реализации и дубли имён (355 → ~150 строк). `mcp_server.py` (850 строк) разбит на пакет `hub/mcp_server/` (context, ratelimit, look, auth, tools, app); mcp>=2.0. `main.py` без try/except импортов. `actions.py`: удалены неиспользуемые `shell`, `long_press`, `wake_and_unlock` и запасные заглушки импортов. JS разбит на `js/common.js`, `js/devices-list.js`, `js/device-page.js` + `app.js`; CSS: токены темы собраны в начале файла. Тесты 348 зелёные (минус 5 тестов удалённых функций).
+- Продолжение рефакторинга: `auth.py` (591 строка) стал пакетом `hub/auth/` (passwords, limiter, clients, guards, routes, cli; `python -m hub.auth hash` работает); из `actions.py` вынесены чистые разборщики в `devices/parsing.py` (725 строк осталось). 348 тестов зелёные.
