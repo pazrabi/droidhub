@@ -297,13 +297,11 @@ async def test_screenshot_success(monkeypatch: pytest.MonkeyPatch, setup_actions
     monkeypatch.setattr(actions, "run_adb", mock_run_adb)
 
     data = await actions.screenshot("realme", max_width=720)
-    assert len(calls) == 3
+    assert len(calls) == 2
     assert calls[0][0] == ["shell", "screencap -p /data/local/tmp/hub_100_64_0_1_5555.png"]
     assert calls[0][1] == "100.64.0.1:5555"
     assert calls[1][0] == ["pull", "/data/local/tmp/hub_100_64_0_1_5555.png", calls[1][0][2]]
     assert calls[1][1] == "100.64.0.1:5555"
-    assert calls[2][0] == ["shell", "rm -f /data/local/tmp/hub_100_64_0_1_5555.png"]
-    assert calls[2][1] == "100.64.0.1:5555"
 
     # Проверка, что результат — валидный JPEG и уменьшен до max_width=720
     img = Image.open(BytesIO(data))
@@ -1306,8 +1304,8 @@ async def test_auto_reconnect_on_screenshot(monkeypatch: pytest.MonkeyPatch, set
 
     data = await actions.screenshot("realme", max_width=720)
     assert connect_calls == [("100.64.0.1", 5555)]
-    # 1 rm (из finally первой попытки) + 1 screencap + 1 pull + 1 rm (из finally второй попытки)
-    assert len(calls) == 4
+    # 1 rm (из finally неудачной первой попытки) + 1 screencap + 1 pull
+    assert len(calls) == 3
     assert calls[1][0] == ["shell", "screencap -p /data/local/tmp/hub_100_64_0_1_5555.png"]
     assert calls[2][0][0] == "pull"
     assert len(setup_actions.entries) == 1

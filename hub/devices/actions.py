@@ -204,11 +204,12 @@ async def _raw_screenshot_pull(device_id: str) -> bytes:
     fd, local_tmp = tempfile.mkstemp(prefix="hub_screen_", suffix=".png")
     os.close(fd)
 
+    ok = False
     try:
-        # 1. adb shell screencap -p /data/local/tmp/hub_<device>.png
+        # 1. screencap в один и тот же файл на телефоне (перезаписывается, без rm на каждый кадр)
         await run_adb(["shell", f"screencap -p {remote_path}"], serial=serial)
 
-        # 2. run_adb(["pull", remote, local_tmp])
+        # 2. забираем файл на сервер
         await run_adb(["pull", remote_path, local_tmp], serial=serial)
 
         if not os.path.exists(local_tmp) or os.path.getsize(local_tmp) == 0:
@@ -220,6 +221,7 @@ async def _raw_screenshot_pull(device_id: str) -> bytes:
         if not raw_bytes:
             raise RuntimeError("Пустые байты после adb pull")
 
+        ok = True
         return raw_bytes
     finally:
         if local_tmp and os.path.exists(local_tmp):
@@ -227,11 +229,12 @@ async def _raw_screenshot_pull(device_id: str) -> bytes:
                 os.unlink(local_tmp)
             except OSError:
                 pass
-        try:
-            if run_adb is not None:
+        if not ok:
+            # при сбое не оставляем возможный обрезанный файл на телефоне
+            try:
                 await asyncio.shield(run_adb(["shell", f"rm -f {remote_path}"], serial=serial))
-        except BaseException:
-            pass
+            except BaseException:
+                pass
 
 
 async def _raw_screenshot_exec_out(device_id: str) -> bytes:
