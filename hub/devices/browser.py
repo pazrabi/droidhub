@@ -202,44 +202,6 @@ async def _read_page(cdp: _Cdp, max_chars: int) -> dict[str, Any]:
     }
 
 
-async def _wait_for_page(cdp: _Cdp, wait_seconds: float, captured: dict[str, dict]) -> bool:
-    """Ждёт загрузки и затишья сети; True если дождались, False если вышло время."""
-    deadline = time.monotonic() + wait_seconds
-    inflight: set[str] = set()
-    load_fired = False
-    last_activity = time.monotonic()
-    while True:
-        now = time.monotonic()
-        if load_fired and not inflight and now - last_activity >= QUIET_SECONDS:
-            return True
-        if now >= deadline:
-            return False
-        try:
-            ev = await asyncio.wait_for(cdp.events.get(), timeout=min(0.25, max(0.01, deadline - now)))
-        except asyncio.TimeoutError:
-            continue
-        method, params = ev.get("method"), ev.get("params", {})
-        if method == "Page.loadEventFired":
-            load_fired = True
-            last_activity = time.monotonic()
-        elif method == "Network.requestWillBeSent":
-            inflight.add(params["requestId"])
-            last_activity = time.monotonic()
-        elif method in ("Network.loadingFinished", "Network.loadingFailed"):
-            inflight.discard(params["requestId"])
-            last_activity = time.monotonic()
-            if method == "Network.loadingFailed" and params["requestId"] in captured:
-                captured[params["requestId"]]["failed"] = True
-        elif method == "Network.responseReceived":
-            resp = params["response"]
-            captured[params["requestId"]] = {
-                "url": resp.get("url", ""),
-                "status": resp.get("status"),
-                "mime": resp.get("mimeType", ""),
-                "type": params.get("type", ""),
-            }
-
-
 def _wanted_response(info: dict, patterns: list[str]) -> bool:
     if info.get("failed") or info["type"] in _SKIP_TYPES:
         return False
@@ -248,23 +210,93 @@ def _wanted_response(info: dict, patterns: list[str]) -> bool:
     return "json" in info["mime"].lower()
 
 
-async def _collect_json(cdp: _Cdp, captured: dict[str, dict], patterns: list[str]) -> list[dict]:
+async def _fetch_body(cdp: _Cdp, request_id: str, info: dict) -> dict | None:
+    try:
+        res = await cdp.call("Network.getResponseBody", {"requestId": request_id}, timeout=15.0)
+    except (BrowserError, asyncio.TimeoutError):
+        return None
+    body = res.get("body", "")
+    if res.get("base64Encoded") or len(body) > MAX_JSON_BODY:
+        return None
+    return {"url": info["url"], "status": info["status"], "body": body}
+
+
+async def _wait_for_page(
+    cdp: _Cdp, wait_seconds: float, captured: dict[str, dict], patterns: list[str] | None = None,
+    bodies: dict[str, asyncio.Task] | None = None,
+) -> bool:
+    """Ждёт загрузки и затишья сети; True если дождались, False если вышло время.
+
+    Тела нужных JSON-ответов забираются сразу после их загрузки (иначе Chrome вытесняет их из кеша).
+    Если заданы patterns, то ждём затишья только по подходящим запросам: сайты вроде Авиасейлс
+    опрашивают сервер бесконечно, и общее затишье не наступает.
+    """
+    patterns = patterns or []
+    bodies = bodies if bodies is not None else {}
+    deadline = time.monotonic() + wait_seconds
+    inflight: set[str] = set()
+    matching: set[str] = set()  # запросы, чей адрес подходит под patterns (по requestWillBeSent)
+    matched_done = 0
+    load_fired = False
+    last_activity = last_matched = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if patterns:
+            if matched_done and not (matching & inflight) and now - last_matched >= QUIET_SECONDS:
+                return True
+        elif load_fired and not inflight and now - last_activity >= QUIET_SECONDS:
+            return True
+        if now >= deadline:
+            return False
+        try:
+            ev = await asyncio.wait_for(cdp.events.get(), timeout=min(0.25, max(0.01, deadline - now)))
+        except asyncio.TimeoutError:
+            continue
+        method, params = ev.get("method"), ev.get("params", {})
+        rid = params.get("requestId")
+        if method == "Page.loadEventFired":
+            load_fired = True
+            last_activity = time.monotonic()
+        elif method == "Network.requestWillBeSent":
+            inflight.add(rid)
+            last_activity = time.monotonic()
+            if any(p in params.get("request", {}).get("url", "") for p in patterns):
+                matching.add(rid)
+                last_matched = time.monotonic()
+        elif method in ("Network.loadingFinished", "Network.loadingFailed"):
+            inflight.discard(rid)
+            last_activity = time.monotonic()
+            info = captured.get(rid)
+            if rid in matching:
+                last_matched = time.monotonic()
+            if method == "Network.loadingFailed":
+                if info is not None:
+                    info["failed"] = True
+            elif info is not None and _wanted_response(info, patterns) and len(bodies) < MAX_JSON_RESPONSES:
+                bodies[rid] = asyncio.create_task(_fetch_body(cdp, rid, info))
+                if rid in matching:
+                    matched_done += 1
+        elif method == "Network.responseReceived":
+            resp = params["response"]
+            captured[rid] = {
+                "url": resp.get("url", ""),
+                "status": resp.get("status"),
+                "mime": resp.get("mimeType", ""),
+                "type": params.get("type", ""),
+            }
+
+
+async def _collect_json(bodies: dict[str, asyncio.Task]) -> list[dict]:
     out: list[dict] = []
     total = 0
-    for request_id, info in captured.items():
-        if len(out) >= MAX_JSON_RESPONSES or total >= MAX_JSON_TOTAL:
+    for task in bodies.values():
+        item = await task
+        if item is None:
+            continue
+        total += len(item["body"])
+        if total > MAX_JSON_TOTAL:
             break
-        if not _wanted_response(info, patterns):
-            continue
-        try:
-            res = await cdp.call("Network.getResponseBody", {"requestId": request_id}, timeout=10.0)
-        except (BrowserError, asyncio.TimeoutError):
-            continue
-        body = res.get("body", "")
-        if res.get("base64Encoded") or len(body) > MAX_JSON_BODY:
-            continue
-        total += len(body)
-        out.append({"url": info["url"], "status": info["status"], "body": body})
+        out.append(item)
     return out
 
 
@@ -307,13 +339,14 @@ async def fetch_page(
         async with _DevTools(serial) as dev:
             tab = await dev.new_tab("about:blank")
             cdp = None
+            bodies: dict[str, asyncio.Task] = {}
             try:
                 cdp = await dev.connect(tab)
                 await cdp.call("Page.enable")
-                await cdp.call("Network.enable")
+                await cdp.call("Network.enable", {"maxTotalBufferSize": 100_000_000, "maxResourceBufferSize": 20_000_000})
                 await cdp.call("Page.navigate", {"url": url}, timeout=30.0)
                 captured: dict[str, dict] = {}
-                finished = await _wait_for_page(cdp, wait_seconds, captured)
+                finished = await _wait_for_page(cdp, wait_seconds, captured, patterns, bodies)
                 result = await _read_page(cdp, max_chars)
                 if result["url"].startswith("chrome-error://"):
                     code = re.search(r"\b[A-Z][A-Z0-9_]{6,}\b", result["text"])
@@ -321,11 +354,13 @@ async def fetch_page(
                         f"Страница не открылась на телефоне ({code.group(0) if code else 'ошибка сети'}): "
                         "проверь интернет на телефоне и адрес"
                     )
-                result["json_responses"] = await _collect_json(cdp, captured, patterns)
+                result["json_responses"] = await _collect_json(bodies)
                 result["finished"] = finished
                 result["seconds"] = round(time.monotonic() - started, 1)
                 return result
             finally:
+                for task in bodies.values():
+                    task.cancel()
                 if cdp is not None:
                     await cdp.close()
                 await dev.close_tab(tab["id"])

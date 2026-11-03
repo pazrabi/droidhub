@@ -35,49 +35,53 @@ class FakeCdp:
         self.events: asyncio.Queue[dict] = asyncio.Queue()
         for e in events:
             self.events.put_nowait(e)
-        self.calls: list[tuple[str, dict]] = []
 
     async def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
-        self.calls.append((method, params or {}))
         if method == "Network.getResponseBody":
             return {"body": '{"price": 100}', "base64Encoded": False}
         return {}
 
 
-async def test_wait_for_page_finishes_after_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.2)
-    events = [
-        {"method": "Network.requestWillBeSent", "params": {"requestId": "1"}},
+def _request(rid: str, url: str, rtype: str = "XHR", mime: str = "application/json") -> list[dict]:
+    return [
+        {"method": "Network.requestWillBeSent", "params": {"requestId": rid, "request": {"url": url}}},
         {"method": "Network.responseReceived", "params": {
-            "requestId": "1", "type": "XHR",
-            "response": {"url": "https://x.ru/api/results", "status": 200, "mimeType": "application/json"}}},
-        {"method": "Network.loadingFinished", "params": {"requestId": "1"}},
-        {"method": "Page.loadEventFired", "params": {}},
+            "requestId": rid, "type": rtype, "response": {"url": url, "status": 200, "mimeType": mime}}},
+        {"method": "Network.loadingFinished", "params": {"requestId": rid}},
     ]
-    cdp = FakeCdp(events)
+
+
+async def test_wait_for_page_finishes_after_quiet_and_collects_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.2)
+    events = (
+        _request("1", "https://x.ru/api/results")
+        + _request("2", "https://x.ru/logo.png", "Image", "image/png")
+        + _request("3", "https://x.ru/page.html", "Document", "text/html")
+        + [{"method": "Page.loadEventFired", "params": {}}]
+    )
     captured: dict = {}
-    assert await browser._wait_for_page(cdp, 5.0, captured) is True
-    assert captured["1"]["url"] == "https://x.ru/api/results"
+    bodies: dict = {}
+    assert await browser._wait_for_page(FakeCdp(events), 5.0, captured, [], bodies) is True
+    out = await browser._collect_json(bodies)
+    assert [r["url"] for r in out] == ["https://x.ru/api/results"]
+    assert out[0]["body"] == '{"price": 100}'
+
+
+async def test_wait_for_page_with_pattern_ignores_endless_polling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Сайт опрашивает сервер вечно (висящий запрос), но нужный ответ получен: ждать до конца не надо."""
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.2)
+    events = _request("1", "https://x.ru/search/results") + [
+        {"method": "Network.requestWillBeSent", "params": {"requestId": "9", "request": {"url": "https://t.ru/poll"}}},
+    ]
+    captured: dict = {}
+    bodies: dict = {}
+    assert await browser._wait_for_page(FakeCdp(events), 5.0, captured, ["/search/results"], bodies) is True
+    out = await browser._collect_json(bodies)
+    assert [r["url"] for r in out] == ["https://x.ru/search/results"]
 
 
 async def test_wait_for_page_times_out_when_no_load() -> None:
-    cdp = FakeCdp([])
-    assert await browser._wait_for_page(cdp, 0.3, {}) is False
-
-
-async def test_collect_json_filters_by_default_and_patterns() -> None:
-    captured = {
-        "1": {"url": "https://x.ru/api/results", "status": 200, "mime": "application/json", "type": "XHR"},
-        "2": {"url": "https://x.ru/logo.png", "status": 200, "mime": "image/png", "type": "Image"},
-        "3": {"url": "https://x.ru/page.html", "status": 200, "mime": "text/html", "type": "Document"},
-        "4": {"url": "https://t.ru/track", "status": 200, "mime": "application/json", "type": "Fetch"},
-    }
-    only_json = await browser._collect_json(FakeCdp([]), captured, [])
-    assert [r["url"] for r in only_json] == ["https://x.ru/api/results", "https://t.ru/track"]
-
-    by_pattern = await browser._collect_json(FakeCdp([]), captured, ["/api/results"])
-    assert [r["url"] for r in by_pattern] == ["https://x.ru/api/results"]
-    assert by_pattern[0]["body"] == '{"price": 100}'
+    assert await browser._wait_for_page(FakeCdp([]), 0.3, {}) is False
 
 
 # --- публичные функции ---
