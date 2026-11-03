@@ -2,14 +2,62 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+import contextlib
+import contextvars
 import dataclasses
 import hmac
+import sys
 import time
 from typing import Any, Callable
 
 from fastapi import status
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
+
+try:
+    from hub.auth import Client, resolve_token
+except ImportError:
+    @dataclasses.dataclass(frozen=True)
+    class Client:  # type: ignore[no-redef]
+        name: str
+        rate_limit_per_min: int | None = None
+        allow_power: bool = True
+
+    def resolve_token(token: str, settings: Any = None) -> Client | None:  # type: ignore[no-redef]
+        if not token:
+            return None
+        if settings is None:
+            try:
+                settings = get_settings()
+            except Exception:
+                settings = None
+        raw = getattr(settings, "client_tokens", "") if settings else ""
+        if raw:
+            for item in raw.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                parts = item.split(":")
+                if len(parts) >= 2:
+                    c_name, c_tok = parts[0].strip(), parts[1].strip()
+                    if not c_name or not c_tok:
+                        continue
+                    limit = None
+                    allow_power = True
+                    if len(parts) >= 3 and parts[2].strip():
+                        try:
+                            limit = int(parts[2].strip())
+                        except ValueError:
+                            pass
+                    if len(parts) >= 4 and parts[3].strip():
+                        if "nopower" in parts[3].strip().split("+"):
+                            allow_power = False
+                    if hmac.compare_digest(token, c_tok):
+                        return Client(name=c_name, rate_limit_per_min=limit, allow_power=allow_power)
+        mcp_tok = getattr(settings, "mcp_token", "") if settings else ""
+        if mcp_tok and hmac.compare_digest(token, mcp_tok):
+            return Client(name="mcp")
+        return None
 
 try:
     from mcp.server.fastmcp import FastMCP, Image
@@ -82,48 +130,143 @@ class _LookCacheEntry:
 _look_cache: dict[str, _LookCacheEntry] = {}
 
 
-# --- Вспомогательный локальный ограничитель (fallback, если limiter недоступен) ---
+# --- Отслеживание контекста авторизованного клиента ---
 
-class _LocalDeviceLimiter:
+_current_client: contextvars.ContextVar[Client | None] = contextvars.ContextVar(
+    "_current_client", default=None
+)
+_session_clients: dict[str, Client] = {}
+
+
+def get_current_client() -> Client:
+    """Возвращает текущего авторизованного клиента или дефолтного клиента 'mcp'."""
+    c = _current_client.get()
+    if c is not None:
+        return c
+    return Client(name="mcp")
+
+
+def set_current_client(client: Client | None) -> contextvars.Token:
+    """Устанавливает текущего клиента в ContextVar."""
+    return _current_client.set(client)
+
+
+@contextlib.contextmanager
+def client_context(client: Client | None):
+    """Контекстный менеджер для установки текущего клиента."""
+    tok = _current_client.set(client)
+    try:
+        yield
+    finally:
+        _current_client.reset(tok)
+
+
+def _call_resolve_token(token: str, settings: Any = None) -> Client | None:
+    if not token or not isinstance(token, str):
+        return None
+    token = token.strip()
+    if not token:
+        return None
+    auth_mod = sys.modules.get("hub.auth")
+    auth_fn = getattr(auth_mod, "resolve_token", None) if auth_mod else None
+    current_fn = getattr(sys.modules.get(__name__), "resolve_token", resolve_token)
+    fn = auth_fn or current_fn or resolve_token
+    if fn is not None:
+        return fn(token, settings=settings)
+    return None
+
+
+# --- Ограничитель действий на пару (клиент, устройство) ---
+
+class ClientDeviceRateLimiter:
+    """Ограничитель действий на пару (клиент, устройство) со скользящим окном в памяти."""
+
     def __init__(self, window_seconds: float = 60.0) -> None:
         self.window_seconds = window_seconds
-        self._history: dict[str, list[float]] = defaultdict(list)
+        self._history: dict[tuple[str, str], list[float]] = defaultdict(list)
         self._lock = asyncio.Lock()
 
-    async def check(self, device_id: str, limit: int | None = None) -> bool:
+    async def check(
+        self,
+        device_id: str,
+        client: Client | str | None = None,
+        limit: int | None = None,
+    ) -> bool:
+        if not device_id:
+            return True
+
+        if client is None:
+            c = get_current_client()
+            client_name = c.name if hasattr(c, "name") else str(c or "mcp")
+            client_limit = getattr(c, "rate_limit_per_min", None)
+        elif isinstance(client, str):
+            client_name = client
+            client_limit = None
+        else:
+            client_name = getattr(client, "name", "mcp")
+            client_limit = getattr(client, "rate_limit_per_min", None)
+
         if limit is None:
-            try:
-                settings = get_settings()
-                limit = getattr(settings, "rate_limit_per_min", 60)
-            except Exception:
-                limit = 60
+            if client_limit is not None:
+                limit = client_limit
+            else:
+                try:
+                    settings = get_settings()
+                    limit = getattr(settings, "rate_limit_per_min", 60)
+                except Exception:
+                    limit = 60
+
         if limit <= 0:
             return True
 
         now = time.monotonic()
         cutoff = now - self.window_seconds
+        key = (client_name, device_id)
 
         async with self._lock:
-            history = [t for t in self._history[device_id] if t > cutoff]
+            history = [t for t in self._history[key] if t > cutoff]
             if len(history) >= limit:
-                self._history[device_id] = history
+                self._history[key] = history
                 return False
             history.append(now)
-            self._history[device_id] = history
+            self._history[key] = history
             return True
 
+    def reset(
+        self,
+        device_id: str | None = None,
+        client: Client | str | None = None,
+    ) -> None:
+        client_name = None
+        if client is not None:
+            client_name = client if isinstance(client, str) else getattr(client, "name", None)
 
-_fallback_limiter = _LocalDeviceLimiter()
+        if device_id is not None and client_name is not None:
+            self._history.pop((client_name, device_id), None)
+        elif device_id is not None:
+            keys_to_del = [k for k in self._history if (isinstance(k, tuple) and k[1] == device_id) or k == device_id]
+            for k in keys_to_del:
+                self._history.pop(k, None)
+        elif client_name is not None:
+            keys_to_del = [k for k in self._history if isinstance(k, tuple) and k[0] == client_name]
+            for k in keys_to_del:
+                self._history.pop(k, None)
+        else:
+            self._history.clear()
 
 
-async def _enforce_rate_limit(device_id: str) -> None:
-    """Проверяет лимит действий в минуту на устройство."""
+limiter = ClientDeviceRateLimiter()
+
+
+async def _enforce_rate_limit(device_id: str, client: Client | None = None) -> None:
+    """Проверяет лимит действий в минуту на пару (клиент, устройство)."""
     if not device_id:
         return
-    active_limiter = limiter if limiter is not None else _fallback_limiter
-    allowed = await active_limiter.check(device_id)
+    c = client or get_current_client()
+    allowed = await limiter.check(device_id, client=c)
     if not allowed:
-        raise RuntimeError(f"Превышен лимит действий на устройство '{device_id}'")
+        client_name = getattr(c, "name", "mcp")
+        raise RuntimeError(f"Превышен лимит действий на устройство '{device_id}' для клиента '{client_name}'")
 
 
 async def _log_audit_safe(
@@ -132,14 +275,17 @@ async def _log_audit_safe(
     params: dict[str, Any],
     ok: bool,
     error: str | None = None,
+    actor: str | None = None,
 ) -> None:
-    """Безопасная запись события аудита с actor='mcp'."""
+    """Безопасная запись события аудита с actor=client.name."""
     try:
         if audit_module is not None:
             aud = audit_module.get_audit()
             if aud is not None:
+                if actor is None:
+                    actor = get_current_client().name
                 await aud.log(
-                    actor="mcp",
+                    actor=actor,
                     device_id=device_id,
                     action=action,
                     params=params,
@@ -166,6 +312,40 @@ else:
     mcp_server = None  # type: ignore
 
 mcp = mcp_server
+
+if mcp_server is not None:
+    _orig_call_tool = mcp_server.call_tool
+
+    async def _wrapped_call_tool(
+        name: str,
+        arguments: dict[str, Any],
+        context: Any = None,
+    ) -> Any:
+        client: Client | None = None
+        if context is not None:
+            req_ctx = getattr(context, "request_context", None)
+            if req_ctx is not None:
+                req = getattr(req_ctx, "request", None)
+                if req is not None and hasattr(req, "scope"):
+                    client = req.scope.get("auth_client")
+                if client is None:
+                    session = getattr(req_ctx, "session", None)
+                    sess_id = (
+                        getattr(session, "session_id", None)
+                        or getattr(session, "mcp_session_id", None)
+                    )
+                    if sess_id and sess_id in _session_clients:
+                        client = _session_clients[sess_id]
+        if client is None:
+            client = _current_client.get() or Client(name="mcp")
+
+        tok = _current_client.set(client)
+        try:
+            return await _orig_call_tool(name, arguments, context)
+        finally:
+            _current_client.reset(tok)
+
+    mcp_server.call_tool = _wrapped_call_tool  # type: ignore[assignment]
 
 
 # --- Регистрация инструментов ---
@@ -195,14 +375,16 @@ Get list of configured Android devices and their statuses; use first to obtain d
                     "last_seen": getattr(s, "last_seen", None),
                     "error": getattr(s, "error", None),
                 })
-        await _log_audit_safe(device_id or None, "list_devices", {"device_id": device_id}, ok=True)
+        client = get_current_client()
+        await _log_audit_safe(device_id or None, "list_devices", {"device_id": device_id}, ok=True, actor=client.name)
         return results
 
     @mcp_server.tool()
     async def device_status(device_id: str) -> dict[str, Any]:
         """Получить детальный статус Android-устройства (батарея, температура, экран) по device_id.
 Get detailed Android device status (battery, temperature, screen) by device_id."""
-        await _enforce_rate_limit(device_id)
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
         mgr = actions.get_manager()
         try:
             status = await mgr.refresh(device_id)
@@ -221,18 +403,19 @@ Get detailed Android device status (battery, temperature, screen) by device_id."
                     "last_seen": getattr(status, "last_seen", None),
                     "error": getattr(status, "error", None),
                 }
-            await _log_audit_safe(device_id, "device_status", {"device_id": device_id}, ok=True)
+            await _log_audit_safe(device_id, "device_status", {"device_id": device_id}, ok=True, actor=client.name)
             return res
         except Exception as e:
-            await _log_audit_safe(device_id, "device_status", {"device_id": device_id}, ok=False, error=str(e))
+            await _log_audit_safe(device_id, "device_status", {"device_id": device_id}, ok=False, error=str(e), actor=client.name)
             raise
 
     @mcp_server.tool()
     async def look(device_id: str) -> str:
         """Главный инструмент «посмотреть на экран»: компактный текстовый список элементов в пикселях; предпочитай look скриншоту, скриншот только когда в look нет нужных элементов (игры, картинки, WebView).
 Main tool to view screen: compact text list of elements in pixels; prefer look over screenshot, use screenshot only when elements are missing in look (games, images, WebView)."""
-        await _enforce_rate_limit(device_id)
-        raw_dump = await actions.ui_dump(device_id, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        raw_dump = await actions.ui_dump(device_id, actor=client.name)
 
         pkg: str | None = None
         act: str | None = None
@@ -373,7 +556,7 @@ Main tool to view screen: compact text list of elements in pixels; prefer look o
             lines.append(limit_note)
 
         _look_cache[device_id] = _LookCacheEntry(timestamp=time.monotonic(), indices=cache_indices)
-        await _log_audit_safe(device_id, "look", {"device_id": device_id, "count": len(displayed)}, ok=True)
+        await _log_audit_safe(device_id, "look", {"device_id": device_id, "count": len(displayed)}, ok=True, actor=client.name)
 
         if not lines:
             return "(нет значимых элементов)"
@@ -383,7 +566,8 @@ Main tool to view screen: compact text list of elements in pixels; prefer look o
     async def tap_index(device_id: str, index: int) -> str:
         """Нажать элемент по номеру [N] из последнего look устройства (координаты в пикселях); предпочитай look и tap_index скриншоту.
 Tap element by index [N] from last look on device (coordinates in pixels); prefer look and tap_index over screenshot."""
-        await _enforce_rate_limit(device_id)
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
         try:
             idx = int(index)
         except (ValueError, TypeError):
@@ -402,16 +586,17 @@ Tap element by index [N] from last look on device (coordinates in pixels); prefe
             raise ValueError(f"Элемент [{idx}] отсутствует в последнем look устройства '{device_id}': сначала вызови look.")
 
         cx, cy = center
-        await actions.tap(device_id, cx, cy, actor="mcp")
-        await _log_audit_safe(device_id, "tap_index", {"device_id": device_id, "index": idx, "x": cx, "y": cy}, ok=True)
+        await actions.tap(device_id, cx, cy, actor=client.name)
+        await _log_audit_safe(device_id, "tap_index", {"device_id": device_id, "index": idx, "x": cx, "y": cy}, ok=True, actor=client.name)
         return f"Тап по элементу [{idx}] ({cx}, {cy}) выполнен"
 
     @mcp_server.tool()
     async def screenshot(device_id: str, max_width: int = 540) -> Image:
         """Сделать скриншот экрана в пикселях JPEG; предпочитай look скриншоту, скриншот использовать только когда в look нет нужных элементов (игры, картинки, WebView).
 Take JPEG screenshot in pixels; prefer look over screenshot, use screenshot only when needed elements are missing in look (games, images, WebView)."""
-        await _enforce_rate_limit(device_id)
-        jpeg_bytes = await actions.screenshot(device_id, max_width=max_width, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        jpeg_bytes = await actions.screenshot(device_id, max_width=max_width, actor=client.name)
         if Image is not None:
             return Image(data=jpeg_bytes, format="jpeg")
         return jpeg_bytes  # type: ignore
@@ -420,15 +605,17 @@ Take JPEG screenshot in pixels; prefer look over screenshot, use screenshot only
     async def ui_dump(device_id: str) -> list[dict[str, Any]]:
         """Получить полное дерево элементов интерфейса с координатами в пикселях; для большинства задач предпочитай look.
 Get full UI hierarchy tree with pixel coordinates; for most tasks prefer look over screenshot and ui_dump."""
-        await _enforce_rate_limit(device_id)
-        return await actions.ui_dump(device_id, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        return await actions.ui_dump(device_id, actor=client.name)
 
     @mcp_server.tool()
     async def tap(device_id: str, x: int, y: int) -> str:
         """Нажать по координатам (x, y) в пикселях; предпочитай look и tap_index скриншоту, скриншот только когда в look нет нужных элементов (игры, картинки, WebView).
 Tap screen at (x, y) in pixels; prefer look and tap_index over screenshot, use screenshot only when elements are missing in look (games, images, WebView)."""
-        await _enforce_rate_limit(device_id)
-        await actions.tap(device_id, x, y, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        await actions.tap(device_id, x, y, actor=client.name)
         return f"Тап ({x}, {y}) выполнен"
 
     @mcp_server.tool()
@@ -439,8 +626,9 @@ Tap screen at (x, y) in pixels; prefer look and tap_index over screenshot, use s
     ) -> str:
         """Найти элемент по тексту или id и нажать на его центр в пикселях; предпочитай look и tap_index скриншоту, скриншот только для игр, картинок, WebView.
 Find element by text or id and tap its pixel center; prefer look and tap_index over screenshot, screenshot only for games, images, WebView."""
-        await _enforce_rate_limit(device_id)
-        elem = await actions.tap_element(device_id, text=text, resource_id=resource_id, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        elem = await actions.tap_element(device_id, text=text, resource_id=resource_id, actor=client.name)
         target = text or resource_id or (elem.get("text") if isinstance(elem, dict) else "") or ""
         return f"Тап по элементу «{target}» выполнен" if target else "Тап по элементу выполнен"
 
@@ -455,66 +643,113 @@ Find element by text or id and tap its pixel center; prefer look and tap_index o
     ) -> str:
         """Выполнить свайп от (x1, y1) до (x2, y2) в пикселях за время ms; предпочитай look скриншоту, скриншот только для игр, картинок, WebView.
 Swipe from (x1, y1) to (x2, y2) in pixels taking ms milliseconds; prefer look over screenshot, screenshot only for games, images, WebView."""
-        await _enforce_rate_limit(device_id)
-        await actions.swipe(device_id, x1, y1, x2, y2, ms=ms, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        await actions.swipe(device_id, x1, y1, x2, y2, ms=ms, actor=client.name)
         return f"Свайп ({x1}, {y1}) -> ({x2}, {y2}) выполнен"
 
     @mcp_server.tool()
     async def type_text(device_id: str, text: str) -> str:
         """Ввести текст в активное поле ввода; перед вводом найди поле через look и нажми на него, предпочитай look скриншоту.
 Type text into active input field; before typing find field via look and tap it, prefer look over screenshot."""
-        await _enforce_rate_limit(device_id)
-        await actions.type_text(device_id, text, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        await actions.type_text(device_id, text, actor=client.name)
         return f"Введен текст: {text}"
 
     @mcp_server.tool()
     async def press_key(device_id: str, key: str) -> str:
         """Нажать системную клавишу (back, home, recents, enter, power, volume_up, volume_down); для проверки экрана предпочитай look скриншоту.
 Press system key (back, home, recents, enter, power, volume_up, volume_down); to inspect screen prefer look over screenshot."""
-        await _enforce_rate_limit(device_id)
-        await actions.key(device_id, key, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        await actions.key(device_id, key, actor=client.name)
         return f"Нажата клавиша {key}"
 
     @mcp_server.tool()
     async def open_app(device_id: str, package: str) -> str:
         """Запустить приложение по имени пакета; после запуска проверяй экран через look, предпочитай look скриншоту.
 Open app by package name; after launch inspect screen via look, prefer look over screenshot."""
-        await _enforce_rate_limit(device_id)
-        await actions.open_app(device_id, package, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        await actions.open_app(device_id, package, actor=client.name)
         return f"Запущено приложение {package}"
 
     @mcp_server.tool()
     async def list_apps(device_id: str) -> list[str]:
         """Получить список всех установленных пакетов приложений на устройстве перед вызовом open_app.
 Get list of all installed application packages on device before calling open_app."""
-        await _enforce_rate_limit(device_id)
-        return await actions.list_apps(device_id, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        return await actions.list_apps(device_id, actor=client.name)
 
     @mcp_server.tool()
     async def open_url(device_id: str, url: str) -> str:
         """Открыть URL в браузере по умолчанию; после перехода проверяй экран через look, предпочитай look скриншоту.
 Open URL in default browser; after navigation inspect screen via look, prefer look over screenshot."""
-        await _enforce_rate_limit(device_id)
-        await actions.open_url(device_id, url, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        await actions.open_url(device_id, url, actor=client.name)
         return f"Открыт URL {url}"
 
     @mcp_server.tool()
     async def wait(device_id: str, seconds: float = 1.0) -> dict[str, Any]:
         """Приостановить выполнение на указанное количество секунд; после ожидания проверяй экран через look, предпочитай look скриншоту.
 Pause execution for specified number of seconds; after waiting inspect screen via look, prefer look over screenshot."""
-        await _enforce_rate_limit(device_id)
-        await actions.wait(device_id, seconds, actor="mcp")
+        client = get_current_client()
+        await _enforce_rate_limit(device_id, client=client)
+        await actions.wait(device_id, seconds, actor=client.name)
         return {"ok": True, "waited": seconds}
 
 
 # --- Авторизационный ASGI-middleware для MCP ---
 
 class MCPAuthMiddleware:
-    """ASGI-слой авторизации MCP: заголовок Authorization: Bearer <mcp_token> или секретный путь /mcp/<token>."""
+    """ASGI-слой авторизации MCP: заголовок Authorization: Bearer <token> или секретный путь /mcp/<token>."""
 
-    def __init__(self, app: Any, get_token: Callable[[], str]) -> None:
+    def __init__(
+        self,
+        app: Any,
+        get_token: Callable[[], str] | None = None,
+        settings: Settings | None = None,
+    ) -> None:
         self.app = app
         self.get_token = get_token
+        self.settings = settings
+
+    def _get_settings(self) -> Settings | None:
+        if self.settings is not None:
+            return self.settings
+        try:
+            return get_settings()
+        except Exception:
+            return None
+
+    def _is_server_enabled(self) -> bool:
+        if self.get_token is not None:
+            legacy_token = (self.get_token() or "").strip()
+            if legacy_token:
+                return True
+        st = self._get_settings()
+        if st is not None:
+            if getattr(st, "mcp_token", "").strip():
+                return True
+            if getattr(st, "client_tokens", "").strip():
+                return True
+        return False
+
+    def _resolve_client(self, token: str) -> Client | None:
+        if not token:
+            return None
+        st = self._get_settings()
+        client = _call_resolve_token(token, settings=st)
+        if client is not None:
+            return client
+        if self.get_token is not None:
+            expected = (self.get_token() or "").strip()
+            if expected and hmac.compare_digest(token, expected):
+                return Client(name="mcp")
+        return None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         scope_type = scope.get("type")
@@ -522,8 +757,7 @@ class MCPAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        expected_token = (self.get_token() or "").strip()
-        if not expected_token:
+        if not self._is_server_enabled():
             if scope_type == "http":
                 resp = JSONResponse(
                     {"detail": "MCP сервер отключен (mcp_token не настроен)"},
@@ -538,22 +772,25 @@ class MCPAuthMiddleware:
         headers = dict(scope.get("headers", []))
         auth_header = headers.get(b"authorization", b"").decode("latin1")
 
-        authorized = False
+        client: Client | None = None
         new_path = path
 
-        # 1. Заголовок Authorization: Bearer <mcp_token>
+        # 1. Заголовок Authorization: Bearer <token>
         if auth_header.lower().startswith("bearer "):
             token_candidate = auth_header[7:].strip()
-            if hmac.compare_digest(token_candidate, expected_token):
-                authorized = True
+            if token_candidate:
+                client = self._resolve_client(token_candidate)
 
-        # 2. Секретный путь: /mcp/<mcp_token> или /<mcp_token>
-        path_matched, candidate_path = self._check_and_rewrite_path(path, expected_token)
-        if path_matched:
-            authorized = True
-            new_path = candidate_path
+        # 2. Секретный путь: /mcp/<token> или /<token>
+        if client is None:
+            candidate_token, candidate_path = self._extract_path_token(path)
+            if candidate_token:
+                candidate_client = self._resolve_client(candidate_token)
+                if candidate_client is not None:
+                    client = candidate_client
+                    new_path = candidate_path
 
-        if not authorized:
+        if client is None:
             if scope_type == "http":
                 resp = JSONResponse(
                     {"detail": "Не авторизован"},
@@ -573,31 +810,56 @@ class MCPAuthMiddleware:
             if not new_path:
                 new_path = "/"
 
+        scope = dict(scope)
+        scope["auth_client"] = client
         if new_path != path:
-            scope = dict(scope)
             scope["path"] = new_path
             scope["raw_path"] = new_path.encode("latin1")
 
-        await self.app(scope, receive, send)
+        session_id_hdr = headers.get(b"mcp-session-id", b"").decode("latin1").strip()
+        if session_id_hdr:
+            _session_clients[session_id_hdr] = client
+
+        async def wrapped_send(message: Any) -> None:
+            if message.get("type") == "http.response.start":
+                for k, v in message.get("headers", []):
+                    if k.lower() == b"mcp-session-id":
+                        sess_id = v.decode("latin1").strip()
+                        if sess_id:
+                            _session_clients[sess_id] = client
+                        break
+            await send(message)
+
+        tok = _current_client.set(client)
+        try:
+            await self.app(scope, receive, wrapped_send)
+        finally:
+            _current_client.reset(tok)
 
     @staticmethod
-    def _check_and_rewrite_path(path: str, expected_token: str) -> tuple[bool, str]:
+    def _extract_path_token(path: str) -> tuple[str, str]:
         if path == "/mcp" or path.startswith("/mcp/"):
             subpath = path[4:]
         else:
             subpath = path
 
-        parts = [p for p in subpath.split("/") if p]
+        parts = [p.strip() for p in subpath.split("/") if p.strip()]
         if parts:
             candidate = parts[0]
-            if hmac.compare_digest(candidate, expected_token):
-                remaining = subpath[len("/" + candidate):]
-                if not remaining:
-                    remaining = "/"
-                elif not remaining.startswith("/"):
-                    remaining = "/" + remaining
-                return True, remaining
+            idx = subpath.find(candidate)
+            after = subpath[idx + len(candidate):]
+            if not after or after == "/":
+                remaining = "/"
+            else:
+                remaining = after if after.startswith("/") else "/" + after
+            return candidate, remaining
+        return "", path
 
+    @classmethod
+    def _check_and_rewrite_path(cls, path: str, expected_token: str) -> tuple[bool, str]:
+        candidate, remaining = cls._extract_path_token(path)
+        if candidate and expected_token and hmac.compare_digest(candidate, expected_token):
+            return True, remaining
         return False, path
 
 
@@ -621,7 +883,7 @@ def create_mcp_app(settings: Settings | None = None) -> tuple[Any, Callable[[], 
             return getattr(settings, "mcp_token", "")
         return get_settings().mcp_token
 
-    auth_app = MCPAuthMiddleware(starlette_app, get_token=_get_token)
+    auth_app = MCPAuthMiddleware(starlette_app, get_token=_get_token, settings=settings)
     lifespan_ctx = lambda: starlette_app.router.lifespan_context(starlette_app)
     return auth_app, lifespan_ctx
 
@@ -631,6 +893,13 @@ get_mcp_app = create_mcp_app
 __all__ = [
     "FastMCP",
     "Image",
+    "Client",
+    "ClientDeviceRateLimiter",
+    "limiter",
+    "get_current_client",
+    "set_current_client",
+    "client_context",
+    "resolve_token",
     "mcp_server",
     "mcp",
     "MCPAuthMiddleware",
