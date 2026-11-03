@@ -47,6 +47,12 @@ class Settings:
     client_tokens: str = ""
     nav_links: str = ""
     nav_active: str = ""
+    sso_secret: str = ""
+    sso_cookie_domain: str = ""
+    sso_login_url: str = ""
+    sso_allowed_suffix: str = ""
+    sso_ttl_hours: int = 168
+    sso_cookie_name: str = "molokohub_sso"
 
     def __post_init__(self) -> None:
         if self.public_url:
@@ -218,6 +224,16 @@ def get_settings(env_file: str | Path | None = None) -> Settings:
     client_tokens = get_val("HUB_CLIENT_TOKENS", "").strip()
     nav_links = get_val("HUB_NAV_LINKS", "").strip()
     nav_active = get_val("HUB_NAV_ACTIVE", "").strip()
+    sso_secret = get_val("HUB_SSO_SECRET", "").strip()
+    sso_cookie_domain = get_val("HUB_SSO_COOKIE_DOMAIN", "").strip()
+    sso_login_url = get_val("HUB_SSO_LOGIN_URL", "").strip()
+    sso_allowed_suffix = get_val("HUB_SSO_ALLOWED_SUFFIX", "").strip()
+    sso_ttl_hours_raw = get_val("HUB_SSO_TTL_HOURS", "168").strip()
+    try:
+        sso_ttl_hours = int(sso_ttl_hours_raw)
+    except (ValueError, TypeError):
+        sso_ttl_hours = 168
+    sso_cookie_name = get_val("HUB_SSO_COOKIE_NAME", "molokohub_sso").strip() or "molokohub_sso"
 
     return Settings(
         devices_file=get_val("HUB_DEVICES_FILE", "config/devices.yaml"),
@@ -243,6 +259,12 @@ def get_settings(env_file: str | Path | None = None) -> Settings:
         client_tokens=client_tokens,
         nav_links=nav_links,
         nav_active=nav_active,
+        sso_secret=sso_secret,
+        sso_cookie_domain=sso_cookie_domain,
+        sso_login_url=sso_login_url,
+        sso_allowed_suffix=sso_allowed_suffix,
+        sso_ttl_hours=sso_ttl_hours,
+        sso_cookie_name=sso_cookie_name,
     )
 
 
