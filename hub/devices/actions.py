@@ -3,22 +3,26 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
-from io import BytesIO
 import os
 import re
 import shlex
 import tempfile
 import time
 from typing import Any, Awaitable, Callable, TypeVar
-import xml.etree.ElementTree as ET
-
-from PIL import Image
 
 T = TypeVar("T")
 
 from hub.audit import get_audit
-from hub.devices import adb
-from hub.devices.adb import AdbError, AdbTimeout, DeviceOffline, adb_shell, connect, run_adb
+from hub.devices import adb  # noqa: F401  (tests patch actions.adb)
+from hub.devices.parsing import (
+    extract_hierarchy_xml as _extract_hierarchy_xml,
+    find_element as _find_element,
+    parse_screen_off as _parse_screen_off,
+    parse_ui_elements as _parse_ui_elements,
+    process_image_to_jpeg as _process_image_to_jpeg,
+    split_text_for_adb_b64 as _split_text_for_adb_b64,
+)
+from hub.devices.adb import AdbError, AdbTimeout, DeviceOffline, adb_shell, connect, run_adb  # noqa: F401
 
 _manager: Any = None
 audit: Any = None  # Хук для тестов или прямого переопределения аудита
@@ -54,33 +58,6 @@ def _get_type_text_lock(device_id: str) -> asyncio.Lock:
     return _type_text_locks[device_id]
 
 
-def _split_text_for_adb_b64(text: str, max_b64_len: int = 800) -> list[str]:
-    """
-    Разбивает текст на части так, чтобы base64-представление каждой части
-    было не больше max_b64_len символов и не разрывало многобайтовые UTF-8 символы.
-    """
-    if not text:
-        return []
-    max_bytes = (max_b64_len // 4) * 3
-    chunks: list[str] = []
-    current_chars: list[str] = []
-    current_bytes = 0
-
-    for ch in text:
-        ch_bytes = len(ch.encode("utf-8"))
-        if current_bytes + ch_bytes > max_bytes and current_chars:
-            chunks.append("".join(current_chars))
-            current_chars = []
-            current_bytes = 0
-        current_chars.append(ch)
-        current_bytes += ch_bytes
-
-    if current_chars:
-        chunks.append("".join(current_chars))
-
-    return chunks
-
-
 def _get_screenshot_lock(device_id: str) -> asyncio.Lock:
     """Возвращает персональный asyncio.Lock для устройства."""
     if device_id not in _screenshot_locks:
@@ -96,7 +73,6 @@ def set_manager(manager: Any) -> None:
 
 def get_manager() -> Any:
     """Возвращает текущий менеджер устройств."""
-    global _manager
     if _manager is None:
         raise RuntimeError("Менеджер устройств не установлен. Вызовите set_manager().")
     return _manager
@@ -203,7 +179,6 @@ async def _record_audit(
     actor: str = "system",
 ) -> None:
     """Безопасная запись действия в журнал аудита."""
-    global audit
     try:
         aud = audit if audit is not None else get_audit()
         if aud is not None:
@@ -217,22 +192,6 @@ async def _record_audit(
             )
     except Exception:
         pass
-
-
-def _process_image_to_jpeg(raw_bytes: bytes, max_width: int) -> bytes:
-    """Уменьшает изображение Pillow до max_width и сохраняет как JPEG."""
-    img = Image.open(BytesIO(raw_bytes))
-    if max_width > 0 and img.width > max_width:
-        ratio = max_width / float(img.width)
-        new_height = int(round(img.height * ratio))
-        img = img.resize((max_width, new_height), Image.Resampling.LANCZOS)
-
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-
-    out_buf = BytesIO()
-    img.save(out_buf, format="JPEG", quality=80)
-    return out_buf.getvalue()
 
 
 async def _raw_screenshot_pull(device_id: str) -> bytes:
@@ -346,40 +305,6 @@ def _is_screen_cached_awake(device_id: str) -> bool:
         is_awake, ts = _screen_cache[device_id]
         if 0 <= (time.monotonic() - ts) <= _SCREEN_CACHE_TTL:
             return is_awake
-    return False
-
-
-def _parse_screen_off(dumpsys_output: str) -> bool:
-    """
-    Определяет, выключен ли экран, по выводу
-    dumpsys power | grep -E "mWakefulness|Display Power"
-    с учетом формата Android 11 и 13.
-    """
-    if not dumpsys_output:
-        return False
-
-    # 1. Проверяем Display Power: state=OFF / ON / DOZE / etc.
-    disp_match = re.search(
-        r"Display Power:\s*state[=\s]+([A-Za-z0-9_]+)", dumpsys_output, re.IGNORECASE
-    )
-    if disp_match:
-        disp_state = disp_match.group(1).upper()
-        if disp_state in ("OFF", "DOZE", "DOZE_SUSPEND"):
-            return True
-
-    # 2. Проверяем mWakefulness: Awake / Asleep / Dozing / Dreaming / Sleeping
-    wake_match = re.search(r"\bmWakefulness[=\s]+([A-Za-z0-9_]+)", dumpsys_output, re.IGNORECASE)
-    if wake_match:
-        wake_state = wake_match.group(1).upper()
-        if wake_state != "AWAKE":
-            return True
-
-    # Явные подтверждения включенного экрана
-    if disp_match and disp_match.group(1).upper() == "ON":
-        return False
-    if wake_match and wake_match.group(1).upper() == "AWAKE":
-        return False
-
     return False
 
 
@@ -742,55 +667,7 @@ async def ui_dump(device_id: str, *, actor: str = "system") -> list[dict]:
             err_msg = xml_text.strip() or dump_clean or "не удалось прочитать файл дампа"
             raise RuntimeError(f"Не удалось получить дамп UI: {err_msg}")
 
-        start_idx = xml_text.find("<hierarchy")
-        if start_idx != -1:
-            end_idx = xml_text.rfind("</hierarchy>")
-            if end_idx != -1:
-                xml_text = xml_text[start_idx : end_idx + len("</hierarchy>")]
-            else:
-                xml_text = xml_text[start_idx:]
-
-        # Очищаем невалидные управляющие XML-символы (\x00-\x08, \x0b, \x0c, \x0e-\x1f)
-        xml_text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", xml_text)
-
-        try:
-            root = ET.fromstring(xml_text)
-        except ET.ParseError as pe:
-            raise RuntimeError(f"Не удалось получить дамп UI: ошибка разбора XML ({pe})") from pe
-
-        elements: list[dict] = []
-        for node in root.iter("node"):
-            text = node.attrib.get("text", "")
-            resource_id = node.attrib.get("resource-id", "") or node.attrib.get("resource_id", "")
-            cls_name = node.attrib.get("class", "")
-            content_desc = node.attrib.get("content-desc", "") or node.attrib.get("content_desc", "")
-            clickable = node.attrib.get("clickable", "false").lower() == "true"
-            bounds_raw = node.attrib.get("bounds", "")
-
-            # Сжатие: пропускаем пустые неинтерактивные контейнеры без текста, id, описания
-            if not (text or resource_id or content_desc or clickable):
-                continue
-
-            coords = [int(v) for v in re.findall(r"-?\d+", bounds_raw)]
-            if len(coords) >= 4:
-                x1, y1, x2, y2 = coords[0], coords[1], coords[2], coords[3]
-                bounds = [x1, y1, x2, y2]
-                center = [(x1 + x2) // 2, (y1 + y2) // 2]
-            else:
-                bounds = [0, 0, 0, 0]
-                center = [0, 0]
-
-            elements.append({
-                "text": text,
-                "resource_id": resource_id,
-                "class": cls_name,
-                "content_desc": content_desc,
-                "clickable": clickable,
-                "bounds": bounds,
-                "center": center,
-            })
-
-        return elements
+        return _parse_ui_elements(_extract_hierarchy_xml(xml_text))
 
     return await _execute_action(device_id, "ui_dump", params, _action, actor=actor)
 
@@ -814,44 +691,7 @@ async def tap_element(
     async def _action() -> dict:
         elements = await ui_dump(device_id, actor=actor)
 
-        # 1. Точный поиск
-        exact_matches: list[dict] = []
-        for elem in elements:
-            text_match = (text is None) or (elem["text"] == text or elem["content_desc"] == text)
-            id_match = (resource_id is None) or (
-                elem["resource_id"] == resource_id
-                or elem["resource_id"].endswith(f":id/{resource_id}")
-            )
-            if text_match and id_match:
-                exact_matches.append(elem)
-
-        matched: dict | None = None
-        # Отдаем приоритет видимым элементам (center != [0, 0])
-        visible_exact = [e for e in exact_matches if e.get("center") != [0, 0]]
-        if visible_exact:
-            matched = visible_exact[0]
-        elif exact_matches:
-            matched = exact_matches[0]
-
-        # 2. Нестрогий поиск (подстрока, без учета регистра)
-        if matched is None:
-            t_low = text.lower() if text else None
-            r_low = resource_id.lower() if resource_id else None
-            fuzzy_matches: list[dict] = []
-            for elem in elements:
-                text_match = (t_low is None) or (
-                    t_low in elem["text"].lower() or t_low in elem["content_desc"].lower()
-                )
-                id_match = (r_low is None) or (r_low in elem["resource_id"].lower())
-                if text_match and id_match:
-                    fuzzy_matches.append(elem)
-
-            visible_fuzzy = [e for e in fuzzy_matches if e.get("center") != [0, 0]]
-            if visible_fuzzy:
-                matched = visible_fuzzy[0]
-            elif fuzzy_matches:
-                matched = fuzzy_matches[0]
-
+        matched = _find_element(elements, text, resource_id)
         if matched is None:
             raise ValueError(f"Элемент не найден: text={text!r}, resource_id={resource_id!r}")
 
