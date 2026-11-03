@@ -20,6 +20,8 @@ class AnnexBSplitter:
         self._buf = bytearray()
         self.sps: bytes | None = None
         self.pps: bytes | None = None
+        self._flushed = False  # последний NAL выдан по простою, ждём, что следующие данные начнутся со стартового кода
+        self.corrupt = False   # выданный по простою кадр оказался оборванным: нужен перезапуск записи
 
     def _nal_ranges(self) -> list[tuple[int, int]]:
         """Границы NAL (без стартового кода) во внутреннем буфере: [(начало, конец), ...]."""
@@ -53,6 +55,10 @@ class AnnexBSplitter:
 
     def feed(self, data: bytes) -> list[tuple[bool, bytes]]:
         """Добавляет данные; возвращает завершённые кадры (последний NAL ждёт следующего стартового кода)."""
+        if self._flushed:
+            self._flushed = False
+            if not (data.startswith(b"\x00\x00\x01") or data.startswith(b"\x00\x00\x00\x01")):
+                self.corrupt = True  # продолжение NAL, который мы уже выдали как целый
         self._buf += data
         ranges = self._nal_ranges()
         units: list[tuple[bool, bytes]] = []
@@ -68,15 +74,17 @@ class AnnexBSplitter:
     def flush_tail(self, allow_key: bool = False) -> list[tuple[bool, bytes]]:
         """
         Выдаёт последний NAL, если поток затих (кадры идут только при изменении экрана,
-        следующего стартового кода можно ждать долго). Ключевой кадр без allow_key не трогаем:
-        он большой и мог прерваться посередине.
+        следующего стартового кода можно ждать долго). Только обычные slice-кадры: SPS, PPS и
+        ключевой кадр без allow_key не трогаем, они могут быть оборваны посередине.
         """
         ranges = self._nal_ranges()
         if not ranges:
             return []
         begin, end = ranges[-1]
-        if (self._buf[begin] & 0x1F) == NAL_IDR and not allow_key:
+        kind = self._buf[begin] & 0x1F
+        if kind != NAL_SLICE and not (allow_key and kind == NAL_IDR):
             return []
         units = self._consume(bytes(self._buf[begin:end]))
         self._buf.clear()
+        self._flushed = True
         return units

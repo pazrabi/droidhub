@@ -58,6 +58,33 @@ def test_splitter_does_not_flush_unfinished_key_frame() -> None:
     assert sp.flush_tail(allow_key=True) == [(True, annexb(SPS, PPS, IDR))]
 
 
+def test_splitter_never_flushes_unfinished_parameter_sets() -> None:
+    """Регресс: SPS, пришедший кусками, нельзя выдавать по простою обрезанным."""
+    sp = AnnexBSplitter()
+    assert sp.feed(START_CODE + SPS[:2]) == []
+    assert sp.flush_tail() == []
+    assert sp.flush_tail(allow_key=True) == []
+    assert sp.sps is None
+    assert sp.feed(SPS[2:] + annexb(PPS, IDR)) == []
+    assert sp.sps == SPS and sp.pps == PPS
+
+
+def test_splitter_detects_truncated_flush() -> None:
+    sp = AnnexBSplitter()
+    sp.feed(annexb(SPS, PPS, IDR, SLICE))
+    sp.flush_tail()  # выдали slice по простою
+    sp.feed(b"\x11\x22\x33")  # а это его продолжение, не стартовый код
+    assert sp.corrupt
+
+
+def test_splitter_flush_then_new_start_code_is_fine() -> None:
+    sp = AnnexBSplitter()
+    sp.feed(annexb(SPS, PPS, IDR, SLICE))
+    sp.flush_tail()
+    sp.feed(START_CODE + SLICE)
+    assert not sp.corrupt
+
+
 def test_splitter_skips_delta_before_parameter_sets() -> None:
     assert AnnexBSplitter().feed(annexb(IDR, SLICE, SLICE)) == [(False, annexb(SLICE))]
 

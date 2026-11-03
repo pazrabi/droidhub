@@ -13,7 +13,7 @@ from hub.devices.h264 import AnnexBSplitter, codec_string
 logger = logging.getLogger(__name__)
 
 TIME_LIMIT_S = 180  # потолок screenrecord; по истечении процесс перезапускается
-IDLE_FLUSH_S = 0.03
+IDLE_FLUSH_S = 0.05
 QUEUE_SIZE = 400
 GOP_LIMIT = 300  # кадров от последнего ключевого; больше не держим
 RESTART_DELAY_S = 0.3
@@ -131,6 +131,9 @@ class StreamSession:
                     if not chunk:
                         break
                     self._on_frames(splitter.feed(chunk), splitter)
+                    if splitter.corrupt:
+                        logger.warning("stream %s: truncated frame, restarting recorder", self.device_id)
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception:
