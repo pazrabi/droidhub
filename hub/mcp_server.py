@@ -14,50 +14,7 @@ from fastapi import status
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
-try:
-    from hub.auth import Client, resolve_token
-except ImportError:
-    @dataclasses.dataclass(frozen=True)
-    class Client:  # type: ignore[no-redef]
-        name: str
-        rate_limit_per_min: int | None = None
-        allow_power: bool = True
-
-    def resolve_token(token: str, settings: Any = None) -> Client | None:  # type: ignore[no-redef]
-        if not token:
-            return None
-        if settings is None:
-            try:
-                settings = get_settings()
-            except Exception:
-                settings = None
-        raw = getattr(settings, "client_tokens", "") if settings else ""
-        if raw:
-            for item in raw.split(","):
-                item = item.strip()
-                if not item:
-                    continue
-                parts = item.split(":")
-                if len(parts) >= 2:
-                    c_name, c_tok = parts[0].strip(), parts[1].strip()
-                    if not c_name or not c_tok:
-                        continue
-                    limit = None
-                    allow_power = True
-                    if len(parts) >= 3 and parts[2].strip():
-                        try:
-                            limit = int(parts[2].strip())
-                        except ValueError:
-                            pass
-                    if len(parts) >= 4 and parts[3].strip():
-                        if "nopower" in parts[3].strip().split("+"):
-                            allow_power = False
-                    if hmac.compare_digest(token, c_tok):
-                        return Client(name=c_name, rate_limit_per_min=limit, allow_power=allow_power)
-        mcp_tok = getattr(settings, "mcp_token", "") if settings else ""
-        if mcp_tok and hmac.compare_digest(token, mcp_tok):
-            return Client(name="mcp")
-        return None
+from hub.auth import Client, resolve_token
 
 try:
     from mcp.server.fastmcp import FastMCP, Image
