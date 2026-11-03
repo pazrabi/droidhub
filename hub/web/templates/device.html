@@ -48,6 +48,7 @@
               <option value="540">540</option>
               <option value="720" selected>720</option>
             </select>
+            <button id="btn-toggle-video" class="btn btn-xs btn-outline" title="Живое видео или скриншоты">Видео</button>
             <button id="btn-toggle-stream" class="btn btn-xs btn-outline">Пауза</button>
             <button id="btn-refresh-screen" class="btn btn-xs btn-outline">↻ Кадр</button>
           </div>
@@ -65,6 +66,7 @@
             draggable="false"
             style="display: none;"
           >
+          <canvas id="screen-canvas" class="screen-img" style="display: none;"></canvas>
           <div class="tap-indicator" id="tap-indicator"></div>
         </div>
 

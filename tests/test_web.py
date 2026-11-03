@@ -23,7 +23,7 @@ from hub.web.views import (
 )
 
 
-JS_FILES = ("common.js", "devices-list.js", "device-page.js")
+JS_FILES = ("common.js", "video.js", "devices-list.js", "device-page.js")
 
 
 def get_all_js(client: TestClient) -> str:
@@ -1087,3 +1087,14 @@ def test_web_logout_deletes_sso_cookie_with_domain(
     assert "Domain=.molokohub.site" in all_set_cookie
     assert "Max-Age=0" in all_set_cookie or "expires=" in all_set_cookie
 
+
+
+def test_device_page_has_video_canvas_and_scripts(mock_manager: DeviceManager) -> None:
+    client = TestClient(create_web_app(mock_manager))
+    client.post("/test-login")
+    html = client.get("/device/realme").text
+    assert 'id="screen-canvas"' in html
+    assert 'id="btn-toggle-video"' in html
+    assert "/static/js/video.js" in html
+    js = get_all_js(client)
+    assert "VideoDecoder" in js and "/stream?width=" in js
