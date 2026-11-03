@@ -13,7 +13,7 @@ from hub.devices.h264 import AnnexBSplitter, codec_string
 logger = logging.getLogger(__name__)
 
 TIME_LIMIT_S = 180  # потолок screenrecord; по истечении процесс перезапускается
-IDLE_FLUSH_S = 0.05
+IDLE_FLUSH_S = 0.2  # короткие паузы бывают и внутри кадра (замер: до 70 мс), поэтому ждём с запасом
 QUEUE_SIZE = 400
 GOP_LIMIT = 300  # кадров от последнего ключевого; больше не держим
 RESTART_DELAY_S = 0.3
