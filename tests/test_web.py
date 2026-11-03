@@ -23,6 +23,18 @@ from hub.web.views import (
 )
 
 
+JS_FILES = ("common.js", "devices-list.js", "device-page.js")
+
+
+def get_all_js(client: TestClient) -> str:
+    """Весь клиентский JS (app.js и модули js/*.js) одним текстом."""
+    parts = [client.get("/static/app.js")] + [client.get(f"/static/js/{name}") for name in JS_FILES]
+    for res in parts:
+        assert res.status_code == 200
+        assert "javascript" in res.headers["content-type"]
+    return "\n".join(res.text for res in parts)
+
+
 @pytest.fixture
 def sample_devices() -> list[DeviceConfig]:
     return [
@@ -344,33 +356,31 @@ def test_static_files_served() -> None:
     assert "--bg-body" in res_css.text
     assert "screen-img" in res_css.text
 
-    res_js = client.get("/static/app.js")
-    assert res_js.status_code == 200
-    assert "javascript" in res_js.headers["content-type"]
+    js = get_all_js(client)
     # Проверка ключевой логики в JS
-    assert "fetchScreenshot" in res_js.text
-    assert "X-Screen-Width" in res_js.text
-    assert "X-Screen-Height" in res_js.text
-    assert "/api/devices/" in res_js.text
-    assert "/screenshot" in res_js.text
-    assert "/tap" in res_js.text
-    assert "/swipe" in res_js.text
-    assert "/key" in res_js.text
-    assert "/text" in res_js.text
-    assert "/open_app" in res_js.text
-    assert "/apps" in res_js.text
+    assert "fetchScreenshot" in js
+    assert "X-Screen-Width" in js
+    assert "X-Screen-Height" in js
+    assert "/api/devices/" in js
+    assert "/screenshot" in js
+    assert "/tap" in js
+    assert "/swipe" in js
+    assert "/key" in js
+    assert "/text" in js
+    assert "/open_app" in js
+    assert "/apps" in js
 
     # Проверка механизмов быстрого отклика и адаптивности
-    assert "needsAnotherFrame" in res_js.text
-    assert "targetIntervalMs" in res_js.text
-    assert "stream-updating" in res_js.text
-    assert "frame-age" in res_js.text
-    assert "showTapEffect" in res_js.text
-    assert "600" in res_js.text
-    assert "quality-select" in res_js.text
-    assert "localStorage" in res_js.text
-    assert "visibilitychange" in res_js.text
-    assert "document.hidden" in res_js.text
+    assert "needsAnotherFrame" in js
+    assert "targetIntervalMs" in js
+    assert "stream-updating" in js
+    assert "frame-age" in js
+    assert "showTapEffect" in js
+    assert "600" in js
+    assert "quality-select" in js
+    assert "localStorage" in js
+    assert "visibilitychange" in js
+    assert "document.hidden" in js
 
 
 def test_responsive_ui_and_adaptive_streaming(mock_manager: DeviceManager) -> None:
@@ -407,9 +417,7 @@ def test_responsive_ui_and_adaptive_streaming(mock_manager: DeviceManager) -> No
     assert 'id="tap-indicator"' in html
 
     # 2. Проверка JS
-    res_js = client.get("/static/app.js")
-    assert res_js.status_code == 200
-    js = res_js.text
+    js = get_all_js(client)
 
     # (1) Запрос без ожидания таймера и флаг «нужен ещё один»
     assert "requestImmediateFrame" in js
@@ -585,9 +593,7 @@ def test_power_confirmation_modal_and_warning_text(mock_manager: DeviceManager) 
     assert 'id="modal-btn-close"' in html
 
     # 2. Проверяем наличие предупреждения в app.js
-    res_js = client.get("/static/app.js")
-    assert res_js.status_code == 200
-    js = res_js.text
+    js = get_all_js(client)
 
     expected_warning = (
         "Выключенный телефон нельзя включить удалённо. "
@@ -608,9 +614,7 @@ def test_power_js_logic_and_polling_contract() -> None:
     app = create_web_app()
     client = TestClient(app)
 
-    res_js = client.get("/static/app.js")
-    assert res_js.status_code == 200
-    js = res_js.text
+    js = get_all_js(client)
 
     # (1) Эндпоинт POST /power и confirm: true
     assert "/power" in js
