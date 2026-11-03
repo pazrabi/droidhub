@@ -85,3 +85,9 @@
 ## 2026-11-03 — рефакторинг хаба
 - `web/views.py`: убраны запасные реализации и дубли имён (355 → ~150 строк). `mcp_server.py` (850 строк) разбит на пакет `hub/mcp_server/` (context, ratelimit, look, auth, tools, app); mcp>=2.0. `main.py` без try/except импортов. `actions.py`: удалены неиспользуемые `shell`, `long_press`, `wake_and_unlock` и запасные заглушки импортов. JS разбит на `js/common.js`, `js/devices-list.js`, `js/device-page.js` + `app.js`; CSS: токены темы собраны в начале файла. Тесты 348 зелёные (минус 5 тестов удалённых функций).
 - Продолжение рефакторинга: `auth.py` (591 строка) стал пакетом `hub/auth/` (passwords, limiter, clients, guards, routes, cli; `python -m hub.auth hash` работает); из `actions.py` вынесены чистые разборщики в `devices/parsing.py` (725 строк осталось). 348 тестов зелёные.
+
+## 2026-11-03 — живое видео экрана
+- Решение: `adb exec-out screenrecord --output-format=h264` на сервере -> WebSocket `/api/devices/{id}/stream` -> WebCodecs в браузере (canvas). Без скачиваний и без ffmpeg. Один процесс на устройство, раздаётся подписчикам, перезапуск каждые 180 с (лимит screenrecord), новому зрителю отдаётся GOP с последнего ключевого кадра.
+- Файлы: `devices/h264.py` (разбор Annex B), `devices/stream.py` (сессии), `api/stream.py` (WebSocket, проверка Origin и require_api), `web/static/js/video.js`, кнопка «Видео/Фото» и canvas на странице устройства; при любой ошибке — откат к скриншотам.
+- Замер на сервере: от команды на телефоне до первого изменившегося кадра у клиента 0,3–0,4 с (Realme и Redmi), было 4–5 с на скриншотах. Старт потока: Realme ~4 с, Redmi ~10 с (ensure_awake после сна). Тесты: 359.
+- Ограничения: экран без изменений кадров не шлёт (так и должно быть); браузер должен уметь WebCodecs (Chrome/Edge/новый Safari).
