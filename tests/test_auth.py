@@ -22,6 +22,7 @@ from hub.auth import (
     auth_router,
     get_client_ip,
     get_login_limiter,
+    get_sso_user,
     hash_password,
     main as cli_main,
     parse_client_tokens,
@@ -31,6 +32,7 @@ from hub.auth import (
     set_login_limiter,
     verify_password,
 )
+from hub import sso
 from hub.config import Settings
 
 
@@ -1042,4 +1044,269 @@ def test_require_api_client_and_state(monkeypatch: pytest.MonkeyPatch) -> None:
         headers={"Authorization": "Bearer invalid_tok"},
     )
     assert res_unauth.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+# =====================================================================
+# Тесты этапа 5: единый вход (SSO), get_sso_user, require_user, require_api, logout
+# =====================================================================
+
+
+def _setup_sso_mock(monkeypatch: pytest.MonkeyPatch, secret: str = "test_sso_secret") -> None:
+    monkeypatch.setattr(Settings, "sso_secret", secret, raising=False)
+    monkeypatch.setattr(Settings, "sso_cookie_name", "molokohub_sso", raising=False)
+    monkeypatch.setattr(Settings, "sso_login_url", "https://molokohub.site/sso/login", raising=False)
+    monkeypatch.setattr(Settings, "sso_cookie_domain", ".molokohub.site", raising=False)
+
+    def mock_verify_cookie(value: str, sec: str, now: float | None = None) -> str | None:
+        if sec != secret:
+            return None
+        if value == "valid_sso_cookie_alice":
+            return "alice"
+        if value == "valid_sso_cookie_bob":
+            return "bob"
+        return None
+
+    monkeypatch.setattr(sso, "verify_cookie", mock_verify_cookie, raising=False)
+
+
+def test_get_sso_user_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch)
+    req = Request({
+        "type": "http",
+        "headers": [(b"cookie", b"molokohub_sso=valid_sso_cookie_alice")],
+    })
+    user = get_sso_user(req)
+    assert user == "alice"
+
+
+def test_get_sso_user_forged_cookie(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch)
+    req = Request({
+        "type": "http",
+        "headers": [(b"cookie", b"molokohub_sso=forged_evil_token")],
+    })
+    user = get_sso_user(req)
+    assert user is None
+
+
+def test_get_sso_user_disabled_sso(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch, secret="")
+    req = Request({
+        "type": "http",
+        "headers": [(b"cookie", b"molokohub_sso=valid_sso_cookie_alice")],
+    })
+    user = get_sso_user(req)
+    assert user is None
+
+
+def test_get_sso_user_missing_cookie(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch)
+    req = Request({"type": "http", "headers": []})
+    user = get_sso_user(req)
+    assert user is None
+
+
+def test_get_sso_user_custom_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    custom_settings = Settings()
+    custom_settings.sso_secret = "custom_secret"  # type: ignore[attr-defined]
+    custom_settings.sso_cookie_name = "custom_cookie"  # type: ignore[attr-defined]
+
+    def custom_verify(value: str, sec: str, now: float | None = None) -> str | None:
+        if sec == "custom_secret" and value == "custom_tok":
+            return "custom_user"
+        return None
+
+    monkeypatch.setattr(sso, "verify_cookie", custom_verify, raising=False)
+
+    req = Request({
+        "type": "http",
+        "headers": [(b"cookie", b"custom_cookie=custom_tok")],
+    })
+    user = get_sso_user(req, settings=custom_settings)
+    assert user == "custom_user"
+
+
+def test_get_sso_user_verify_raises_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch)
+
+    def faulty_verify(value: str, sec: str, now: float | None = None) -> str | None:
+        raise RuntimeError("Corrupted signature parsing")
+
+    monkeypatch.setattr(sso, "verify_cookie", faulty_verify, raising=False)
+
+    req = Request({
+        "type": "http",
+        "headers": [(b"cookie", b"molokohub_sso=valid_sso_cookie_alice")],
+    })
+    user = get_sso_user(req)
+    assert user is None
+
+
+def test_require_user_with_sso_cookie(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch)
+
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test_secret_key")
+
+    @app.get("/user-check")
+    def user_check(request: Request, user: str = Depends(require_user)) -> dict[str, Any]:
+        client_obj = getattr(request.state, "client", None)
+        return {
+            "user": user,
+            "client_name": client_obj.name if client_obj else None,
+        }
+
+    client = TestClient(app)
+
+    # 1. Валидный SSO-cookie
+    client.cookies.set("molokohub_sso", "valid_sso_cookie_alice")
+    res = client.get("/user-check")
+    assert res.status_code == 200
+    assert res.json() == {"user": "alice", "client_name": "alice"}
+
+    # 2. Поддельный SSO-cookie
+    client.cookies.set("molokohub_sso", "bad_token")
+    res_bad = client.get("/user-check")
+    assert res_bad.status_code == status.HTTP_401_UNAUTHORIZED
+
+    # 3. Без cookie
+    client.cookies.clear()
+    res_no_cookie = client.get("/user-check")
+    assert res_no_cookie.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_require_user_disabled_sso_ignores_cookie(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch, secret="")
+
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test_secret_key")
+
+    @app.get("/user-check")
+    def user_check(user: str = Depends(require_user)) -> dict[str, str]:
+        return {"user": user}
+
+    client = TestClient(app)
+    client.cookies.set("molokohub_sso", "valid_sso_cookie_alice")
+    res = client.get("/user-check")
+    assert res.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_require_user_session_priority_over_sso(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch)
+
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test_secret_key")
+
+    @app.get("/user-check")
+    def user_check(request: Request, user: str = Depends(require_user)) -> dict[str, Any]:
+        return {"user": user, "client_name": request.state.client.name}
+
+    @app.post("/login-session")
+    def login_session(request: Request) -> dict[str, bool]:
+        request.session["user"] = "session_bob"
+        return {"ok": True}
+
+    client = TestClient(app)
+    client.post("/login-session")
+
+    # Сессия "session_bob" имеет приоритет над cookie "alice"
+    client.cookies.set("molokohub_sso", "valid_sso_cookie_alice")
+    res = client.get("/user-check")
+    assert res.status_code == 200
+    assert res.json() == {"user": "session_bob", "client_name": "session_bob"}
+
+
+def test_require_api_with_sso_cookie(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch)
+
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test_secret_key")
+
+    @app.get("/api/test-sso")
+    def api_endpoint(request: Request, actor: str = Depends(require_api)) -> dict[str, Any]:
+        client_obj = getattr(request.state, "client", None)
+        return {
+            "actor": actor,
+            "client_name": client_obj.name if client_obj else None,
+            "allow_power": client_obj.allow_power if client_obj else None,
+        }
+
+    client = TestClient(app)
+
+    # 1. Валидный SSO-cookie
+    client.cookies.set("molokohub_sso", "valid_sso_cookie_alice")
+    res = client.get("/api/test-sso")
+    assert res.status_code == 200
+    assert res.json() == {
+        "actor": "alice",
+        "client_name": "alice",
+        "allow_power": True,
+    }
+
+    # 2. Поддельный SSO-cookie -> 401
+    client.cookies.set("molokohub_sso", "fake_cookie")
+    res_bad = client.get("/api/test-sso")
+    assert res_bad.status_code == status.HTTP_401_UNAUTHORIZED
+    assert res_bad.json()["detail"] == "Не авторизован"
+
+    # 3. Без cookie и без токена -> 401
+    client.cookies.clear()
+    res_empty = client.get("/api/test-sso")
+    assert res_empty.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_require_api_disabled_sso_ignores_cookie(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch, secret="")
+
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test_secret_key")
+
+    @app.get("/api/test-sso")
+    def api_endpoint(actor: str = Depends(require_api)) -> dict[str, str]:
+        return {"actor": actor}
+
+    client = TestClient(app)
+    client.cookies.set("molokohub_sso", "valid_sso_cookie_alice")
+    res = client.get("/api/test-sso")
+    assert res.status_code == status.HTTP_401_UNAUTHORIZED
+
+
+def test_logout_deletes_sso_cookie_when_sso_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch)
+
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test_session_secret")
+    app.include_router(auth_router)
+
+    client = TestClient(app)
+
+    # Вызываем POST /logout
+    res = client.post("/logout", follow_redirects=False)
+    assert res.status_code == status.HTTP_303_SEE_OTHER
+    assert res.headers["location"] == "/login"
+
+    # Проверяем удаление SSO-cookie
+    set_cookies = res.headers.get_list("set-cookie") if hasattr(res.headers, "get_list") else [res.headers.get("set-cookie", "")]
+    all_set_cookie = " ".join(set_cookies)
+
+    assert "molokohub_sso" in all_set_cookie
+    assert "Domain=.molokohub.site" in all_set_cookie
+    assert "Max-Age=0" in all_set_cookie or "expires=" in all_set_cookie
+
+
+def test_logout_when_sso_disabled_does_not_delete_sso_cookie(monkeypatch: pytest.MonkeyPatch) -> None:
+    _setup_sso_mock(monkeypatch, secret="")
+
+    app = FastAPI()
+    app.add_middleware(SessionMiddleware, secret_key="test_session_secret")
+    app.include_router(auth_router)
+
+    client = TestClient(app)
+    res = client.post("/logout", follow_redirects=False)
+    assert res.status_code == status.HTTP_303_SEE_OTHER
+    assert res.headers["location"] == "/login"
+
+    all_set_cookie = res.headers.get("set-cookie", "")
+    assert "molokohub_sso" not in all_set_cookie
+
 
