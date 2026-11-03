@@ -96,6 +96,12 @@ def test_settings_defaults() -> None:
     assert settings.client_tokens == ""
     assert settings.nav_links == ""
     assert settings.nav_active == ""
+    assert settings.sso_secret == ""
+    assert settings.sso_cookie_domain == ""
+    assert settings.sso_login_url == ""
+    assert settings.sso_allowed_suffix == ""
+    assert settings.sso_ttl_hours == 168
+    assert settings.sso_cookie_name == "molokohub_sso"
 
 
 def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -115,6 +121,12 @@ def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
         "HUB_CLIENT_TOKENS",
         "HUB_NAV_LINKS",
         "HUB_NAV_ACTIVE",
+        "HUB_SSO_SECRET",
+        "HUB_SSO_COOKIE_DOMAIN",
+        "HUB_SSO_LOGIN_URL",
+        "HUB_SSO_ALLOWED_SUFFIX",
+        "HUB_SSO_TTL_HOURS",
+        "HUB_SSO_COOKIE_NAME",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -165,6 +177,12 @@ def test_get_settings_default_call(monkeypatch: pytest.MonkeyPatch) -> None:
         "HUB_CLIENT_TOKENS",
         "HUB_NAV_LINKS",
         "HUB_NAV_ACTIVE",
+        "HUB_SSO_SECRET",
+        "HUB_SSO_COOKIE_DOMAIN",
+        "HUB_SSO_LOGIN_URL",
+        "HUB_SSO_ALLOWED_SUFFIX",
+        "HUB_SSO_TTL_HOURS",
+        "HUB_SSO_COOKIE_NAME",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -184,6 +202,12 @@ def test_get_settings_default_call(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.client_tokens == ""
     assert settings.nav_links == ""
     assert settings.nav_active == ""
+    assert settings.sso_secret == ""
+    assert settings.sso_cookie_domain == ""
+    assert settings.sso_login_url == ""
+    assert settings.sso_allowed_suffix == ""
+    assert settings.sso_ttl_hours == 168
+    assert settings.sso_cookie_name == "molokohub_sso"
 
     # Проверяем чтение переменных окружения при вызове без аргументов
     monkeypatch.setenv("HUB_ADMIN_USER", "default_caller")
@@ -413,6 +437,12 @@ def test_get_settings_nav_links_env_and_file(
     settings = get_settings()
     assert settings.nav_links == ""
     assert settings.nav_active == ""
+    assert settings.sso_secret == ""
+    assert settings.sso_cookie_domain == ""
+    assert settings.sso_login_url == ""
+    assert settings.sso_allowed_suffix == ""
+    assert settings.sso_ttl_hours == 168
+    assert settings.sso_cookie_name == "molokohub_sso"
     assert settings.parsed_nav_links == []
 
     # 2. Чтение из .env файла
@@ -436,3 +466,67 @@ def test_get_settings_nav_links_env_and_file(
     assert settings_override.nav_links == "Custom|https://custom.example.com/"
     assert settings_override.nav_active == "Custom"
     assert settings_override.parsed_nav_links == [("Custom", "https://custom.example.com/")]
+
+
+def test_get_settings_sso_fields(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in (
+        "HUB_SSO_SECRET",
+        "HUB_SSO_COOKIE_DOMAIN",
+        "HUB_SSO_LOGIN_URL",
+        "HUB_SSO_ALLOWED_SUFFIX",
+        "HUB_SSO_TTL_HOURS",
+        "HUB_SSO_COOKIE_NAME",
+        "HUB_ENV_FILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    # 1. Значения из переменных окружения
+    monkeypatch.setenv("HUB_SSO_SECRET", "secret_key_123")
+    monkeypatch.setenv("HUB_SSO_COOKIE_DOMAIN", ".molokohub.site")
+    monkeypatch.setenv("HUB_SSO_LOGIN_URL", "https://molokohub.site/sso/login")
+    monkeypatch.setenv("HUB_SSO_ALLOWED_SUFFIX", "molokohub.site")
+    monkeypatch.setenv("HUB_SSO_TTL_HOURS", "72")
+    monkeypatch.setenv("HUB_SSO_COOKIE_NAME", "custom_sso_cookie")
+
+    settings = get_settings()
+    assert settings.sso_secret == "secret_key_123"
+    assert settings.sso_cookie_domain == ".molokohub.site"
+    assert settings.sso_login_url == "https://molokohub.site/sso/login"
+    assert settings.sso_allowed_suffix == "molokohub.site"
+    assert settings.sso_ttl_hours == 72
+    assert settings.sso_cookie_name == "custom_sso_cookie"
+
+    # 2. Нечисловой TTL откатывается к дефолту 168
+    monkeypatch.setenv("HUB_SSO_TTL_HOURS", "not_a_number")
+    settings_bad_ttl = get_settings()
+    assert settings_bad_ttl.sso_ttl_hours == 168
+
+    # 3. Значения из .env файла
+    for key in (
+        "HUB_SSO_SECRET",
+        "HUB_SSO_COOKIE_DOMAIN",
+        "HUB_SSO_LOGIN_URL",
+        "HUB_SSO_ALLOWED_SUFFIX",
+        "HUB_SSO_TTL_HOURS",
+        "HUB_SSO_COOKIE_NAME",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "HUB_SSO_SECRET=env_file_secret\n"
+        "HUB_SSO_COOKIE_DOMAIN=.example.org\n"
+        "HUB_SSO_LOGIN_URL=https://example.org/sso/login\n"
+        "HUB_SSO_ALLOWED_SUFFIX=example.org\n"
+        "HUB_SSO_TTL_HOURS=24\n"
+        "HUB_SSO_COOKIE_NAME=file_cookie\n",
+        encoding="utf-8",
+    )
+    settings_file = get_settings(env_file=env_file)
+    assert settings_file.sso_secret == "env_file_secret"
+    assert settings_file.sso_cookie_domain == ".example.org"
+    assert settings_file.sso_login_url == "https://example.org/sso/login"
+    assert settings_file.sso_allowed_suffix == "example.org"
+    assert settings_file.sso_ttl_hours == 24
+    assert settings_file.sso_cookie_name == "file_cookie"
+

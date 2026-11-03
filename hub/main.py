@@ -36,6 +36,11 @@ except (ImportError, ModuleNotFoundError):
     from fastapi import APIRouter
     web_router = APIRouter()
 
+try:
+    from hub.sso_routes import sso_router
+except (ImportError, ModuleNotFoundError):
+    sso_router = None  # type: ignore
+
 
 def _get_static_dir() -> Path:
     return Path(__file__).resolve().parent / "web" / "static"
@@ -101,6 +106,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(api_router)
     app.include_router(auth_router)
     app.include_router(web_router)
+    if settings.sso_secret and sso_router is not None:
+        app.include_router(sso_router)
 
     # Статические файлы
     static_dir = _get_static_dir()
