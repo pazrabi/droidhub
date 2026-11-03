@@ -19,7 +19,6 @@
     const statusText = document.getElementById('stream-status-text');
     const streamUpdating = document.getElementById('stream-updating');
     const frameAgeEl = document.getElementById('frame-age');
-    const qualitySelect = document.getElementById('quality-select');
     const btnToggleStream = document.getElementById('btn-toggle-stream');
     const btnRefreshScreen = document.getElementById('btn-refresh-screen');
     const tapIndicator = document.getElementById('tap-indicator');
@@ -34,35 +33,7 @@
     let lastFrameTime = 0;
     const targetIntervalMs = 1000; // Целевой интервал по умолчанию 1 с
 
-    // Селектор качества (макс. ширина 360 / 540 / 720) и сохранение в localStorage
-    const STORAGE_KEY_QUALITY = 'screenshot_quality';
-    let currentQuality = '720';
-    try {
-      const savedQuality = localStorage.getItem(STORAGE_KEY_QUALITY) || localStorage.getItem('quality') || localStorage.getItem('max_width');
-      if (savedQuality && ['360', '540', '720'].includes(savedQuality)) {
-        currentQuality = savedQuality;
-      }
-    } catch (e) {
-      console.warn('Ошибка чтения localStorage:', e);
-    }
-
-    if (qualitySelect) {
-      qualitySelect.value = currentQuality;
-      qualitySelect.addEventListener('change', () => {
-        const val = qualitySelect.value;
-        if (['360', '540', '720'].includes(val)) {
-          currentQuality = val;
-          try {
-            localStorage.setItem(STORAGE_KEY_QUALITY, val);
-            localStorage.setItem('quality', val);
-            localStorage.setItem('max_width', val);
-          } catch (e) {
-            console.warn('Ошибка записи localStorage:', e);
-          }
-          requestImmediateFrame();
-        }
-      });
-    }
+    const MAX_WIDTH = 720; // ширина кадра
 
     function setStatus(type, msg) {
       if (statusDot) {
@@ -104,7 +75,7 @@
       const startTime = Date.now();
 
       try {
-        const maxWidth = currentQuality || '720';
+        const maxWidth = MAX_WIDTH;
         const url = `/api/devices/${encodeURIComponent(deviceId)}/screenshot?max_width=${encodeURIComponent(maxWidth)}&_t=${Date.now()}`;
         const resp = await fetch(url, { cache: 'no-store' });
 

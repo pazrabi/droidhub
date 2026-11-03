@@ -296,10 +296,7 @@ def test_device_page_renders_all_required_elements(mock_manager: DeviceManager) 
     assert 'id="btn-refresh-apps"' in html
 
     # 6. Элементы адаптивности и отклика
-    assert 'id="quality-select"' in html
-    assert 'value="360"' in html
-    assert 'value="540"' in html
-    assert 'value="720"' in html
+    assert 'id="quality-select"' not in html
     assert 'id="stream-updating"' in html
     assert 'id="frame-age"' in html
 
@@ -377,8 +374,7 @@ def test_static_files_served() -> None:
     assert "frame-age" in js
     assert "showTapEffect" in js
     assert "600" in js
-    assert "quality-select" in js
-    assert "localStorage" in js
+    assert "quality-select" not in js
     assert "visibilitychange" in js
     assert "document.hidden" in js
 
@@ -402,11 +398,8 @@ def test_responsive_ui_and_adaptive_streaming(mock_manager: DeviceManager) -> No
     assert res_page.status_code == 200
     html = res_page.text
 
-    # Селектор качества в панели
-    assert 'id="quality-select"' in html
-    assert '<option value="360"' in html
-    assert '<option value="540"' in html
-    assert '<option value="720"' in html
+    # Выбора ширины кадра больше нет
+    assert 'id="quality-select"' not in html
 
     # Индикаторы обновления и возраста кадра
     assert 'id="stream-updating"' in html
@@ -437,10 +430,9 @@ def test_responsive_ui_and_adaptive_streaming(mock_manager: DeviceManager) -> No
     assert "600" in js
     assert "showTapEffect" in js
 
-    # (5) Селектор качества, localStorage и max_width
-    assert "localStorage" in js
+    # (5) max_width передаётся, селектора качества нет
     assert "max_width" in js
-    assert "quality-select" in js
+    assert "quality-select" not in js
 
     # (6) Пауза при скрытой вкладке
     assert "visibilitychange" in js
