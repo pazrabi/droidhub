@@ -1023,3 +1023,16 @@ html.embed body { background: var(--bg-body); }
 .btn-xs { font-size: 13px; padding: 4px 10px; }
 .btn-outline { background-color: var(--bg-surface); border-color: var(--border-color); }
 .btn-outline:hover { background-color: var(--bg-surface); border-color: var(--accent-primary); }
+
+/* Занятость устройства рядом с «В сети» */
+.badge-group { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.badge-idle {
+  background-color: rgba(139, 148, 158, 0.15);
+  color: var(--text-secondary, #8b949e);
+  border: 1px solid rgba(139, 148, 158, 0.35);
+}
+.badge-busy {
+  background-color: rgba(210, 153, 34, 0.18);
+  color: #d29922;
+  border: 1px solid rgba(210, 153, 34, 0.45);
+}

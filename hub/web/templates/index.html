@@ -22,11 +22,15 @@
       <div class="device-card" id="card-{{ d.id }}">
         <div class="device-card-header">
           <h2 class="device-card-title">{{ d.name or d.id }}</h2>
-          {% if d.online %}
-            <span class="badge badge-success">В сети</span>
-          {% else %}
-            <span class="badge badge-danger">Не в сети</span>
-          {% endif %}
+          <div class="badge-group">
+            {% if d.online %}
+              <span class="badge badge-success">В сети</span>
+            {% else %}
+              <span class="badge badge-danger">Не в сети</span>
+            {% endif %}
+            {% set act = busy.get(d.id) if busy else none %}
+            <span class="badge busy-badge {% if act %}badge-busy{% else %}badge-idle{% endif %}" id="busy-{{ d.id }}"{% if not d.online %} style="display: none;"{% endif %}>{% if act %}Занят: {{ act.label }}{% else %}Свободен{% endif %}</span>
+          </div>
         </div>
         <div class="device-card-body">
           <div class="device-meta-row">

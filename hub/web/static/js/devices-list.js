@@ -75,7 +75,7 @@
         if (!card) return;
 
         // Онлайн / оффлайн статус
-        const badge = card.querySelector('.device-card-header .badge');
+        const badge = card.querySelector('.device-card-header .badge:not(.busy-badge)');
         if (badge) {
           if (d.online) {
             badge.className = 'badge badge-success';
@@ -83,6 +83,21 @@
           } else {
             badge.className = 'badge badge-danger';
             badge.textContent = 'Не в сети';
+          }
+        }
+
+        // Занятость: кто и что сейчас делает на телефоне
+        const busyEl = document.getElementById(`busy-${d.id}`);
+        if (busyEl) {
+          busyEl.style.display = d.online ? '' : 'none';
+          if (d.busy && d.activity) {
+            busyEl.className = 'badge busy-badge badge-busy';
+            busyEl.textContent = `Занят: ${d.activity.label}`;
+            busyEl.title = d.activity.actor ? `Запрос от: ${d.activity.actor}` : '';
+          } else {
+            busyEl.className = 'badge busy-badge badge-idle';
+            busyEl.textContent = 'Свободен';
+            busyEl.title = '';
           }
         }
 

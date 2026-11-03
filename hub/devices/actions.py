@@ -13,7 +13,7 @@ from typing import Any, Awaitable, Callable, TypeVar
 T = TypeVar("T")
 
 from hub.audit import get_audit
-from hub.devices import adb  # noqa: F401  (tests patch actions.adb)
+from hub.devices import activity, adb  # noqa: F401  (tests patch actions.adb)
 from hub.devices.parsing import (
     extract_hierarchy_xml as _extract_hierarchy_xml,
     find_element as _find_element,
@@ -154,20 +154,21 @@ async def _execute_action(
     Выполняет действие с автоподключением при DeviceOffline/обрыве связи
     и логированием результата в журнал аудита.
     """
-    try:
+    async with activity.track(device_id, action_name, actor):
         try:
-            res = await coro_fn()
-        except Exception as exc:
-            if _is_offline_error(exc):
-                await _reconnect_for_device(device_id)
+            try:
                 res = await coro_fn()
-            else:
-                raise
-        await _record_audit(device_id, action_name, params, ok=True, actor=actor)
-        return res
-    except Exception as e:
-        await _record_audit(device_id, action_name, params, ok=False, error=str(e), actor=actor)
-        raise
+            except Exception as exc:
+                if _is_offline_error(exc):
+                    await _reconnect_for_device(device_id)
+                    res = await coro_fn()
+                else:
+                    raise
+            await _record_audit(device_id, action_name, params, ok=True, actor=actor)
+            return res
+        except Exception as e:
+            await _record_audit(device_id, action_name, params, ok=False, error=str(e), actor=actor)
+            raise
 
 
 async def _record_audit(

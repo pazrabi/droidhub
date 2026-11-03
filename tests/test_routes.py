@@ -620,3 +620,12 @@ def test_missing_client_assumed_allow_power_true(
     res = client.post("/api/devices/realme/power", json={"action": "reboot", "confirm": True})
     assert res.status_code == 200
     mock_power.assert_called_once_with("realme", "reboot", actor=TEST_ACTOR)
+
+
+def test_devices_list_includes_busy_status(client: TestClient) -> None:
+    """GET /api/devices отдаёт busy/activity: свободен без операций."""
+    res = client.get("/api/devices")
+    assert res.status_code == 200
+    for item in res.json():
+        assert item["busy"] is False
+        assert item["activity"] is None

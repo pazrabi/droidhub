@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 import hub.audit as audit_module
 from hub.config import get_settings
-from hub.devices import actions, browser
+from hub.devices import actions, activity, browser
 from hub.devices.adb import AdbError, AdbTimeout, DeviceOffline, adb_shell
 from hub.devices.manager import DeviceStatus
 
@@ -296,6 +296,9 @@ async def get_devices(actor: str = Depends(require_api)) -> list[dict[str, Any]]
                 item["charging"] = s.get("charging")
             else:
                 item["charging"] = getattr(s, "charging", None)
+        busy = activity.current(item.get("id", ""))
+        item["busy"] = busy is not None
+        item["activity"] = busy
         results.append(item)
     return results
 

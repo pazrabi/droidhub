@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from hub.auth import get_sso_user, require_user
+from hub.devices import activity
 from hub.config import Settings, get_settings, parse_nav_links
 
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -128,7 +129,8 @@ async def devices_page(request: Request) -> Response:
         return _redirect_to_login(request)
     manager = getattr(request.app.state, "manager", None)
     devices = manager.statuses() if manager is not None else []
-    return _render(request, "index.html", user=user, devices=devices)
+    busy = {d.id: activity.current(d.id) for d in devices}
+    return _render(request, "index.html", user=user, devices=devices, busy=busy)
 
 
 @web_router.get("/device/{device_id}", response_class=HTMLResponse)
