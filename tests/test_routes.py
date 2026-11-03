@@ -5,7 +5,7 @@ import types
 from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from PIL import Image
 import pytest
@@ -455,3 +455,168 @@ def test_get_devices_charging_field(client: TestClient, monkeypatch: pytest.Monk
     for item in data_with_charging:
         assert "charging" in item
         assert item["charging"] is True
+
+
+try:
+    from hub.auth import Client
+except (ImportError, AttributeError):
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class Client:
+        name: str
+        rate_limit_per_min: int | None = None
+        allow_power: bool = True
+
+
+def test_power_nopower_client_403_and_wake_200(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    POST /api/devices/{id}/power с action reboot или shutdown возвращает 403 с русским текстом,
+    если request.state.client.allow_power равно False.
+    wake и sleep разрешены всем (200).
+    """
+    mock_power = AsyncMock(return_value=None)
+    monkeypatch.setattr(actions, "power", mock_power)
+
+    nopower_client = Client(name="nopower", allow_power=False)
+
+    async def _mock_require_api(request: Request) -> str:
+        request.state.client = nopower_client
+        return nopower_client.name
+
+    app.dependency_overrides[require_api] = _mock_require_api
+    try:
+        # 1. reboot с confirm=True -> 403
+        res_reboot = client.post("/api/devices/realme/power", json={"action": "reboot", "confirm": True})
+        assert res_reboot.status_code == 403
+        detail_reboot = res_reboot.json()["detail"].lower()
+        assert "запрещено" in detail_reboot or "питани" in detail_reboot
+
+        # 2. reboot без confirm -> 403
+        res_reboot_no_confirm = client.post("/api/devices/realme/power", json={"action": "reboot"})
+        assert res_reboot_no_confirm.status_code == 403
+        detail_reboot_nc = res_reboot_no_confirm.json()["detail"].lower()
+        assert "запрещено" in detail_reboot_nc or "питани" in detail_reboot_nc
+
+        # 3. shutdown с confirm=True -> 403
+        res_shutdown = client.post("/api/devices/realme/power", json={"action": "shutdown", "confirm": True})
+        assert res_shutdown.status_code == 403
+        detail_shutdown = res_shutdown.json()["detail"].lower()
+        assert "запрещено" in detail_shutdown or "питани" in detail_shutdown
+
+        # 4. shutdown без confirm -> 403
+        res_shutdown_no_confirm = client.post("/api/devices/realme/power", json={"action": "shutdown"})
+        assert res_shutdown_no_confirm.status_code == 403
+
+        # actions.power не должен вызываться для 403
+        mock_power.assert_not_called()
+
+        # 5. wake разрешён всем -> 200
+        res_wake = client.post("/api/devices/realme/power", json={"action": "wake"})
+        assert res_wake.status_code == 200
+        assert res_wake.json() == {"ok": True, "status": "ok"}
+        mock_power.assert_called_once_with("realme", "wake", actor="nopower")
+
+        # 6. sleep также разрешён всем -> 200
+        mock_power.reset_mock()
+        res_sleep = client.post("/api/devices/realme/power", json={"action": "sleep"})
+        assert res_sleep.status_code == 200
+        assert res_sleep.json() == {"ok": True, "status": "ok"}
+        mock_power.assert_called_once_with("realme", "sleep", actor="nopower")
+    finally:
+        app.dependency_overrides.pop(require_api, None)
+
+
+def test_independent_client_rate_limits(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Лимит действий в минуту считается на пару (клиент, устройство).
+    Один клиент не расходует лимит другого: лимиты разных клиентов независимы.
+    """
+    monkeypatch.setattr(actions, "tap", AsyncMock(return_value=None))
+
+    current_client: Client | None = None
+
+    async def _dynamic_require_api(request: Request) -> str:
+        if current_client is not None:
+            request.state.client = current_client
+            return current_client.name
+        return "default"
+
+    app.dependency_overrides[require_api] = _dynamic_require_api
+    try:
+        # Клиент 1: лимит 2 действия в минуту
+        client_1 = Client(name="client_1", rate_limit_per_min=2)
+        # Клиент 2: лимит 2 действия в минуту
+        client_2 = Client(name="client_2", rate_limit_per_min=2)
+
+        # Клиент 1 исчерпывает свой лимит на realme
+        current_client = client_1
+        res1 = client.post("/api/devices/realme/tap", json={"x": 10, "y": 10})
+        assert res1.status_code == 200
+        res2 = client.post("/api/devices/realme/tap", json={"x": 10, "y": 10})
+        assert res2.status_code == 200
+        res3 = client.post("/api/devices/realme/tap", json={"x": 10, "y": 10})
+        assert res3.status_code == 429
+        assert "лимит действий" in res3.json()["detail"].lower()
+
+        # Клиент 2 на том же самом устройстве realme не исчерпал лимит!
+        current_client = client_2
+        res4 = client.post("/api/devices/realme/tap", json={"x": 10, "y": 10})
+        assert res4.status_code == 200
+        res5 = client.post("/api/devices/realme/tap", json={"x": 10, "y": 10})
+        assert res5.status_code == 200
+        # И только 3-й запрос клиента 2 блокируется
+        res6 = client.post("/api/devices/realme/tap", json={"x": 10, "y": 10})
+        assert res6.status_code == 429
+
+        # Клиент 1 на другом устройстве (redmi) также имеет независимый лимит
+        current_client = client_1
+        res_other = client.post("/api/devices/redmi/tap", json={"x": 10, "y": 10})
+        assert res_other.status_code == 200
+    finally:
+        app.dependency_overrides.pop(require_api, None)
+
+
+def test_client_rate_limit_fallback_settings(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Если client.rate_limit_per_min не задан (None), используется settings.rate_limit_per_min.
+    """
+    settings = Settings(rate_limit_per_min=1)
+    monkeypatch.setattr("hub.api.routes.get_settings", lambda: settings)
+    monkeypatch.setattr(actions, "tap", AsyncMock(return_value=None))
+
+    client_default = Client(name="default_limiter", rate_limit_per_min=None)
+
+    async def _mock_require_api(request: Request) -> str:
+        request.state.client = client_default
+        return client_default.name
+
+    app.dependency_overrides[require_api] = _mock_require_api
+    try:
+        res1 = client.post("/api/devices/realme/tap", json={"x": 10, "y": 10})
+        assert res1.status_code == 200
+
+        res2 = client.post("/api/devices/realme/tap", json={"x": 10, "y": 10})
+        assert res2.status_code == 429
+        assert "лимит действий" in res2.json()["detail"].lower()
+    finally:
+        app.dependency_overrides.pop(require_api, None)
+
+
+def test_missing_client_assumed_allow_power_true(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """При отсутствии клиента в request.state считаем allow_power=True."""
+    mock_power = AsyncMock(return_value=None)
+    monkeypatch.setattr(actions, "power", mock_power)
+
+    # _fake_require_api по умолчанию не выставляет request.state.client
+    res = client.post("/api/devices/realme/power", json={"action": "reboot", "confirm": True})
+    assert res.status_code == 200
+    mock_power.assert_called_once_with("realme", "reboot", actor=TEST_ACTOR)
