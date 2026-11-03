@@ -264,12 +264,14 @@ async def fetch_page(
     wait_seconds: float = 15.0,
     capture_json: list[str] | None = None,
     max_chars: int = 200000,
+    wait_for: str | None = None,
+    wait_full: bool = False,
 ) -> dict[str, Any]:
-    """Открыть адрес в Chrome телефона и вернуть текст всей страницы (не пиксели) и JSON-ответы сайта; capture_json: подстроки адресов нужных ответов, wait_seconds: сколько ждать догрузки; в ответе captcha=true, если показана капча.
-Open URL in phone's Chrome and return full page text (no pixels) plus the site's JSON responses; capture_json: URL substrings of wanted responses, wait_seconds: max wait for content; captcha=true when a captcha is shown."""
+    """Открыть адрес в Chrome телефона и вернуть текст всей страницы (не пиксели) и все JSON-ответы сайта по порядку; capture_json: подстроки адресов, wait_for: подстрока в теле ответа как признак конца выдачи, wait_full: ждать wait_seconds целиком; captcha=true при капче.
+Open URL in phone's Chrome and return full page text (no pixels) plus all the site's JSON responses in order; capture_json: URL substrings, wait_for: body substring marking end of results, wait_full: wait the whole wait_seconds; captcha=true when a captcha is shown."""
     client = await _begin(device_id)
     return await browser.fetch_page(
-        device_id, url, wait_seconds, capture_json, max_chars, actor=client.name
+        device_id, url, wait_seconds, capture_json, max_chars, wait_for, wait_full, actor=client.name
     )
 
 

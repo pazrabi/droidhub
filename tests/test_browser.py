@@ -80,6 +80,47 @@ async def test_wait_for_page_with_pattern_ignores_endless_polling(monkeypatch: p
     assert [r["url"] for r in out] == ["https://x.ru/search/results"]
 
 
+def _poll(rid: str, body_marker: str) -> list[dict]:
+    return _request(rid, "https://x.ru/search/results")
+
+
+class MarkerCdp(FakeCdp):
+    async def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+        if method == "Network.getResponseBody":
+            marker = "DONE" if params["requestId"] == "3" else "PARTIAL"
+            return {"body": '{"s": "%s"}' % marker, "base64Encoded": False}
+        return {}
+
+
+async def test_wait_for_collects_all_polls_until_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Несколько опросов одного адреса: ждём ответ с признаком конца, возвращаем все ответы по порядку."""
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.2)
+    events = _request("1", "https://x.ru/search/results") + _request("2", "https://x.ru/search/results") \
+        + _request("3", "https://x.ru/search/results")
+    bodies: dict = {}
+    ok = await browser._wait_for_page(
+        MarkerCdp(events), 5.0, {}, ["/search/results"], bodies, wait_for="DONE"
+    )
+    assert ok is True
+    out = await browser._collect_json(bodies)
+    assert [r["body"] for r in out] == ['{"s": "PARTIAL"}', '{"s": "PARTIAL"}', '{"s": "DONE"}']
+
+
+async def test_wait_for_not_found_times_out() -> None:
+    events = _request("1", "https://x.ru/search/results")
+    ok = await browser._wait_for_page(
+        MarkerCdp(events), 0.6, {}, ["/search/results"], {}, wait_for="NEVER"
+    )
+    assert ok is False
+
+
+async def test_wait_full_waits_whole_time() -> None:
+    start = asyncio.get_running_loop().time()
+    ok = await browser._wait_for_page(FakeCdp(_request("1", "https://x.ru/a")), 0.6, {}, [], {}, wait_full=True)
+    assert ok is True
+    assert asyncio.get_running_loop().time() - start >= 0.55
+
+
 async def test_wait_for_page_times_out_when_no_load() -> None:
     assert await browser._wait_for_page(FakeCdp([]), 0.3, {}) is False
 
@@ -149,7 +190,7 @@ def test_api_fetch_page(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> 
     )
     assert res.status_code == 200
     assert res.json()["text"] == "hello"
-    mock.assert_called_once_with("realme", "https://x.ru/", 5.0, ["/api/"], 200000, actor="bot")
+    mock.assert_called_once_with("realme", "https://x.ru/", 5.0, ["/api/"], 200000, None, False, actor="bot")
 
 
 @pytest.mark.parametrize(

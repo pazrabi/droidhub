@@ -51,6 +51,8 @@ class FetchPageRequest(BaseModel):
     wait_seconds: float = 15.0
     capture_json: list[str] = []
     max_chars: int = 200000
+    wait_for: str | None = None
+    wait_full: bool = False
 
 
 class PowerRequest(BaseModel):
@@ -519,7 +521,8 @@ async def fetch_page_device(
     await _check_device_and_rate_limit(device_id, request=request)
     try:
         return await browser.fetch_page(
-            device_id, req.url, req.wait_seconds, req.capture_json, req.max_chars, actor=actor
+            device_id, req.url, req.wait_seconds, req.capture_json, req.max_chars,
+            req.wait_for, req.wait_full, actor=actor
         )
     except _BROWSER_ERRORS as exc:
         raise _browser_http_error(exc)

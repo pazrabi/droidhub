@@ -24,9 +24,9 @@ DEVTOOLS_SOCKET = "localabstract:chrome_devtools_remote"
 MAX_WAIT_SECONDS = 60.0
 QUIET_SECONDS = 1.5  # столько сети должно молчать после загрузки, чтобы считать выдачу догруженной
 DEFAULT_MAX_CHARS = 200_000
-MAX_JSON_RESPONSES = 50
+MAX_JSON_RESPONSES = 200
 MAX_JSON_BODY = 2_000_000
-MAX_JSON_TOTAL = 8_000_000
+MAX_JSON_TOTAL = 30_000_000
 LOCK_WAIT_SECONDS = 90.0
 
 _SKIP_TYPES = {"Image", "Font", "Stylesheet", "Media", "Ping", "Other"}
@@ -224,6 +224,8 @@ async def _fetch_body(cdp: _Cdp, request_id: str, info: dict) -> dict | None:
 async def _wait_for_page(
     cdp: _Cdp, wait_seconds: float, captured: dict[str, dict], patterns: list[str] | None = None,
     bodies: dict[str, asyncio.Task] | None = None,
+    wait_for: str | None = None,
+    wait_full: bool = False,
 ) -> bool:
     """Ждёт загрузки и затишья сети; True если дождались, False если вышло время.
 
@@ -233,6 +235,7 @@ async def _wait_for_page(
     """
     patterns = patterns or []
     bodies = bodies if bodies is not None else {}
+    found = False  # подстрока wait_for уже встретилась в теле одного из ответов
     deadline = time.monotonic() + wait_seconds
     inflight: set[str] = set()
     matching: set[str] = set()  # запросы, чей адрес подходит под patterns (по requestWillBeSent)
@@ -241,13 +244,24 @@ async def _wait_for_page(
     last_activity = last_matched = time.monotonic()
     while True:
         now = time.monotonic()
-        if patterns:
+        if wait_for and not found:
+            found = any(
+                t.done() and not t.cancelled() and (r := t.result()) is not None and wait_for in r["body"]
+                for t in bodies.values()
+            )
+        if wait_full:
+            if now >= deadline:
+                return True
+        elif wait_for:
+            if found and not (matching & inflight) and now - last_matched >= QUIET_SECONDS:
+                return True
+        elif patterns:
             if matched_done and not (matching & inflight) and now - last_matched >= QUIET_SECONDS:
                 return True
         elif load_fired and not inflight and now - last_activity >= QUIET_SECONDS:
             return True
         if now >= deadline:
-            return False
+            return wait_full
         try:
             ev = await asyncio.wait_for(cdp.events.get(), timeout=min(0.25, max(0.01, deadline - now)))
         except asyncio.TimeoutError:
@@ -318,19 +332,27 @@ async def fetch_page(
     wait_seconds: float = 15.0,
     capture_json: list[str] | None = None,
     max_chars: int = DEFAULT_MAX_CHARS,
+    wait_for: str | None = None,
+    wait_full: bool = False,
     *,
     actor: str = "system",
 ) -> dict[str, Any]:
     """Открывает url в новой вкладке Chrome, ждёт догрузки и возвращает текст страницы и JSON-ответы сайта.
 
-    capture_json: подстроки адресов, ответы которых нужно вернуть (пусто: все JSON-ответы XHR/fetch).
+    capture_json: подстроки адресов, ответы которых нужно вернуть (пусто: все JSON-ответы XHR/fetch);
+    возвращаются все подходящие ответы по порядку завершения, по одному на каждый запрос.
+    wait_for: подстрока, которая должна появиться в теле одного из ответов (выдача закончена);
+    wait_full: ждать wait_seconds целиком (finished=true, если время вышло без ошибок).
     """
     if not re.match(r"^https?://", url, re.IGNORECASE):
         raise ValueError("Нужен адрес, начинающийся с http:// или https://")
     wait_seconds = max(1.0, min(float(wait_seconds), MAX_WAIT_SECONDS))
     max_chars = max(1000, min(int(max_chars), 1_000_000))
     patterns = [p for p in (capture_json or []) if p]
-    params = {"url": url, "wait_seconds": wait_seconds, "capture_json": patterns}
+    params = {
+        "url": url, "wait_seconds": wait_seconds, "capture_json": patterns,
+        "wait_for": wait_for, "wait_full": wait_full,
+    }
 
     async def _run() -> dict[str, Any]:
         await actions.ensure_awake(device_id, actor=actor)
@@ -346,7 +368,9 @@ async def fetch_page(
                 await cdp.call("Network.enable", {"maxTotalBufferSize": 100_000_000, "maxResourceBufferSize": 20_000_000})
                 await cdp.call("Page.navigate", {"url": url}, timeout=30.0)
                 captured: dict[str, dict] = {}
-                finished = await _wait_for_page(cdp, wait_seconds, captured, patterns, bodies)
+                finished = await _wait_for_page(
+                    cdp, wait_seconds, captured, patterns, bodies, wait_for=wait_for, wait_full=wait_full
+                )
                 result = await _read_page(cdp, max_chars)
                 if result["url"].startswith("chrome-error://"):
                     code = re.search(r"\b[A-Z][A-Z0-9_]{6,}\b", result["text"])
