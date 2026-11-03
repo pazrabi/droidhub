@@ -451,27 +451,6 @@ async def test_swipe(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
 # --- ТЕСТ LONG_PRESS ---
 
 @pytest.mark.asyncio
-async def test_long_press(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
-    calls: list[str] = []
-
-    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
-        calls.append(cmd)
-        return ""
-
-    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
-
-    await actions.long_press("realme", 250, 450)
-    assert calls == ["input swipe 250 450 250 450 800"]
-
-    await actions.long_press("realme", 250, 450, ms=1200)
-    assert calls[-1] == "input swipe 250 450 250 450 1200"
-    assert setup_actions.entries[-1]["action"] == "long_press"
-    assert setup_actions.entries[-1]["ok"] is True
-
-
-# --- ТЕСТ TYPE_TEXT ---
-
-@pytest.mark.asyncio
 async def test_type_text_latin(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
     calls: list[str] = []
 
@@ -1066,61 +1045,6 @@ async def test_tap_element_prioritizes_visible(monkeypatch: pytest.MonkeyPatch):
 
 
 # --- ТЕСТ WAKE_AND_UNLOCK ---
-
-@pytest.mark.asyncio
-async def test_wake_and_unlock(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
-    calls: list[str] = []
-
-    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
-        calls.append(cmd)
-        return ""
-
-    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
-
-    await actions.wake_and_unlock("realme")
-    assert "input keyevent KEYCODE_WAKEUP" in calls
-    assert "wm dismiss-keyguard" in calls
-    assert "input keyevent 82" in calls
-    assert setup_actions.entries[0]["action"] == "wake_and_unlock"
-    assert setup_actions.entries[0]["ok"] is True
-
-
-# --- ТЕСТ SHELL & ALLOW_SHELL ---
-
-@pytest.mark.asyncio
-async def test_shell_disallowed(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
-    class SettingsDisallow:
-        allow_shell = False
-
-    monkeypatch.setattr(actions, "get_settings", lambda: SettingsDisallow())
-
-    with pytest.raises(PermissionError, match="allow_shell=False"):
-        await actions.shell("realme", "ls /")
-
-    assert len(setup_actions.entries) == 1
-    assert setup_actions.entries[0]["action"] == "shell"
-    assert setup_actions.entries[0]["ok"] is False
-
-
-@pytest.mark.asyncio
-async def test_shell_allowed(monkeypatch: pytest.MonkeyPatch, setup_actions: MockAudit):
-    class SettingsAllow:
-        allow_shell = True
-
-    monkeypatch.setattr(actions, "get_settings", lambda: SettingsAllow())
-
-    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
-        return "root\n"
-
-    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
-
-    out = await actions.shell("realme", "whoami")
-    assert out == "root\n"
-    assert setup_actions.entries[0]["action"] == "shell"
-    assert setup_actions.entries[0]["ok"] is True
-
-
-# --- ТЕСТ WAIT ---
 
 @pytest.mark.asyncio
 async def test_wait(setup_actions: MockAudit):
@@ -1954,31 +1878,6 @@ async def test_auto_ensure_awake_in_swipe(monkeypatch: pytest.MonkeyPatch):
     await actions.swipe("realme", 10, 20, 30, 40)
     assert any("input keyevent KEYCODE_WAKEUP" in c for c in calls)
     assert calls[-1] == "input swipe 10 20 30 40 300"
-
-
-@pytest.mark.asyncio
-async def test_auto_ensure_awake_in_long_press(monkeypatch: pytest.MonkeyPatch):
-    calls: list[str] = []
-    actions._screen_cache.clear()
-    state_asleep = True
-
-    async def mock_adb_shell(serial: str, cmd: str, timeout: float = 15.0) -> str:
-        nonlocal state_asleep
-        calls.append(cmd)
-        if "dumpsys power" in cmd:
-            if state_asleep:
-                return "mWakefulness=Asleep\n"
-            return "mWakefulness=Awake\n"
-        if "KEYCODE_WAKEUP" in cmd:
-            state_asleep = False
-            return ""
-        return ""
-
-    monkeypatch.setattr(actions, "adb_shell", mock_adb_shell)
-
-    await actions.long_press("realme", 15, 25)
-    assert any("input keyevent KEYCODE_WAKEUP" in c for c in calls)
-    assert "input swipe 15 25 15 25 800" in calls[-1]
 
 
 @pytest.mark.asyncio

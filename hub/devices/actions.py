@@ -16,34 +16,9 @@ from PIL import Image
 
 T = TypeVar("T")
 
-try:
-    from hub.audit import get_audit
-except (ImportError, ModuleNotFoundError):
-    get_audit = None  # type: ignore
-
-try:
-    from hub.config import get_settings
-except (ImportError, ModuleNotFoundError):
-    get_settings = None  # type: ignore
-
-try:
-    from hub.devices import adb
-    from hub.devices.adb import (
-        AdbError,
-        AdbTimeout,
-        DeviceOffline,
-        adb_shell,
-        connect,
-        run_adb,
-    )
-except (ImportError, ModuleNotFoundError):
-    adb = None  # type: ignore
-    adb_shell = None  # type: ignore
-    run_adb = None  # type: ignore
-    connect = None  # type: ignore
-    class AdbError(Exception): pass  # type: ignore
-    class DeviceOffline(AdbError): pass  # type: ignore
-    class AdbTimeout(AdbError): pass  # type: ignore
+from hub.audit import get_audit
+from hub.devices import adb
+from hub.devices.adb import AdbError, AdbTimeout, DeviceOffline, adb_shell, connect, run_adb
 
 _manager: Any = None
 audit: Any = None  # Хук для тестов или прямого переопределения аудита
@@ -60,8 +35,6 @@ KEY_CODES: dict[str, str] = {
     "volume": "KEYCODE_VOLUME_UP",
 }
 
-_SHELL_UNSAFE_CHARS = set(';&|`$"\'()<>\\!*?#~=\n\r\t')
-
 ADB_KEYBOARD_PACKAGE = "com.android.adbkeyboard"
 ADB_KEYBOARD_IME = "com.android.adbkeyboard/.AdbIME"
 _IME_SWITCH_DELAY: float = 0.5
@@ -72,7 +45,6 @@ _screenshot_inflight: dict[str, asyncio.Task[bytes]] = {}
 
 # Блокировки для ввода текста (переключение IME) по устройствам
 _type_text_locks: dict[str, asyncio.Lock] = {}
-_ime_locks = _type_text_locks
 
 
 def _get_type_text_lock(device_id: str) -> asyncio.Lock:
@@ -189,12 +161,7 @@ async def _reconnect_for_device(device_id: str) -> bool:
                 pass
 
         if host:
-            conn_fn = globals().get("connect")
-            if conn_fn is None and adb is not None:
-                conn_fn = getattr(adb, "connect", None)
-            if conn_fn is not None:
-                res = await conn_fn(host, port)
-                return bool(res)
+            return bool(await connect(host, port))
     except Exception:
         pass
     return False
@@ -238,7 +205,7 @@ async def _record_audit(
     """Безопасная запись действия в журнал аудита."""
     global audit
     try:
-        aud = audit if audit is not None else (get_audit() if get_audit is not None else None)
+        aud = audit if audit is not None else get_audit()
         if aud is not None:
             await aud.log(
                 actor=actor,
@@ -271,8 +238,6 @@ def _process_image_to_jpeg(raw_bytes: bytes, max_width: int) -> bytes:
 async def _raw_screenshot_pull(device_id: str) -> bytes:
     """Делает скриншот на телефоне через shell screencap и стягивает через adb pull."""
     serial = _get_serial(device_id)
-    if run_adb is None:
-        raise RuntimeError("Функция run_adb не доступна")
 
     safe_serial = re.sub(r"[^a-zA-Z0-9_-]", "_", serial or device_id)
     remote_path = f"/data/local/tmp/hub_{safe_serial}.png"
@@ -313,8 +278,6 @@ async def _raw_screenshot_pull(device_id: str) -> bytes:
 async def _raw_screenshot_exec_out(device_id: str) -> bytes:
     """Резервный скриншот через adb exec-out screencap -p."""
     serial = _get_serial(device_id)
-    if run_adb is None:
-        raise RuntimeError("Функция run_adb не доступна")
     raw_bytes = await run_adb(["exec-out", "screencap", "-p"], serial=serial, binary=True)
     if not isinstance(raw_bytes, bytes):
         raw_bytes = str(raw_bytes).encode("latin1")
@@ -422,8 +385,6 @@ def _parse_screen_off(dumpsys_output: str) -> bool:
 
 async def _check_swipe_lock(serial: str) -> bool:
     """Проверяет наличие экрана блокировки / keyguard при пробуждении."""
-    if adb_shell is None:
-        return False
     try:
         out = await adb_shell(
             serial,
@@ -475,8 +436,6 @@ async def ensure_awake(device_id: str, *, actor: str = "system") -> bool:
         token = _ensure_awake_ctx.set(active_devices | {device_id})
         try:
             serial = _get_serial(device_id)
-            if adb_shell is None:
-                raise RuntimeError("Функция adb_shell не доступна")
 
             cmd = 'dumpsys power | grep -E "mWakefulness|Display Power"'
             out = ""
@@ -547,8 +506,6 @@ async def power(device_id: str, action: str, *, actor: str = "system") -> None:
 
     async def _action() -> None:
         serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
 
         if act_lower == "wake":
             await adb_shell(serial, "input keyevent KEYCODE_WAKEUP")
@@ -611,8 +568,6 @@ async def tap(device_id: str, x: int, y: int, *, actor: str = "system") -> None:
     async def _action() -> None:
         await ensure_awake(device_id, actor=actor)
         serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
         await adb_shell(serial, f"input tap {x} {y}")
 
     await _execute_action(device_id, "tap", params, _action, actor=actor)
@@ -634,32 +589,9 @@ async def swipe(
     async def _action() -> None:
         await ensure_awake(device_id, actor=actor)
         serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
         await adb_shell(serial, f"input swipe {x1} {y1} {x2} {y2} {ms}")
 
     await _execute_action(device_id, "swipe", params, _action, actor=actor)
-
-
-async def long_press(
-    device_id: str,
-    x: int,
-    y: int,
-    ms: int = 800,
-    *,
-    actor: str = "system",
-) -> None:
-    """Выполняет долгое нажатие по координатам (x, y) длительностью ms миллисекунд."""
-    params = {"x": x, "y": y, "ms": ms}
-
-    async def _action() -> None:
-        await ensure_awake(device_id, actor=actor)
-        serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
-        await adb_shell(serial, f"input swipe {x} {y} {x} {y} {ms}")
-
-    await _execute_action(device_id, "long_press", params, _action, actor=actor)
 
 
 async def type_text(device_id: str, text: str, *, actor: str = "system") -> None:
@@ -669,8 +601,6 @@ async def type_text(device_id: str, text: str, *, actor: str = "system") -> None
     async def _action() -> None:
         await ensure_awake(device_id, actor=actor)
         serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
 
         if not text:
             return
@@ -721,8 +651,6 @@ async def key(device_id: str, name: str, *, actor: str = "system") -> None:
         if key_lower not in ("power", "keycode_power"):
             await ensure_awake(device_id, actor=actor)
         serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
         try:
             await adb_shell(serial, f"input keyevent {keycode}")
         finally:
@@ -739,8 +667,6 @@ async def open_app(device_id: str, package: str, *, actor: str = "system") -> No
     async def _action() -> None:
         await ensure_awake(device_id, actor=actor)
         serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
 
         quoted_pkg = shlex.quote(package)
         if "/" in package:
@@ -759,8 +685,6 @@ async def list_apps(device_id: str, *, actor: str = "system") -> list[str]:
 
     async def _action() -> list[str]:
         serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
 
         out = await adb_shell(serial, "pm list packages")
         apps: list[str] = []
@@ -786,8 +710,6 @@ async def open_url(device_id: str, url: str, *, actor: str = "system") -> None:
     async def _action() -> None:
         await ensure_awake(device_id, actor=actor)
         serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
         await adb_shell(serial, f"am start -a android.intent.action.VIEW -d {shlex.quote(url)}")
 
     await _execute_action(device_id, "open_url", params, _action, actor=actor)
@@ -800,8 +722,6 @@ async def ui_dump(device_id: str, *, actor: str = "system") -> list[dict]:
     async def _action() -> list[dict]:
         await ensure_awake(device_id, actor=actor)
         serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
 
         # 1. Удаляем старый файл перед дампом, чтобы не вернуть устаревший интерфейс при сбое
         await adb_shell(serial, "rm -f /sdcard/window_dump.xml")
@@ -952,45 +872,6 @@ async def tap_element(
     except Exception as e:
         await _record_audit(device_id, "tap_element", params, ok=False, error=str(e), actor=actor)
         raise
-
-
-async def wake_and_unlock(device_id: str, *, actor: str = "system") -> None:
-    """Пробуждает устройство и разблокирует экран."""
-    params: dict[str, Any] = {}
-
-    async def _action() -> None:
-        serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
-
-        await adb_shell(serial, "input keyevent KEYCODE_WAKEUP")
-        await adb_shell(serial, "wm dismiss-keyguard")
-        await adb_shell(serial, "input keyevent 82")
-        _screen_cache[device_id] = (True, time.monotonic())
-
-    await _execute_action(device_id, "wake_and_unlock", params, _action, actor=actor)
-
-
-async def shell(device_id: str, cmd: str, *, actor: str = "system") -> str:
-    """Выполняет произвольную команду shell на устройстве (только если allow_shell=True)."""
-    if get_settings is None:
-        raise RuntimeError("Модуль конфигурации недоступен")
-
-    settings = get_settings()
-    if not settings.allow_shell:
-        err = PermissionError("Выполнение shell-команд запрещено настройками (allow_shell=False)")
-        await _record_audit(device_id, "shell", {"cmd": cmd}, ok=False, error=str(err), actor=actor)
-        raise err
-
-    params = {"cmd": cmd}
-
-    async def _action() -> str:
-        serial = _get_serial(device_id)
-        if adb_shell is None:
-            raise RuntimeError("Функция adb_shell не доступна")
-        return await adb_shell(serial, cmd)
-
-    return await _execute_action(device_id, "shell", params, _action, actor=actor)
 
 
 async def wait(device_id: str, seconds: float, *, actor: str = "system") -> None:
