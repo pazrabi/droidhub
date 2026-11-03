@@ -74,11 +74,6 @@ except (ImportError, ModuleNotFoundError):
     TransportSecuritySettings = None  # type: ignore
 
 try:
-    from hub.api.routes import limiter
-except (ImportError, ModuleNotFoundError):
-    limiter = None  # type: ignore
-
-try:
     import hub.audit as audit_module
 except (ImportError, ModuleNotFoundError):
     audit_module = None  # type: ignore
@@ -135,7 +130,6 @@ _look_cache: dict[str, _LookCacheEntry] = {}
 _current_client: contextvars.ContextVar[Client | None] = contextvars.ContextVar(
     "_current_client", default=None
 )
-_session_clients: dict[str, Client] = {}
 
 
 def get_current_client() -> Client:
@@ -167,10 +161,10 @@ def _call_resolve_token(token: str, settings: Any = None) -> Client | None:
     token = token.strip()
     if not token:
         return None
+    current_fn = getattr(sys.modules.get(__name__), "resolve_token", resolve_token)
     auth_mod = sys.modules.get("hub.auth")
     auth_fn = getattr(auth_mod, "resolve_token", None) if auth_mod else None
-    current_fn = getattr(sys.modules.get(__name__), "resolve_token", resolve_token)
-    fn = auth_fn or current_fn or resolve_token
+    fn = current_fn or auth_fn or resolve_token
     if fn is not None:
         return fn(token, settings=settings)
     return None
@@ -328,14 +322,6 @@ if mcp_server is not None:
                 req = getattr(req_ctx, "request", None)
                 if req is not None and hasattr(req, "scope"):
                     client = req.scope.get("auth_client")
-                if client is None:
-                    session = getattr(req_ctx, "session", None)
-                    sess_id = (
-                        getattr(session, "session_id", None)
-                        or getattr(session, "mcp_session_id", None)
-                    )
-                    if sess_id and sess_id in _session_clients:
-                        client = _session_clients[sess_id]
         if client is None:
             client = _current_client.get() or Client(name="mcp")
 
@@ -816,23 +802,9 @@ class MCPAuthMiddleware:
             scope["path"] = new_path
             scope["raw_path"] = new_path.encode("latin1")
 
-        session_id_hdr = headers.get(b"mcp-session-id", b"").decode("latin1").strip()
-        if session_id_hdr:
-            _session_clients[session_id_hdr] = client
-
-        async def wrapped_send(message: Any) -> None:
-            if message.get("type") == "http.response.start":
-                for k, v in message.get("headers", []):
-                    if k.lower() == b"mcp-session-id":
-                        sess_id = v.decode("latin1").strip()
-                        if sess_id:
-                            _session_clients[sess_id] = client
-                        break
-            await send(message)
-
         tok = _current_client.set(client)
         try:
-            await self.app(scope, receive, wrapped_send)
+            await self.app(scope, receive, send)
         finally:
             _current_client.reset(tok)
 
