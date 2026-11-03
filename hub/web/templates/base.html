@@ -8,6 +8,25 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body class="dark-theme">
+  {% set _nav_items = nav_items if nav_items is defined else (nav_links if nav_links is defined else (get_nav_links(request if request is defined else None) if get_nav_links is defined else [])) %}
+  {% if _nav_items %}
+  <nav class="owner-nav-bar" id="owner-nav-bar" aria-label="Инструменты владельца">
+    <div class="owner-nav-container">
+      {% set _active_name = (nav_active if nav_active is defined else '') | lower %}
+      {% for item in _nav_items %}
+        {% set title = item.title if item.title is defined else item[0] %}
+        {% set url = item.url if item.url is defined else item[1] %}
+        {% set is_act = item.is_active if item.is_active is defined else (item.active if item.active is defined else (title | lower == _active_name and _active_name != '')) %}
+        {% if is_act %}
+          <span class="owner-nav-tab active" aria-current="page">{{ title }}</span>
+        {% else %}
+          <a href="{{ url }}" class="owner-nav-tab">{{ title }}</a>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </nav>
+  {% endif %}
+
   <header class="app-header">
     <div class="header-container">
       <div class="brand">

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import inspect
 from pathlib import Path
 from typing import Any, Optional
@@ -65,8 +66,79 @@ def require_web_user(request: Request) -> str:
     return user
 
 
+@dataclass
+class NavLinkItem:
+    """Элемент верхней навигационной полоски инструментов владельца."""
+    title: str
+    url: str
+    is_active: bool = False
+
+    @property
+    def name(self) -> str:
+        return self.title
+
+    @property
+    def active(self) -> bool:
+        return self.is_active
+
+    def __getitem__(self, idx: int | str) -> Any:
+        if idx == 0 or idx == "title" or idx == "name":
+            return self.title
+        if idx == 1 or idx == "url":
+            return self.url
+        if idx == 2 or idx == "is_active" or idx == "active":
+            return self.is_active
+        raise KeyError(idx)
+
+
+def get_nav_links(request: Request | None = None) -> list[NavLinkItem]:
+    """
+    Возвращает список элементов навигационной полоски переключателя инструментов
+    владельца (NavLinkItem) на основе настроек приложения или get_settings().
+    """
+    settings = None
+    if request is not None:
+        app = getattr(request, "app", None)
+        if app is not None:
+            settings = getattr(getattr(app, "state", None), "settings", None)
+
+    if settings is None:
+        try:
+            from hub.config import get_settings
+            settings = get_settings()
+        except Exception:
+            return []
+
+    parsed = getattr(settings, "parsed_nav_links", None)
+    if parsed is None:
+        try:
+            from hub.config import parse_nav_links
+            parsed = parse_nav_links(getattr(settings, "nav_links", ""))
+        except Exception:
+            return []
+
+    if not parsed:
+        return []
+
+    active_title = (getattr(settings, "nav_active", "") or "").strip().lower()
+    items: list[NavLinkItem] = []
+    for title, url in parsed:
+        is_active = bool(active_title and title.strip().lower() == active_title)
+        items.append(NavLinkItem(title=title, url=url, is_active=is_active))
+    return items
+
+
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+# Регистрация глобальных переменных шаблонизатора Jinja2
+templates.env.globals["get_nav_links"] = get_nav_links
+templates.env.globals["get_nav_items"] = get_nav_links
+try:
+    from hub.config import get_settings
+    templates.env.globals["get_settings"] = get_settings
+except Exception:
+    pass
 
 web_router = APIRouter()
 
@@ -78,10 +150,15 @@ async def login_page(request: Request, error: Optional[str] = None) -> Response:
     if user:
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
+    nav_links = get_nav_links(request)
     return templates.TemplateResponse(
         request=request,
         name="login.html",
-        context={"error": bool(error)},
+        context={
+            "error": bool(error),
+            "nav_links": nav_links,
+            "nav_items": nav_links,
+        },
     )
 
 
@@ -117,12 +194,15 @@ async def devices_page(request: Request) -> Response:
         except Exception:
             devices = []
 
+    nav_links = get_nav_links(request)
     return templates.TemplateResponse(
         request=request,
         name="index.html",
         context={
             "user": user,
             "devices": devices,
+            "nav_links": nav_links,
+            "nav_items": nav_links,
         },
     )
 
@@ -176,6 +256,7 @@ async def device_page(request: Request, device_id: str) -> Response:
     except Exception:
         pass
 
+    nav_links = get_nav_links(request)
     return templates.TemplateResponse(
         request=request,
         name="device.html",
@@ -184,6 +265,8 @@ async def device_page(request: Request, device_id: str) -> Response:
             "device_id": device_id,
             "device": device,
             "device_status": device_status,
+            "nav_links": nav_links,
+            "nav_items": nav_links,
         },
     )
 
@@ -194,4 +277,6 @@ __all__ = [
     "require_web_user",
     "get_user_from_request",
     "templates",
+    "get_nav_links",
+    "NavLinkItem",
 ]

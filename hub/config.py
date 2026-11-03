@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     from dotenv import dotenv_values
@@ -44,10 +45,48 @@ class Settings:
     alert_tag: str = "droidhub"
     public_url: str = ""
     client_tokens: str = ""
+    nav_links: str = ""
+    nav_active: str = ""
 
     def __post_init__(self) -> None:
         if self.public_url:
             self.public_url = self.public_url.strip().rstrip("/")
+
+    @property
+    def parsed_nav_links(self) -> list[tuple[str, str]]:
+        return parse_nav_links(self.nav_links)
+
+
+def parse_nav_links(raw: str) -> list[tuple[str, str]]:
+    """
+    Разбирает строку nav_links формата:
+    'Название|URL,Название|URL,...' в список пар (название, url).
+    Пустые и битые записи пропускаются.
+    URL принимаются только с протоколом http или https.
+    """
+    if not raw or not isinstance(raw, str):
+        return []
+
+    result: list[tuple[str, str]] = []
+    for item in raw.split(","):
+        entry = item.strip()
+        if not entry:
+            continue
+        parts = entry.split("|")
+        if len(parts) != 2:
+            continue
+        title = parts[0].strip()
+        url = parts[1].strip()
+        if not title or not url:
+            continue
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+                continue
+        except Exception:
+            continue
+        result.append((title, url))
+    return result
 
 
 def load_devices(path: str | Path = "config/devices.yaml") -> list[DeviceConfig]:
@@ -177,6 +216,8 @@ def get_settings(env_file: str | Path | None = None) -> Settings:
     alert_tag = get_val("HUB_ALERT_TAG", "droidhub").strip() or "droidhub"
     public_url = get_val("HUB_PUBLIC_URL", "").strip().rstrip("/")
     client_tokens = get_val("HUB_CLIENT_TOKENS", "").strip()
+    nav_links = get_val("HUB_NAV_LINKS", "").strip()
+    nav_active = get_val("HUB_NAV_ACTIVE", "").strip()
 
     return Settings(
         devices_file=get_val("HUB_DEVICES_FILE", "config/devices.yaml"),
@@ -200,7 +241,9 @@ def get_settings(env_file: str | Path | None = None) -> Settings:
         alert_tag=alert_tag,
         public_url=public_url,
         client_tokens=client_tokens,
+        nav_links=nav_links,
+        nav_active=nav_active,
     )
 
 
-__all__ = ["Settings", "get_settings", "DeviceConfig", "load_devices"]
+__all__ = ["Settings", "get_settings", "DeviceConfig", "load_devices", "parse_nav_links"]

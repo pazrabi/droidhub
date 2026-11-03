@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from hub.config import DeviceConfig, Settings, get_settings, load_devices
+from hub.config import DeviceConfig, Settings, get_settings, load_devices, parse_nav_links
 
 
 def test_device_config_dataclass() -> None:
@@ -94,6 +94,8 @@ def test_settings_defaults() -> None:
     assert settings.alert_tag == "droidhub"
     assert settings.public_url == ""
     assert settings.client_tokens == ""
+    assert settings.nav_links == ""
+    assert settings.nav_active == ""
 
 
 def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -111,6 +113,8 @@ def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
         "HUB_DB_PATH",
         "HUB_ENV_FILE",
         "HUB_CLIENT_TOKENS",
+        "HUB_NAV_LINKS",
+        "HUB_NAV_ACTIVE",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -125,6 +129,8 @@ def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HUB_DEVICES_FILE", "custom/devices.yaml")
     monkeypatch.setenv("HUB_DB_PATH", "custom/hub.db")
     monkeypatch.setenv("HUB_CLIENT_TOKENS", "pool:Abc-123_x:30:nopower")
+    monkeypatch.setenv("HUB_NAV_LINKS", "Gemini Pool|https://pool.molokohub.site/,DroidHub|https://droidhub.molokohub.site/")
+    monkeypatch.setenv("HUB_NAV_ACTIVE", "DroidHub")
 
     settings = get_settings()
     assert settings.admin_user == "superadmin"
@@ -138,6 +144,8 @@ def test_get_settings_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.devices_file == "custom/devices.yaml"
     assert settings.db_path == "custom/hub.db"
     assert settings.client_tokens == "pool:Abc-123_x:30:nopower"
+    assert settings.nav_links == "Gemini Pool|https://pool.molokohub.site/,DroidHub|https://droidhub.molokohub.site/"
+    assert settings.nav_active == "DroidHub"
 
 
 def test_get_settings_default_call(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -155,6 +163,8 @@ def test_get_settings_default_call(monkeypatch: pytest.MonkeyPatch) -> None:
         "HUB_DB_PATH",
         "HUB_ENV_FILE",
         "HUB_CLIENT_TOKENS",
+        "HUB_NAV_LINKS",
+        "HUB_NAV_ACTIVE",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -172,12 +182,24 @@ def test_get_settings_default_call(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.allow_shell is False
     assert settings.rate_limit_per_min == 60
     assert settings.client_tokens == ""
+    assert settings.nav_links == ""
+    assert settings.nav_active == ""
 
     # Проверяем чтение переменных окружения при вызове без аргументов
     monkeypatch.setenv("HUB_ADMIN_USER", "default_caller")
     monkeypatch.setenv("HUB_ALLOW_SHELL", "true")
     monkeypatch.setenv("HUB_RATE_LIMIT_PER_MIN", "45")
     monkeypatch.setenv("HUB_CLIENT_TOKENS", "default:tok_123")
+    monkeypatch.setenv("HUB_NAV_LINKS", "Pool|https://pool.molokohub.site/")
+    monkeypatch.setenv("HUB_NAV_ACTIVE", "Pool")
+
+    settings_env = get_settings()
+    assert settings_env.admin_user == "default_caller"
+    assert settings_env.allow_shell is True
+    assert settings_env.rate_limit_per_min == 45
+    assert settings_env.client_tokens == "default:tok_123"
+    assert settings_env.nav_links == "Pool|https://pool.molokohub.site/"
+    assert settings_env.nav_active == "Pool"
 
     settings_env = get_settings()
     assert settings_env.admin_user == "default_caller"
@@ -293,3 +315,124 @@ def test_get_settings_client_tokens(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("HUB_CLIENT_TOKENS", "custom:env_override_tok")
     settings_override = get_settings(env_file=env_file)
     assert settings_override.client_tokens == "custom:env_override_tok"
+
+
+def test_parse_nav_links_valid() -> None:
+    # Одиночная валидная запись
+    single = "Gemini Pool|https://pool.molokohub.site/"
+    assert parse_nav_links(single) == [("Gemini Pool", "https://pool.molokohub.site/")]
+
+    # Несколько записей с http и https
+    raw = "Gemini Pool|https://pool.molokohub.site/,DroidHub|http://droidhub.molokohub.site/"
+    assert parse_nav_links(raw) == [
+        ("Gemini Pool", "https://pool.molokohub.site/"),
+        ("DroidHub", "http://droidhub.molokohub.site/"),
+    ]
+
+    # Лишние пробелы вокруг запятых и пайпов
+    spaced = "  Gemini Pool  |  https://pool.molokohub.site/  ,  DroidHub  |  https://droidhub.molokohub.site/  "
+    assert parse_nav_links(spaced) == [
+        ("Gemini Pool", "https://pool.molokohub.site/"),
+        ("DroidHub", "https://droidhub.molokohub.site/"),
+    ]
+
+    # Ссылка с портом, путем, query параметрами
+    complex_url = "My Tool|https://hub.example.com:8080/dashboard?a=1&b=2#sec"
+    assert parse_nav_links(complex_url) == [
+        ("My Tool", "https://hub.example.com:8080/dashboard?a=1&b=2#sec")
+    ]
+
+
+def test_parse_nav_links_empty() -> None:
+    assert parse_nav_links("") == []
+    assert parse_nav_links("   ") == []
+    assert parse_nav_links(",,,,") == []
+    assert parse_nav_links(" ,  , , ") == []
+    assert parse_nav_links(None) == []  # type: ignore[arg-type]
+
+
+def test_parse_nav_links_broken() -> None:
+    # Запись без разделителя
+    assert parse_nav_links("ТолькоНазвание") == []
+
+    # Запись с пустым названием
+    assert parse_nav_links("|https://pool.molokohub.site/") == []
+    assert parse_nav_links("   |https://pool.molokohub.site/") == []
+
+    # Запись с пустым URL
+    assert parse_nav_links("DroidHub|") == []
+    assert parse_nav_links("DroidHub|   ") == []
+
+    # Лишние разделители (больше двух частей)
+    assert parse_nav_links("DroidHub|https://pool.molokohub.site/|extra") == []
+
+    # Некорректный URL без хоста/netloc
+    assert parse_nav_links("Broken|http://") == []
+    assert parse_nav_links("Broken|https://") == []
+
+    # Протоколы, отличные от http/https
+    assert parse_nav_links("FTP|ftp://files.example.com/pub") == []
+    assert parse_nav_links("Mail|mailto:user@example.com") == []
+    assert parse_nav_links("File|file:///etc/passwd") == []
+    assert parse_nav_links("Data|data:text/html,<h1>hi</h1>") == []
+    assert parse_nav_links("Relative|/device/1") == []
+
+    # Смесь валидных и битых записей: валидные остаются, битые пропускаются
+    mixed = (
+        "Good 1|https://one.example.com,"
+        "NoPipe,"
+        "|https://empty-title.com,"
+        "EmptyUrl|,"
+        "FTP|ftp://ftp.example.com,"
+        "Good 2|http://two.example.com:9000/test"
+    )
+    assert parse_nav_links(mixed) == [
+        ("Good 1", "https://one.example.com"),
+        ("Good 2", "http://two.example.com:9000/test"),
+    ]
+
+
+def test_parse_nav_links_javascript_rejected() -> None:
+    # javascript: схемы должны отбрасываться
+    assert parse_nav_links("Evil|javascript:alert(1)") == []
+    assert parse_nav_links("Evil|JAVASCRIPT:alert(document.cookie)") == []
+    assert parse_nav_links("Evil|JavaScript:void(0)") == []
+
+    # javascript: в смеси с валидной ссылкой
+    mixed = "Evil|javascript:alert(1),Safe|https://safe.example.com/"
+    assert parse_nav_links(mixed) == [("Safe", "https://safe.example.com/")]
+
+
+def test_get_settings_nav_links_env_and_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in ("HUB_NAV_LINKS", "HUB_NAV_ACTIVE", "HUB_ENV_FILE"):
+        monkeypatch.delenv(key, raising=False)
+
+    # 1. По умолчанию пусто
+    settings = get_settings()
+    assert settings.nav_links == ""
+    assert settings.nav_active == ""
+    assert settings.parsed_nav_links == []
+
+    # 2. Чтение из .env файла
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "HUB_NAV_LINKS=Pool|https://pool.molokohub.site/,DroidHub|https://droidhub.molokohub.site/\n"
+        "HUB_NAV_ACTIVE=DroidHub\n",
+        encoding="utf-8",
+    )
+    settings_file = get_settings(env_file=env_file)
+    assert settings_file.nav_links == "Pool|https://pool.molokohub.site/,DroidHub|https://droidhub.molokohub.site/"
+    assert settings_file.nav_active == "DroidHub"
+    assert len(settings_file.parsed_nav_links) == 2
+    assert settings_file.parsed_nav_links[0] == ("Pool", "https://pool.molokohub.site/")
+    assert settings_file.parsed_nav_links[1] == ("DroidHub", "https://droidhub.molokohub.site/")
+
+    # 3. Переменные окружения процесса имеют приоритет над .env
+    monkeypatch.setenv("HUB_NAV_LINKS", "Custom|https://custom.example.com/")
+    monkeypatch.setenv("HUB_NAV_ACTIVE", "Custom")
+    settings_override = get_settings(env_file=env_file)
+    assert settings_override.nav_links == "Custom|https://custom.example.com/"
+    assert settings_override.nav_active == "Custom"
+    assert settings_override.parsed_nav_links == [("Custom", "https://custom.example.com/")]
