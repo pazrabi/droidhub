@@ -98,7 +98,11 @@ class _Cdp:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[mid] = fut
         await self._ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
-        msg = await asyncio.wait_for(fut, timeout)
+        try:
+            msg = await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            self._pending.pop(mid, None)
+            raise BrowserError(f"Chrome на телефоне не ответил на {method} за {timeout:.0f} с")
         if "error" in msg:
             raise BrowserError(f"Chrome вернул ошибку на {method}: {msg['error'].get('message', msg['error'])}")
         return msg.get("result", {})
@@ -314,6 +318,20 @@ async def _collect_json(bodies: dict[str, asyncio.Task]) -> list[dict]:
     return out
 
 
+def _guarded(fn: Any) -> Any:
+    """Сетевые сбои на пути к DevTools (обрыв websocket, порт, HTTP) превращает в понятную ошибку."""
+
+    async def wrapper() -> Any:
+        try:
+            return await fn()
+        except (websockets.WebSocketException, httpx.HTTPError, OSError, asyncio.TimeoutError) as exc:
+            raise BrowserUnavailable(
+                f"Связь с Chrome на телефоне оборвалась ({type(exc).__name__}): повтори запрос"
+            ) from exc
+
+    return wrapper
+
+
 async def _locked(device_id: str, fn: Any) -> Any:
     lock = _get_lock(device_id)
     try:
@@ -361,17 +379,28 @@ async def fetch_page(
         async with _DevTools(serial) as dev:
             tab = await dev.new_tab("about:blank")
             cdp = None
+            nav: asyncio.Task | None = None
             bodies: dict[str, asyncio.Task] = {}
             try:
                 cdp = await dev.connect(tab)
                 await cdp.call("Page.enable")
                 await cdp.call("Network.enable", {"maxTotalBufferSize": 100_000_000, "maxResourceBufferSize": 20_000_000})
-                await cdp.call("Page.navigate", {"url": url}, timeout=30.0)
+                # Ответ на navigate у тяжёлых сайтов приходит поздно: не ждём его, а следим за сетью
+                nav = asyncio.create_task(cdp.call("Page.navigate", {"url": url}, timeout=wait_seconds + 15.0))
                 captured: dict[str, dict] = {}
                 finished = await _wait_for_page(
                     cdp, wait_seconds, captured, patterns, bodies, wait_for=wait_for, wait_full=wait_full
                 )
+                if nav.done() and not nav.cancelled() and nav.exception() is None:
+                    error_text = nav.result().get("errorText")
+                    if error_text:
+                        raise BrowserError(f"Страница не открылась на телефоне ({error_text}): проверь адрес и интернет")
                 result = await _read_page(cdp, max_chars)
+                if result["url"] in ("about:blank", ""):
+                    raise BrowserError(
+                        "Страница не начала загружаться на телефоне за отведённое время: "
+                        "сайт не отвечает или телефон медленно грузит его"
+                    )
                 if result["url"].startswith("chrome-error://"):
                     code = re.search(r"\b[A-Z][A-Z0-9_]{6,}\b", result["text"])
                     raise BrowserError(
@@ -383,6 +412,8 @@ async def fetch_page(
                 result["seconds"] = round(time.monotonic() - started, 1)
                 return result
             finally:
+                if nav is not None:
+                    nav.cancel()
                 for task in bodies.values():
                     task.cancel()
                 if cdp is not None:
@@ -390,7 +421,7 @@ async def fetch_page(
                 await dev.close_tab(tab["id"])
 
     return await actions._execute_action(
-        device_id, "fetch_page", params, lambda: _locked(device_id, _run), actor=actor
+        device_id, "fetch_page", params, lambda: _locked(device_id, _guarded(_run)), actor=actor
     )
 
 
@@ -406,7 +437,7 @@ async def browser_tabs(device_id: str, *, actor: str = "system") -> list[dict[st
             ]
 
     return await actions._execute_action(
-        device_id, "browser_tabs", {}, lambda: _locked(device_id, _run), actor=actor
+        device_id, "browser_tabs", {}, lambda: _locked(device_id, _guarded(_run)), actor=actor
     )
 
 
@@ -429,5 +460,5 @@ async def page_text(
                 await cdp.close()
 
     return await actions._execute_action(
-        device_id, "page_text", {"tab_index": tab_index}, lambda: _locked(device_id, _run), actor=actor
+        device_id, "page_text", {"tab_index": tab_index}, lambda: _locked(device_id, _guarded(_run)), actor=actor
     )

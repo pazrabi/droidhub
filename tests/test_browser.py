@@ -215,3 +215,41 @@ def test_api_tabs_and_text(client: TestClient, monkeypatch: pytest.MonkeyPatch) 
     res = client.get("/api/devices/realme/browser/text?tab_index=1")
     assert res.json() == {"text": "abc"}
     browser.page_text.assert_called_once_with("realme", 1, 200000, actor="bot")
+
+
+# --- сбои превращаются в понятные ошибки, а не в 500 ---
+
+async def test_cdp_call_timeout_is_browser_error() -> None:
+    class SilentWs:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(10)
+
+        async def send(self, data: str) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    cdp = browser._Cdp(SilentWs())
+    try:
+        with pytest.raises(browser.BrowserError, match="не ответил"):
+            await cdp.call("Page.navigate", {"url": "https://x.ru"}, timeout=0.1)
+    finally:
+        await cdp.close()
+
+
+async def test_guarded_maps_network_failures() -> None:
+    async def broken() -> None:
+        raise ConnectionResetError("reset")
+
+    with pytest.raises(browser.BrowserUnavailable, match="оборвалась"):
+        await browser._guarded(broken)()
+
+    async def slow() -> None:
+        raise asyncio.TimeoutError()
+
+    with pytest.raises(browser.BrowserUnavailable):
+        await browser._guarded(slow)()
