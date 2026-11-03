@@ -17,29 +17,10 @@ from hub.config import Settings, get_settings, load_devices
 from hub.devices import actions
 from hub.devices.adb import AdbError
 from hub.devices.manager import DeviceManager
-
-try:
-    from hub.mcp_server import create_mcp_app
-except (ImportError, ModuleNotFoundError):
-    create_mcp_app = None  # type: ignore
-
-# Контракты параллельной разработки
-try:
-    from hub.auth import auth_router
-except (ImportError, ModuleNotFoundError):
-    from fastapi import APIRouter
-    auth_router = APIRouter()
-
-try:
-    from hub.web.views import web_router
-except (ImportError, ModuleNotFoundError):
-    from fastapi import APIRouter
-    web_router = APIRouter()
-
-try:
-    from hub.sso_routes import sso_router
-except (ImportError, ModuleNotFoundError):
-    sso_router = None  # type: ignore
+from hub.auth import auth_router
+from hub.mcp_server import create_mcp_app
+from hub.sso_routes import sso_router
+from hub.web.views import web_router
 
 
 def _get_static_dir() -> Path:
@@ -63,15 +44,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     actions.set_manager(manager)
     monitor = AlertMonitor(manager=manager, settings=settings)
 
-    mcp_app = None
-    mcp_lifespan_ctx = None
-    if create_mcp_app is not None:
-        try:
-            mcp_app, mcp_lifespan_ctx = create_mcp_app(settings)
-        except (ImportError, ModuleNotFoundError, RuntimeError) as exc:
-            logging.getLogger(__name__).warning("MCP server initialization failed: %s", exc, exc_info=True)
-            mcp_app = None
-            mcp_lifespan_ctx = None
+    # Сбой MCP не должен ронять веб-панель и API
+    try:
+        mcp_app, mcp_lifespan_ctx = create_mcp_app(settings)
+    except (ImportError, RuntimeError):
+        logging.getLogger(__name__).warning("MCP server initialization failed", exc_info=True)
+        mcp_app = mcp_lifespan_ctx = None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -115,7 +93,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(api_router)
     app.include_router(auth_router)
     app.include_router(web_router)
-    if settings.sso_secret and sso_router is not None:
+    if settings.sso_secret:
         app.include_router(sso_router)
 
     # Статические файлы
@@ -123,7 +101,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if static_dir.is_dir():
         app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-    # MCP-сервер
     if mcp_app is not None:
         app.mount("/mcp", mcp_app)
 
