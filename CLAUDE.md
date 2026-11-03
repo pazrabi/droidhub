@@ -84,3 +84,22 @@ FastAPI-зависимости: `require_user(request) -> str` (логин из 
 
 ### ИЗМЕНЕНИЕ контракта hub/alerts.py (бот Telegram общий для нескольких проектов)
 Хаб ТОЛЬКО отправляет (`sendMessage`), НИКОГДА не вызывает `getUpdates`, не ставит webhook, не обрабатывает `callback_query` (иначе конфликт 409 и кража апдейтов у других проектов). Каждое сообщение начинается с префикса `[<alert_tag>]` (по умолчанию `droidhub`). Вместо callback-кнопок: inline-кнопка с `url` = `<public_url>/device/<id>` («Открыть панель»); если public_url пуст, кнопки нет. Новые поля Settings: `alert_tag: str = "droidhub"` (env `HUB_ALERT_TAG`), `public_url: str = ""` (env `HUB_PUBLIC_URL`). Автовыключение при `temp_shutdown_c` остаётся. В тревожном сообщении явно писать: «Зарядка не остановлена: при подключённом кабеле батарея продолжает заряжаться, отключи питание физически».
+
+## Контракты этапа 4: токены по клиентам (пул, Claude и др.)
+
+### hub/config.py
+Новое поле `Settings.client_tokens: str = ""` (env `HUB_CLIENT_TOKENS`). Формат: записи через запятую `имя:токен[:лимит_в_минуту[:флаги]]`, флаги через `+`; пример `pool:Abc-123_x:30:nopower`. Имя `[a-z0-9_-]+`, токен urlsafe-base64 (без `:` и `,`). Флаг `nopower` запрещает reboot/shutdown. Некорректные записи пропускать с предупреждением в лог (без токена в тексте).
+
+### hub/auth.py
+`@dataclass(frozen=True) class Client: name: str; rate_limit_per_min: int | None = None; allow_power: bool = True`.
+`parse_client_tokens(raw: str) -> dict[str, Client]` (ключ токен) и `resolve_token(token: str, settings=None) -> Client | None`: сначала токены из client_tokens, затем legacy `api_token` -> `Client("api")` и `mcp_token` -> `Client("mcp")`; сравнение constant-time (`hmac.compare_digest`) по всем кандидатам, пустые токены никогда не совпадают.
+`require_api` теперь использует `resolve_token` для Bearer, кладёт `request.state.client` (для сессии панели `Client(name=<логин>)`) и возвращает `client.name` как actor.
+
+### MCP (hub/mcp_server.py)
+Авторизация по Bearer и по пути `/mcp/<токен>` через `resolve_token`; actor во всех вызовах actions и audit = `client.name`; лимит действий в минуту: `client.rate_limit_per_min` если задан, иначе `settings.rate_limit_per_min`, считается на пару (клиент, устройство). Power-действий в MCP по-прежнему нет.
+
+### HTTP API (hub/api/routes.py)
+`POST /api/devices/{id}/power` с action `reboot`/`shutdown` -> 403 с русским текстом, если `request.state.client.allow_power` False. Лимит как в MCP (на клиента и устройство).
+
+### docs/agent-guide.md
+Инструкция для ИИ-агентов, использующих MCP хаба: порядок работы (`list_devices` → `look` → `tap_index`/`type_text` → снова `look`), когда скриншот, ввод русского, ожидания (`wait`), что нельзя (телефоны общие и реальные: не логиниться в важные аккаунты, не платить, не удалять данные, не менять настройки безопасности), лимиты и поведение при ошибках (оффлайн, 429), как завершать (вернуть телефон на домашний экран).
