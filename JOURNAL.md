@@ -81,3 +81,6 @@
 - Создан репозиторий `pazrabi/molokohub` (владелец создал вручную), оболочка запушена.
 - DroidHub: режим `?embed=1` (скрипт в base.html + CSS `html.embed`), заголовок `Content-Security-Policy: frame-ancestors 'self' https://molokohub.site` (настройка `HUB_FRAME_ANCESTORS`), тест. 354 теста проходят.
 - Написана `docs/embed-for-pool.md` для разработчика пула. На сервер ещё не выложено.
+
+## 2026-11-03 — рефакторинг хаба
+- `web/views.py`: убраны запасные реализации и дубли имён (355 → ~150 строк). `mcp_server.py` (850 строк) разбит на пакет `hub/mcp_server/` (context, ratelimit, look, auth, tools, app); mcp>=2.0. `main.py` без try/except импортов. `actions.py`: удалены неиспользуемые `shell`, `long_press`, `wake_and_unlock` и запасные заглушки импортов. JS разбит на `js/common.js`, `js/devices-list.js`, `js/device-page.js` + `app.js`; CSS: токены темы собраны в начале файла. Тесты 348 зелёные (минус 5 тестов удалённых функций).

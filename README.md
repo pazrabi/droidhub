@@ -251,7 +251,11 @@ droidhub/
 │   ├── config.py             # Настройки из .env и devices.yaml
 │   ├── auth.py               # Авторизация (сессии, Bearer-токены, хэширование)
 │   ├── audit.py              # Журнал аудита действий
+│   ├── alerts.py             # Оповещения Telegram, автовыключение при перегреве
+│   ├── sso.py, sso_routes.py # Единый вход molokohub (cookie, /sso/*)
 │   ├── cli.py                # Вспомогательный CLI для проверки
+│   ├── mcp_server/           # MCP: tools (инструменты), look, auth, ratelimit, context, app
+│   ├── web/                  # Страницы (views.py), шаблоны, static: style.css, app.js, js/*.js
 │   ├── devices/
 │   │   ├── adb.py            # Обёртка над ADB через asyncio subprocess
 │   │   ├── manager.py        # Менеджер устройств и мониторинг
