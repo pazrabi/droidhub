@@ -5,9 +5,16 @@
 {% block content %}
 <div class="devices-page">
   <div class="page-header">
-    <h1 class="page-title">Подключенные устройства</h1>
-    <button id="btn-refresh-devices" class="btn btn-outline btn-sm">↻ Обновить</button>
+    <div class="title-wrap">
+      <h1 class="page-title">DroidHub</h1>
+      <span class="status-pill" id="hub-status">онлайн</span>
+    </div>
+    <div class="page-actions">
+      <span class="updated" id="updated-at"></span>
+      <button id="btn-refresh-devices" class="btn btn-outline">↻ Обновить</button>
+    </div>
   </div>
+  <div class="section-label">Подключенные устройства</div>
 
   <div class="devices-grid" id="devices-container">
     {% if devices %}

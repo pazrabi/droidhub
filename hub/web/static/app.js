@@ -158,6 +158,20 @@
     let isUpdatingDevices = false;
     let pollTimer = null;
 
+    function setHubStatus(ok) {
+      const pill = document.getElementById('hub-status');
+      const upd = document.getElementById('updated-at');
+      if (pill) {
+        pill.textContent = ok ? 'онлайн' : 'нет связи';
+        pill.classList.toggle('is-bad', !ok);
+      }
+      if (ok && upd) {
+        const t = new Date();
+        upd.textContent = 'обновлено ' + String(t.getHours()).padStart(2, '0') + ':' + String(t.getMinutes()).padStart(2, '0');
+      }
+    }
+    setHubStatus(true);
+
     async function fetchDevicesList(manual = false) {
       if (isUpdatingDevices || (document.hidden && !manual)) {
         return;
@@ -175,8 +189,12 @@
           if (Array.isArray(devices)) {
             updateDevicesListDOM(devices);
           }
+          setHubStatus(true);
+        } else {
+          setHubStatus(false);
         }
       } catch (e) {
+        setHubStatus(false);
         console.warn('Ошибка обновления списка устройств:', e);
       } finally {
         isUpdatingDevices = false;

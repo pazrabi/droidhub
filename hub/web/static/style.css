@@ -1038,3 +1038,20 @@ body { font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
 /* Внутри molokohub: шапку и вкладки рисует оболочка, своя серая полоска не нужна */
 html.embed .app-header { display: none; }
 html.embed body { background: var(--bg-body); }
+
+/* Шапка страницы и кнопки как в Gemini Pool */
+:root { --ok: #1a8f4d; --ok-bg: #e4f5ea; --bad: #c8382d; --bad-bg: #fde8e6; }
+@media (prefers-color-scheme: dark) { :root { --ok: #4ccb82; --ok-bg: #12301f; --bad: #ff7b70; --bad-bg: #3a1a17; } }
+.page-header { flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+.title-wrap { display: flex; align-items: center; gap: 10px; }
+.page-title { font-size: 20px; font-weight: 700; margin: 0; }
+.status-pill { font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 999px; color: var(--ok); background: var(--ok-bg); }
+.status-pill.is-bad { color: var(--bad); background: var(--bad-bg); }
+.page-actions { display: flex; align-items: center; gap: 12px; }
+.updated { color: var(--text-secondary); font-size: 14px; }
+.section-label { font-size: 13px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text-secondary); margin: 0 0 12px; }
+.btn { font-weight: 400; font-size: 15px; padding: 6px 12px; border-radius: 8px; }
+.btn-sm { font-size: 14px; padding: 6px 12px; }
+.btn-xs { font-size: 13px; padding: 4px 10px; }
+.btn-outline { background-color: var(--bg-surface); border-color: var(--border-color); }
+.btn-outline:hover { background-color: var(--bg-surface); border-color: var(--accent-primary); }
