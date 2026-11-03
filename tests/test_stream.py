@@ -137,6 +137,7 @@ def test_stream_delivers_config_and_frames(stream_app: FastAPI, monkeypatch: pyt
             config = json.loads(ws.receive_text())
             assert config["type"] == "config"
             assert config["codec"] == "avc1.42c01f"
+            assert config["sps"] and config["pps"]
             assert (config["width"], config["height"]) == (540, 1200)
             assert (config["real_width"], config["real_height"]) == (720, 1600)
             key = ws.receive_bytes()

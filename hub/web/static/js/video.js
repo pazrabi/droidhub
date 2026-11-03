@@ -1,8 +1,49 @@
-// DroidHub — живое видео экрана: WebSocket с H.264 (Annex B) -> WebCodecs VideoDecoder -> canvas
+// DroidHub — живое видео экрана: WebSocket с H.264 -> WebCodecs VideoDecoder (AVCC) -> canvas
 (function () {
   'use strict';
 
   const FRAME_DURATION_US = 33333;
+
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  // Описание декодера (avcC) из SPS и PPS: так формат понимают все браузеры, включая Safari
+  function buildAvcC(sps, pps) {
+    const out = new Uint8Array(11 + sps.length + pps.length);
+    let o = 0;
+    out.set([1, sps[1], sps[2], sps[3], 0xFF, 0xE1, sps.length >> 8, sps.length & 0xFF], o); o += 8;
+    out.set(sps, o); o += sps.length;
+    out.set([1, pps.length >> 8, pps.length & 0xFF], o); o += 3;
+    out.set(pps, o);
+    return out;
+  }
+
+  // Annex B (00 00 00 01 + NAL) -> AVCC (4 байта длины + NAL); SPS и PPS уже в описании, их выкидываем
+  function annexbToAvcc(data) {
+    const nals = [];
+    let start = -1;
+    for (let i = 0; i + 3 < data.length; i++) {
+      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+        if (start >= 0) nals.push(data.subarray(start, i));
+        start = i + 4;
+        i += 3;
+      }
+    }
+    if (start >= 0) nals.push(data.subarray(start));
+    const kept = nals.filter((n) => { const t = n[0] & 0x1F; return t !== 7 && t !== 8; });
+    const out = new Uint8Array(kept.reduce((sum, n) => sum + 4 + n.length, 0));
+    let o = 0;
+    for (const n of kept) {
+      out[o] = n.length >>> 24; out[o + 1] = (n.length >>> 16) & 0xFF; out[o + 2] = (n.length >>> 8) & 0xFF; out[o + 3] = n.length & 0xFF;
+      out.set(n, o + 4);
+      o += 4 + n.length;
+    }
+    return out;
+  }
 
   class VideoStream {
     static supported() {
@@ -53,7 +94,11 @@
     }
 
     async _configure(msg) {
-      const config = { codec: msg.codec, optimizeForLatency: true, avc: { format: 'annexb' } };
+      const config = {
+        codec: msg.codec,
+        optimizeForLatency: true,
+        description: buildAvcC(b64ToBytes(msg.sps), b64ToBytes(msg.pps)),
+      };
       const support = await VideoDecoder.isConfigSupported(config);
       if (!support.supported) throw new Error(`кодек ${msg.codec} не поддерживается`);
       this._closeDecoder();
@@ -98,7 +143,7 @@
       this.decoder.decode(new EncodedVideoChunk({
         type: isKey ? 'key' : 'delta',
         timestamp: this.counter++ * FRAME_DURATION_US,
-        data: bytes.subarray(1),
+        data: annexbToAvcc(bytes.subarray(1)),
       }));
     }
   }

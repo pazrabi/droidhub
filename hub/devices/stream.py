@@ -30,6 +30,8 @@ class StreamInfo:
     width: int
     height: int
     codec: str = ""
+    sps: bytes = b""
+    pps: bytes = b""
 
 
 @dataclass
@@ -95,9 +97,10 @@ class StreamSession:
     def _on_frames(self, units: list[tuple[bool, bytes]], splitter: AnnexBSplitter) -> None:
         for is_key, data in units:
             if is_key:
-                codec = codec_string(splitter.sps or b"\x00\x00\x00\x00")
-                if codec != self.info.codec:
-                    self.info.codec = codec
+                sps, pps = splitter.sps or b"", splitter.pps or b""
+                if (sps, pps) != (self.info.sps, self.info.pps):
+                    self.info.sps, self.info.pps = sps, pps
+                    self.info.codec = codec_string(sps) if sps else ""
                     self._publish("config", self.info)
                 self._gop = []
             elif not self._gop:

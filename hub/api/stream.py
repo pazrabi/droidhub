@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -41,6 +42,7 @@ def stream_size(width: int, real_width: int, real_height: int) -> tuple[int, int
 def config_message(info: StreamInfo, real_width: int, real_height: int) -> str:
     return json.dumps({
         "type": "config", "codec": info.codec, "width": info.width, "height": info.height,
+        "sps": base64.b64encode(info.sps).decode(), "pps": base64.b64encode(info.pps).decode(),
         "real_width": real_width, "real_height": real_height,
     })
 
