@@ -50,6 +50,75 @@ a:hover {
   text-decoration: underline;
 }
 
+/* Верхняя полоска вкладок-переключателя между инструментами владельца */
+.owner-nav-bar {
+  background-color: #0b1329;
+  border-bottom: 1px solid #1a2540;
+  height: 56px;
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.owner-nav-container {
+  max-width: 1200px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0 1rem;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  overflow-x: auto;
+  white-space: nowrap;
+  flex-wrap: nowrap;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+
+.owner-nav-container::-webkit-scrollbar {
+  display: none;
+}
+
+.owner-nav-tab {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1;
+  color: #c5d1e8;
+  background-color: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 9999px;
+  padding: 6px 14px;
+  text-decoration: none;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.owner-nav-tab:hover {
+  background-color: rgba(255, 255, 255, 0.16);
+  color: #ffffff;
+  border-color: rgba(255, 255, 255, 0.28);
+  text-decoration: none;
+}
+
+.owner-nav-tab.active {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: #ffffff;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0 4px;
+  cursor: default;
+  pointer-events: none;
+  user-select: none;
+  letter-spacing: -0.01em;
+}
+
 /* Header */
 .app-header {
   background-color: var(--bg-surface);

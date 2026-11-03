@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 import pytest
 from starlette.middleware.sessions import SessionMiddleware
 
-from hub.config import DeviceConfig
+from hub.config import DeviceConfig, Settings
 from hub.devices import actions
 from hub.devices.manager import DeviceManager, DeviceStatus
 from hub.web.views import (
@@ -657,3 +657,195 @@ def test_power_css_styling() -> None:
     assert ".modal-backdrop" in css
     assert ".modal-window" in css
     assert ".modal-warning-text" in css
+
+
+# =====================================================================
+# 10. Тесты верхней полоски переключателя инструментов владельца
+# =====================================================================
+
+
+def test_owner_nav_bar_absent_when_nav_links_empty(
+    mock_manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """При пустом nav_links полоска вкладок отсутствует на всех страницах."""
+    monkeypatch.delenv("HUB_NAV_LINKS", raising=False)
+    monkeypatch.delenv("HUB_NAV_ACTIVE", raising=False)
+
+    app = create_web_app(mock_manager)
+    client = TestClient(app)
+
+    # 1. На странице логина
+    res_login = client.get("/login")
+    assert res_login.status_code == 200
+    assert "owner-nav-bar" not in res_login.text
+    assert "owner-nav-tab" not in res_login.text
+
+    # 2. На главной странице
+    client.post("/test-login")
+    res_index = client.get("/")
+    assert res_index.status_code == 200
+    assert "owner-nav-bar" not in res_index.text
+    assert "owner-nav-tab" not in res_index.text
+
+    # 3. На странице устройства
+    res_device = client.get("/device/realme")
+    assert res_device.status_code == 200
+    assert "owner-nav-bar" not in res_device.text
+    assert "owner-nav-tab" not in res_device.text
+
+
+def test_owner_nav_bar_present_when_nav_links_set(
+    mock_manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    При заданных ссылках полоска отображается:
+    - активная вкладка подсвечена (.active) и не кликабельна (без тега <a>/href),
+    - остальные ссылки открываются в той же вкладке (без target=_blank, без rel="noopener").
+    """
+    monkeypatch.setenv(
+        "HUB_NAV_LINKS",
+        "Gemini Pool|https://pool.molokohub.site/,DroidHub|https://droidhub.molokohub.site/",
+    )
+    monkeypatch.setenv("HUB_NAV_ACTIVE", "DroidHub")
+
+    app = create_web_app(mock_manager)
+    client = TestClient(app)
+    client.post("/test-login")
+
+    response = client.get("/")
+    assert response.status_code == 200
+    html = response.text
+
+    # Полоска присутствует
+    assert 'class="owner-nav-bar"' in html or "owner-nav-bar" in html
+
+    # Активная вкладка DroidHub: подсвечена и БЕЗ ссылки
+    assert "DroidHub" in html
+    assert 'class="owner-nav-tab active"' in html
+    # DroidHub не должен быть кликабельной ссылкой
+    assert '<a href="https://droidhub.molokohub.site/"' not in html
+    assert '<a href="https://droidhub.molokohub.site/">DroidHub</a>' not in html
+    assert '<span class="owner-nav-tab active" aria-current="page">DroidHub</span>' in html
+
+    # Неактивная вкладка Gemini Pool: кликабельная ссылка в той же вкладке
+    assert '<a href="https://pool.molokohub.site/" class="owner-nav-tab">Gemini Pool</a>' in html
+    # Никаких target=_blank и rel=noopener
+    assert 'target="_blank"' not in html
+    assert 'rel="noopener"' not in html
+
+
+def test_owner_nav_bar_case_insensitive_active(
+    mock_manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Активная вкладка определяется без учёта регистра символов."""
+    monkeypatch.setenv(
+        "HUB_NAV_LINKS",
+        "Gemini Pool|https://pool.molokohub.site/,DroidHub|https://droidhub.molokohub.site/",
+    )
+
+    app = create_web_app(mock_manager)
+    client = TestClient(app)
+    client.post("/test-login")
+
+    # Нижний регистр: droidhub
+    monkeypatch.setenv("HUB_NAV_ACTIVE", "droidhub")
+    res_lower = client.get("/")
+    assert '<span class="owner-nav-tab active" aria-current="page">DroidHub</span>' in res_lower.text
+    assert '<a href="https://droidhub.molokohub.site/"' not in res_lower.text
+
+    # Верхний регистр: DROIDHUB
+    monkeypatch.setenv("HUB_NAV_ACTIVE", "DROIDHUB")
+    res_upper = client.get("/")
+    assert '<span class="owner-nav-tab active" aria-current="page">DroidHub</span>' in res_upper.text
+    assert '<a href="https://droidhub.molokohub.site/"' not in res_upper.text
+
+    # Переключение на gemini pool (без учета регистра)
+    monkeypatch.setenv("HUB_NAV_ACTIVE", "gemini pool")
+    res_pool = client.get("/")
+    assert '<span class="owner-nav-tab active" aria-current="page">Gemini Pool</span>' in res_pool.text
+    assert '<a href="https://pool.molokohub.site/"' not in res_pool.text
+    assert '<a href="https://droidhub.molokohub.site/" class="owner-nav-tab">DroidHub</a>' in res_pool.text
+
+
+def test_owner_nav_bar_on_login_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """На странице входа полоска тоже показывается."""
+    monkeypatch.setenv(
+        "HUB_NAV_LINKS",
+        "Gemini Pool|https://pool.molokohub.site/,DroidHub|https://droidhub.molokohub.site/",
+    )
+    monkeypatch.setenv("HUB_NAV_ACTIVE", "DroidHub")
+
+    app = create_web_app()
+    client = TestClient(app)
+
+    response = client.get("/login")
+    assert response.status_code == 200
+    html = response.text
+
+    # Полоска на странице логина
+    assert "owner-nav-bar" in html
+    assert '<span class="owner-nav-tab active" aria-current="page">DroidHub</span>' in html
+    assert '<a href="https://pool.molokohub.site/" class="owner-nav-tab">Gemini Pool</a>' in html
+
+
+def test_owner_nav_bar_from_app_settings(mock_manager: DeviceManager) -> None:
+    """Полоска корректно получает настройки через app.state.settings."""
+    app = create_web_app(mock_manager)
+    app.state.settings = Settings(
+        nav_links="Pool|https://pool.example.com,Hub|https://hub.example.com",
+        nav_active="Hub",
+    )
+    client = TestClient(app)
+    client.post("/test-login")
+
+    response = client.get("/")
+    assert response.status_code == 200
+    html = response.text
+
+    assert "owner-nav-bar" in html
+    assert '<span class="owner-nav-tab active" aria-current="page">Hub</span>' in html
+    assert '<a href="https://pool.example.com" class="owner-nav-tab">Pool</a>' in html
+
+
+def test_owner_nav_bar_broken_and_javascript_links_skipped(
+    mock_manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Битые ссылки и javascript: схемы отбрасываются при рендеринге страницы."""
+    monkeypatch.setenv(
+        "HUB_NAV_LINKS",
+        "Safe|https://safe.example.com,Evil|javascript:alert(1),Broken|,|NoTitle",
+    )
+    monkeypatch.setenv("HUB_NAV_ACTIVE", "Safe")
+
+    app = create_web_app(mock_manager)
+    client = TestClient(app)
+    client.post("/test-login")
+
+    response = client.get("/")
+    assert response.status_code == 200
+    html = response.text
+
+    assert "owner-nav-bar" in html
+    assert "Safe" in html
+    assert "javascript" not in html
+    assert "Evil" not in html
+    assert "Broken" not in html
+
+
+def test_owner_nav_bar_css_styling() -> None:
+    """Проверка CSS-стилей для верхней полоски: высота ~56px, тёмно-синий фон, таблетки, скролл."""
+    app = create_web_app()
+    client = TestClient(app)
+
+    res_css = client.get("/static/style.css")
+    assert res_css.status_code == 200
+    css = res_css.text
+
+    assert ".owner-nav-bar" in css
+    assert "56px" in css
+    assert "#0b1329" in css
+    assert ".owner-nav-container" in css
+    assert "overflow-x: auto" in css
+    assert ".owner-nav-tab" in css
+    assert ".owner-nav-tab.active" in css
+    assert "border-radius: 9999px" in css
