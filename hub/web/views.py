@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import inspect
 from pathlib import Path
 from typing import Any, Optional
+import urllib.parse
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -11,7 +12,7 @@ from fastapi.templating import Jinja2Templates
 
 # Импорт зависимости авторизации по контракту CLAUDE.md / PLAN.md
 try:
-    from hub.auth import require_user
+    from hub.auth import get_sso_user, require_user
 except (ImportError, ModuleNotFoundError):
     def require_user(request: Request) -> str:
         """Fallback зависимости require_user, если hub.auth еще не создан."""
@@ -28,14 +29,68 @@ except (ImportError, ModuleNotFoundError):
             detail="Требуется авторизация",
         )
 
+    def get_sso_user(request: Request, settings: Any = None) -> Optional[str]:
+        return None
+
+
+def get_settings_from_request(request: Request | None = None) -> Any:
+    """Возвращает настройки приложения из request.app.state.settings или get_settings()."""
+    if request is not None:
+        scope = getattr(request, "scope", None)
+        app = scope.get("app") if isinstance(scope, dict) else None
+        if app is not None:
+            settings = getattr(getattr(app, "state", None), "settings", None)
+            if settings is not None:
+                return settings
+
+    try:
+        from hub.config import get_settings
+        return get_settings()
+    except Exception:
+        return None
+
+
+def get_current_full_url(request: Request) -> str:
+    """Возвращает текущий полный URL с учетом возможных proxy-заголовков."""
+    proto = request.headers.get("x-forwarded-proto")
+    host = request.headers.get("x-forwarded-host")
+    if proto and host:
+        path = request.url.path
+        query = request.url.query
+        return f"{proto}://{host}{path}" + (f"?{query}" if query else "")
+    return str(request.url)
+
+
+def build_sso_redirect_url(request: Request, settings: Any = None) -> str:
+    """Формирует URL редиректа на SSO-логин с параметром next=<urlencoded текущий полный URL>."""
+    if settings is None:
+        settings = get_settings_from_request(request)
+    sso_login_url = (getattr(settings, "sso_login_url", "") or "").strip() or "/sso/login"
+    current_url = get_current_full_url(request)
+    encoded_next = urllib.parse.quote(current_url, safe="")
+    sep = "&" if "?" in sso_login_url else "?"
+    return f"{sso_login_url}{sep}next={encoded_next}"
+
+
+def get_login_redirect_url(request: Request, settings: Any = None) -> str:
+    """Возвращает URL для перенаправления неавторизованного пользователя (/login или SSO)."""
+    if settings is None:
+        settings = get_settings_from_request(request)
+    sso_secret = (getattr(settings, "sso_secret", "") or "").strip()
+    if sso_secret:
+        return build_sso_redirect_url(request, settings)
+    return "/login"
+
 
 def get_user_from_request(request: Request) -> Optional[str]:
     """
-    Проверяет наличие авторизованного пользователя в сессии через require_user
+    Проверяет наличие авторизованного пользователя в сессии или через SSO cookie
     (с поддержкой переопределения через app.dependency_overrides в тестах).
     Возвращает имя пользователя или None.
     """
-    override = getattr(request.app, "dependency_overrides", {}).get(require_user)
+    scope = getattr(request, "scope", None)
+    app = scope.get("app") if isinstance(scope, dict) else None
+    override = getattr(app, "dependency_overrides", {}).get(require_user) if app is not None else None
     if override is not None:
         try:
             sig = inspect.signature(override)
@@ -54,14 +109,14 @@ def get_user_from_request(request: Request) -> Optional[str]:
 
 def require_web_user(request: Request) -> str:
     """
-    FastAPI dependency для веб-страниц: требует сессию пользователя,
-    иначе инициирует редирект 303 на /login.
+    FastAPI dependency для веб-страниц: требует сессию пользователя или SSO,
+    иначе инициирует редирект 303 на /login (или SSO-логин).
     """
     user = get_user_from_request(request)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_303_SEE_OTHER,
-            headers={"Location": "/login"},
+            headers={"Location": get_login_redirect_url(request)},
         )
     return user
 
@@ -150,6 +205,14 @@ async def login_page(request: Request, error: Optional[str] = None) -> Response:
     if user:
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
+    settings = get_settings_from_request(request)
+    sso_secret = (getattr(settings, "sso_secret", "") or "").strip()
+    if sso_secret:
+        return RedirectResponse(
+            url=build_sso_redirect_url(request, settings),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
     nav_links = get_nav_links(request)
     return templates.TemplateResponse(
         request=request,
@@ -167,7 +230,10 @@ async def devices_page(request: Request) -> Response:
     """Главная страница панели: список устройств со статусами."""
     user = get_user_from_request(request)
     if not user:
-        return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(
+            url=get_login_redirect_url(request),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
 
     manager = getattr(request.app.state, "manager", None)
     if manager is None:
@@ -212,7 +278,10 @@ async def device_page(request: Request, device_id: str) -> Response:
     """Страница управления устройством: экран, кнопки, ввод текста, приложения."""
     user = get_user_from_request(request)
     if not user:
-        return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse(
+            url=get_login_redirect_url(request),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
 
     manager = getattr(request.app.state, "manager", None)
     if manager is None:
@@ -276,6 +345,10 @@ __all__ = [
     "require_user",
     "require_web_user",
     "get_user_from_request",
+    "get_settings_from_request",
+    "get_current_full_url",
+    "build_sso_redirect_url",
+    "get_login_redirect_url",
     "templates",
     "get_nav_links",
     "NavLinkItem",

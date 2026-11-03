@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 import pytest
 from starlette.middleware.sessions import SessionMiddleware
 
+import hub.auth
+from hub import sso
 from hub.config import DeviceConfig, Settings
 from hub.devices import actions
 from hub.devices.manager import DeviceManager, DeviceStatus
@@ -849,3 +851,236 @@ def test_owner_nav_bar_css_styling() -> None:
     assert ".owner-nav-tab" in css
     assert ".owner-nav-tab.active" in css
     assert "border-radius: 9999px" in css
+
+
+# =====================================================================
+# 11. Тесты этапа 5: единый вход (SSO), редиректы и аутентификация в вебе
+# =====================================================================
+
+
+def create_full_web_app(manager: DeviceManager | None = None) -> FastAPI:
+    """Создает приложение с веб-роутером, auth_router и api_router для комплексных тестов."""
+    from hub.api.routes import api_router
+    from hub.auth import auth_router
+
+    app = create_web_app(manager)
+    app.include_router(auth_router)
+    app.include_router(api_router)
+    return app
+
+
+def _setup_web_sso_mock(
+    monkeypatch: pytest.MonkeyPatch,
+    secret: str = "test_sso_secret",
+    login_url: str = "https://molokohub.site/sso/login",
+    cookie_domain: str = ".molokohub.site",
+    cookie_name: str = "molokohub_sso",
+) -> None:
+    monkeypatch.setattr(Settings, "sso_secret", secret, raising=False)
+    monkeypatch.setattr(Settings, "sso_login_url", login_url, raising=False)
+    monkeypatch.setattr(Settings, "sso_cookie_domain", cookie_domain, raising=False)
+    monkeypatch.setattr(Settings, "sso_cookie_name", cookie_name, raising=False)
+
+    def mock_verify_cookie(value: str, sec: str, now: float | None = None) -> str | None:
+        if sec != secret:
+            return None
+        if value == "valid_web_sso_cookie":
+            return "sso_user_alice"
+        return None
+
+    monkeypatch.setattr(sso, "verify_cookie", mock_verify_cookie, raising=False)
+
+
+def test_web_index_with_valid_sso_cookie(
+    mock_manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET / с валидным SSO-cookie открывает страницу панели (200 OK, отображает имя)."""
+    _setup_web_sso_mock(monkeypatch)
+    app = create_web_app(mock_manager)
+    client = TestClient(app)
+    client.cookies.set("molokohub_sso", "valid_web_sso_cookie")
+
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "Подключенные устройства" in response.text
+    assert "sso_user_alice" in response.text
+    assert "Realme C21Y" in response.text
+
+
+def test_web_device_with_valid_sso_cookie(
+    mock_manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /device/{id} с валидным SSO-cookie открывает экран устройства (200 OK)."""
+    _setup_web_sso_mock(monkeypatch)
+    app = create_web_app(mock_manager)
+    client = TestClient(app)
+    client.cookies.set("molokohub_sso", "valid_web_sso_cookie")
+
+    response = client.get("/device/realme")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "Realme C21Y" in response.text
+    assert "sso_user_alice" in response.text
+
+
+def test_web_login_page_with_valid_sso_cookie_redirects_to_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Если пользователь уже авторизован по SSO, локальный /login редиректит 303 на /."""
+    _setup_web_sso_mock(monkeypatch)
+    app = create_web_app()
+    client = TestClient(app)
+    client.cookies.set("molokohub_sso", "valid_web_sso_cookie")
+
+    response = client.get("/login", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+
+
+def test_web_forged_sso_cookie_rejected_and_redirects(
+    mock_manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Поддельный SSO-cookie отвергается; при включенном SSO запрос редиректит на SSO-логин."""
+    _setup_web_sso_mock(monkeypatch)
+    app = create_web_app(mock_manager)
+    client = TestClient(app)
+    client.cookies.set("molokohub_sso", "forged_evil_cookie")
+
+    # Главная страница
+    res_index = client.get("/", follow_redirects=False)
+    assert res_index.status_code == 303
+    assert res_index.headers["location"] == "https://molokohub.site/sso/login?next=http%3A%2F%2Ftestserver%2F"
+
+    # Страница устройства
+    res_dev = client.get("/device/realme", follow_redirects=False)
+    assert res_dev.status_code == 303
+    assert res_dev.headers["location"] == "https://molokohub.site/sso/login?next=http%3A%2F%2Ftestserver%2Fdevice%2Frealme"
+
+
+def test_web_redirect_with_correct_next_parameters(
+    mock_manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    При непустом sso_secret страницы панели без сессии и SSO-cookie
+    редиректят на sso_login_url?next=<urlencoded текущий полный URL>,
+    а локальный GET /login тоже редиректит туда.
+    """
+    _setup_web_sso_mock(monkeypatch)
+    app = create_web_app(mock_manager)
+    client = TestClient(app)
+
+    # 1. GET / -> next=http%3A%2F%2Ftestserver%2F
+    res1 = client.get("/", follow_redirects=False)
+    assert res1.status_code == 303
+    assert res1.headers["location"] == "https://molokohub.site/sso/login?next=http%3A%2F%2Ftestserver%2F"
+
+    # 2. GET /device/realme -> next=http%3A%2F%2Ftestserver%2Fdevice%2Frealme
+    res2 = client.get("/device/realme", follow_redirects=False)
+    assert res2.status_code == 303
+    assert res2.headers["location"] == "https://molokohub.site/sso/login?next=http%3A%2F%2Ftestserver%2Fdevice%2Frealme"
+
+    # 3. GET /device/realme?tab=apps&filter=system -> сохраняет и кодирует query string
+    res3 = client.get("/device/realme?tab=apps&filter=system", follow_redirects=False)
+    assert res3.status_code == 303
+    assert res3.headers["location"] == (
+        "https://molokohub.site/sso/login?next=http%3A%2F%2Ftestserver%2Fdevice%2Frealme%3Ftab%3Dapps%26filter%3Dsystem"
+    )
+
+    # 4. Локальный GET /login при включенном SSO тоже редиректит туда
+    res4 = client.get("/login", follow_redirects=False)
+    assert res4.status_code == 303
+    assert res4.headers["location"] == "https://molokohub.site/sso/login?next=http%3A%2F%2Ftestserver%2Flogin"
+
+
+def test_web_api_unauthenticated_returns_401_not_redirect(
+    mock_manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    /api без аутентификации по-прежнему возвращает 401 (не редирект),
+    даже при включенном SSO. Поддельный cookie даёт 401, валидный даёт 200.
+    """
+    _setup_web_sso_mock(monkeypatch)
+    app = create_full_web_app(mock_manager)
+    client = TestClient(app)
+
+    # 1. Запрос без авторизации -> 401 (НЕ 302/303)
+    res_no_auth = client.get("/api/devices")
+    assert res_no_auth.status_code == 401
+    assert res_no_auth.json()["detail"] == "Не авторизован"
+    assert "location" not in res_no_auth.headers
+
+    # 2. Запрос с поддельным cookie -> 401
+    client.cookies.set("molokohub_sso", "bad_forged_cookie")
+    res_bad = client.get("/api/devices")
+    assert res_bad.status_code == 401
+    assert "location" not in res_bad.headers
+
+    # 3. Запрос с валидным SSO-cookie -> 200
+    client.cookies.set("molokohub_sso", "valid_web_sso_cookie")
+    res_ok = client.get("/api/devices")
+    assert res_ok.status_code == 200
+    devices_data = res_ok.json()
+    assert isinstance(devices_data, list)
+    assert len(devices_data) == 2
+
+
+def test_web_disabled_sso_original_behavior(
+    mock_manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Если sso_secret пуст, поведение полностью как сейчас (редиректы на /login, форма входа)."""
+    _setup_web_sso_mock(monkeypatch, secret="")
+    app = create_web_app(mock_manager)
+    client = TestClient(app)
+
+    # 1. GET / без сессии редиректит на /login
+    res1 = client.get("/", follow_redirects=False)
+    assert res1.status_code == 303
+    assert res1.headers["location"] == "/login"
+
+    # 2. GET /device/{id} без сессии редиректит на /login
+    res2 = client.get("/device/realme", follow_redirects=False)
+    assert res2.status_code == 303
+    assert res2.headers["location"] == "/login"
+
+    # 3. GET /login отдает форму 200 OK (не редирект)
+    res3 = client.get("/login")
+    assert res3.status_code == 200
+    assert "Вход в DroidHub" in res3.text
+    assert '<form action="/login"' in res3.text
+
+    # 4. Наличие SSO-cookie при выключенном SSO не дает доступ
+    client.cookies.set("molokohub_sso", "valid_web_sso_cookie")
+    res4 = client.get("/", follow_redirects=False)
+    assert res4.status_code == 303
+    assert res4.headers["location"] == "/login"
+
+
+def test_web_logout_deletes_sso_cookie_with_domain(
+    mock_manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /logout панели дополнительно удаляет SSO-cookie (с domain=sso_cookie_domain)."""
+    _setup_web_sso_mock(
+        monkeypatch,
+        secret="test_sso_secret",
+        cookie_name="molokohub_sso",
+        cookie_domain=".molokohub.site",
+    )
+    app = create_full_web_app(mock_manager)
+    client = TestClient(app)
+
+    # Авторизуемся через сессию
+    client.post("/test-login")
+
+    # Выполняем POST /logout
+    res = client.post("/logout", follow_redirects=False)
+    assert res.status_code == 303
+    assert res.headers["location"] == "/login"
+
+    set_cookies = res.headers.get_list("set-cookie") if hasattr(res.headers, "get_list") else [res.headers.get("set-cookie", "")]
+    all_set_cookie = " ".join(set_cookies)
+
+    assert "molokohub_sso" in all_set_cookie
+    assert "Domain=.molokohub.site" in all_set_cookie
+    assert "Max-Age=0" in all_set_cookie or "expires=" in all_set_cookie
+
