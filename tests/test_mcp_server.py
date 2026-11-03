@@ -9,7 +9,9 @@ from fastapi.testclient import TestClient
 from hub.config import DeviceConfig, Settings
 from hub.devices import actions
 from hub.devices.manager import DeviceManager, DeviceStatus
+from hub.audit import get_audit, init_audit
 import hub.mcp_server as mcp_mod
+from hub.mcp_server import Client
 from hub.main import create_app
 
 
@@ -615,4 +617,401 @@ async def test_tap_index_invalid_index(mock_device_manager) -> None:
 
     with pytest.raises(ValueError, match="(?i)сначала вызови look"):
         await mcp_mod.tap_index("realme", 999)
+
+
+# --- 5. Проверка авторизации по токенам клиентов (Этап 4) ---
+
+def test_auth_unknown_token_401(test_settings: Settings, monkeypatch) -> None:
+    """Неизвестный токен возвращает 401 как по Bearer, так и по пути /mcp/<token>."""
+    def fake_resolve(token: str, settings: Settings | None = None) -> Client | None:
+        if token == "known-token":
+            return Client(name="test_client")
+        return None
+
+    monkeypatch.setattr(mcp_mod, "resolve_token", fake_resolve)
+    app = create_app(test_settings)
+
+    with TestClient(app) as client:
+        # 1. Неизвестный Bearer -> 401
+        r_bearer = client.post("/mcp/", headers={"Authorization": "Bearer unknown-token-xyz"})
+        assert r_bearer.status_code == 401
+        assert "WWW-Authenticate" in r_bearer.headers
+
+        # 2. Неизвестный токен в пути -> 401
+        r_path = client.post("/mcp/unknown-token-xyz/")
+        assert r_path.status_code == 401
+
+        # 3. Неизвестный токен без слэша в пути -> 401
+        r_path_noslash = client.post("/mcp/unknown-token-xyz")
+        assert r_path_noslash.status_code == 401
+
+
+def test_auth_empty_token_401(test_settings: Settings, monkeypatch) -> None:
+    """Пустой токен (в заголовке или в пути) возвращает 401, когда сервер включен."""
+    def fake_resolve(token: str, settings: Settings | None = None) -> Client | None:
+        if token == "valid-token":
+            return Client(name="valid_client")
+        return None
+
+    monkeypatch.setattr(mcp_mod, "resolve_token", fake_resolve)
+    app = create_app(test_settings)
+
+    with TestClient(app) as client:
+        # 1. Пустой Bearer -> 401
+        r1 = client.post("/mcp/", headers={"Authorization": "Bearer "})
+        assert r1.status_code == 401
+
+        # 2. Bearer только с пробелами -> 401
+        r2 = client.post("/mcp/", headers={"Authorization": "Bearer    "})
+        assert r2.status_code == 401
+
+        # 3. Путь /mcp/ без токена и заголовка -> 401
+        r3 = client.post("/mcp/")
+        assert r3.status_code == 401
+
+        # 4. Путь /mcp/   / с пробелами -> 401
+        r4 = client.post("/mcp/   /")
+        assert r4.status_code == 401
+
+
+def test_two_clients_with_different_actors_and_limits(
+    test_settings: Settings,
+    mock_device_manager,
+    monkeypatch,
+) -> None:
+    """Два клиента с разными actor и лимитами: авторизация по Bearer и пути, actor передается в actions, проверка разных лимитов."""
+    mcp_mod.limiter.reset()
+    clients_db = {
+        "token-pool": Client(name="pool", rate_limit_per_min=5, allow_power=True),
+        "token-claude": Client(name="claude", rate_limit_per_min=2, allow_power=False),
+    }
+
+    def fake_resolve(token: str, settings: Settings | None = None) -> Client | None:
+        return clients_db.get(token)
+
+    monkeypatch.setattr(mcp_mod, "resolve_token", fake_resolve)
+    app = create_app(test_settings)
+
+    with patch("hub.devices.actions.tap", new_callable=AsyncMock) as mock_tap:
+        with TestClient(app) as client:
+            # Клиент 1: pool через Bearer токен (лимит 5)
+            r1 = client.post(
+                "/mcp/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "c1", "version": "1.0"},
+                    },
+                },
+                headers={
+                    "Authorization": "Bearer token-pool",
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+            assert r1.status_code == 200
+            sess_pool = r1.headers.get("mcp-session-id")
+
+            # Вызов 1 pool -> успешно (1 из 5)
+            r2 = client.post(
+                "/mcp/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "tap",
+                        "arguments": {"device_id": "realme", "x": 100, "y": 200},
+                    },
+                },
+                headers={
+                    "Authorization": "Bearer token-pool",
+                    "mcp-session-id": sess_pool,
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+            assert r2.status_code == 200
+            assert '"isError":false' in r2.text
+            mock_tap.assert_called_once_with("realme", 100, 200, actor="pool")
+
+            # Клиент 2: claude через путь /mcp/<token> (лимит 2)
+            mock_tap.reset_mock()
+            r3 = client.post(
+                "/mcp/token-claude/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "c2", "version": "1.0"},
+                    },
+                },
+                headers={"Accept": "application/json, text/event-stream"},
+            )
+            assert r3.status_code == 200
+            sess_claude = r3.headers.get("mcp-session-id")
+
+            # Вызов 1 claude -> успешно (1 из 2)
+            r4 = client.post(
+                "/mcp/token-claude/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "tap",
+                        "arguments": {"device_id": "realme", "x": 50, "y": 70},
+                    },
+                },
+                headers={
+                    "mcp-session-id": sess_claude,
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+            assert r4.status_code == 200
+            assert '"isError":false' in r4.text
+            mock_tap.assert_called_once_with("realme", 50, 70, actor="claude")
+
+            # Вызов 2 claude -> успешно (2 из 2)
+            mock_tap.reset_mock()
+            r5 = client.post(
+                "/mcp/token-claude/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "tap",
+                        "arguments": {"device_id": "realme", "x": 51, "y": 71},
+                    },
+                },
+                headers={
+                    "mcp-session-id": sess_claude,
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+            assert r5.status_code == 200
+            assert '"isError":false' in r5.text
+            mock_tap.assert_called_once_with("realme", 51, 71, actor="claude")
+
+            # Вызов 3 claude -> ошибка превышения лимита (порог 2 исчерпан)
+            mock_tap.reset_mock()
+            r6 = client.post(
+                "/mcp/token-claude/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "tap",
+                        "arguments": {"device_id": "realme", "x": 52, "y": 72},
+                    },
+                },
+                headers={
+                    "mcp-session-id": sess_claude,
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+            assert r6.status_code == 200
+            assert '"isError":true' in r6.text
+            mock_tap.assert_not_called()
+
+            # Клиент pool (лимит 5) продолжает успешно выполнять действия (вызовы 2, 3, 4, 5)
+            for req_id, x in enumerate([101, 102, 103, 104], start=7):
+                mock_tap.reset_mock()
+                r_pool = client.post(
+                    "/mcp/",
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "tap",
+                            "arguments": {"device_id": "realme", "x": x, "y": 200},
+                        },
+                    },
+                    headers={
+                        "Authorization": "Bearer token-pool",
+                        "mcp-session-id": sess_pool,
+                        "Accept": "application/json, text/event-stream",
+                    },
+                )
+                assert r_pool.status_code == 200
+                assert '"isError":false' in r_pool.text
+                mock_tap.assert_called_once_with("realme", x, 200, actor="pool")
+
+            # Вызов 6 pool -> превышение лимита pool (порог 5 исчерпан)
+            mock_tap.reset_mock()
+            r_pool_blocked = client.post(
+                "/mcp/",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 20,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "tap",
+                        "arguments": {"device_id": "realme", "x": 999, "y": 999},
+                    },
+                },
+                headers={
+                    "Authorization": "Bearer token-pool",
+                    "mcp-session-id": sess_pool,
+                    "Accept": "application/json, text/event-stream",
+                },
+            )
+            assert r_pool_blocked.status_code == 200
+            assert '"isError":true' in r_pool_blocked.text
+            mock_tap.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_actor_in_audit_records(
+    test_settings: Settings,
+    mock_device_manager,
+    monkeypatch,
+) -> None:
+    """Actor во всех вызовах actions и audit равен client.name (а не 'mcp')."""
+    init_audit(":memory:")
+    c_pool = Client(name="pool", rate_limit_per_min=10)
+    c_claude = Client(name="claude", rate_limit_per_min=10)
+
+    # 1. Вызовы под клиентом pool
+    with mcp_mod.client_context(c_pool):
+        # list_devices логирует audit
+        await mcp_mod.list_devices()
+
+        # look логирует audit
+        dump_data = [{"class": "TextView", "text": "Кнопка", "center": [10, 20]}]
+        with patch("hub.devices.actions.ui_dump", new_callable=AsyncMock, return_value=dump_data):
+            await mcp_mod.look("realme")
+
+        # tap_index логирует audit и вызывает actions.tap с actor='pool'
+        with patch("hub.devices.actions.tap", new_callable=AsyncMock) as mock_tap:
+            await mcp_mod.tap_index("realme", 1)
+            mock_tap.assert_called_once_with("realme", 10, 20, actor="pool")
+
+    # 2. Вызовы под клиентом claude
+    with mcp_mod.client_context(c_claude):
+        await mcp_mod.list_devices()
+
+        with patch("hub.devices.actions.swipe", new_callable=AsyncMock) as mock_swipe:
+            await mcp_mod.swipe("realme", 1, 2, 3, 4)
+            mock_swipe.assert_called_once_with("realme", 1, 2, 3, 4, ms=300, actor="claude")
+
+    aud = get_audit()
+    assert aud is not None
+    entries = await aud.recent(limit=20)
+    actors = [e["actor"] for e in entries]
+
+    # Проверяем, что в записях есть 'pool' и 'claude', и нет константы 'mcp'
+    assert "pool" in actors
+    assert "claude" in actors
+    assert "mcp" not in actors
+
+
+@pytest.mark.asyncio
+async def test_rate_limits_independence(
+    test_settings: Settings,
+    mock_device_manager,
+    monkeypatch,
+) -> None:
+    """Лимит действий считается на пару (клиент, устройство); один клиент не должен расходовать лимит другого."""
+    mcp_mod.limiter.reset()
+
+    c_pool = Client(name="pool", rate_limit_per_min=2)
+    c_claude = Client(name="claude", rate_limit_per_min=2)
+
+    # Pool выполняет 2 действия на realme (лимит 2)
+    with mcp_mod.client_context(c_pool):
+        with patch("hub.devices.actions.tap", new_callable=AsyncMock):
+            await mcp_mod.tap("realme", 1, 1)
+            await mcp_mod.tap("realme", 2, 2)
+            # 3-е действие pool на realme превышает лимит
+            with pytest.raises(RuntimeError, match="Превышен лимит"):
+                await mcp_mod.tap("realme", 3, 3)
+
+    # Claude на realme НЕ должен пострадать от исчерпания лимита клиентом pool!
+    with mcp_mod.client_context(c_claude):
+        with patch("hub.devices.actions.tap", new_callable=AsyncMock):
+            await mcp_mod.tap("realme", 10, 10)
+            await mcp_mod.tap("realme", 20, 20)
+            # 3-е действие claude на realme превышает его собственный лимит
+            with pytest.raises(RuntimeError, match="Превышен лимит"):
+                await mcp_mod.tap("realme", 30, 30)
+
+    # Pool на другом устройстве (redmi) не исчерпан: лимит на пару (клиент, устройство)
+    with mcp_mod.client_context(c_pool):
+        with patch("hub.devices.actions.tap", new_callable=AsyncMock):
+            await mcp_mod.tap("redmi", 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_fallback_rate_limit_from_settings(
+    test_settings: Settings,
+    mock_device_manager,
+    monkeypatch,
+) -> None:
+    """Если client.rate_limit_per_min не задан (None), используется settings.rate_limit_per_min."""
+    mcp_mod.limiter.reset()
+
+    c_no_limit = Client(name="client_no_limit", rate_limit_per_min=None)
+
+    with patch("hub.mcp_server.get_settings") as mock_get_settings:
+        mock_get_settings.return_value = Settings(rate_limit_per_min=2)
+        with mcp_mod.client_context(c_no_limit):
+            with patch("hub.devices.actions.tap", new_callable=AsyncMock):
+                await mcp_mod.tap("realme", 1, 1)
+                await mcp_mod.tap("realme", 2, 2)
+                with pytest.raises(RuntimeError, match="Превышен лимит"):
+                    await mcp_mod.tap("realme", 3, 3)
+
+
+def test_token_not_logged_anywhere(
+    test_settings: Settings,
+    caplog,
+    monkeypatch,
+) -> None:
+    """Токены авторизации не логируются в логах сервера."""
+    secret_token = "super-secret-token-value-xyz987"
+    app = create_app(test_settings)
+
+    with caplog.at_level("DEBUG"):
+        with TestClient(app) as client:
+            client.post("/mcp/", headers={"Authorization": f"Bearer {secret_token}"})
+
+    # Сервер не должен логировать токен ни в одном лог-сообщении
+    server_records = [r for r in caplog.records if not r.name.startswith("httpx")]
+    for record in server_records:
+        assert secret_token not in record.message
+        assert secret_token not in str(record.args)
+
+
+def test_monkeypatch_resolve_token_priority_over_hub_auth(
+    test_settings: Settings,
+    monkeypatch,
+) -> None:
+    """Заглушка через monkeypatch в mcp_mod.resolve_token имеет приоритет над hub.auth.resolve_token."""
+    import sys
+    import types
+
+    fake_auth = types.ModuleType("hub.auth")
+    fake_auth.resolve_token = lambda tok, settings=None: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "hub.auth", fake_auth)
+
+    c_custom = Client(name="custom_user")
+    monkeypatch.setattr(
+        mcp_mod,
+        "resolve_token",
+        lambda tok, settings=None: c_custom if tok == "my-tok" else None,
+    )
+
+    resolved = mcp_mod._call_resolve_token("my-tok", settings=test_settings)
+    assert resolved == c_custom
+    assert resolved.name == "custom_user"
+
 
