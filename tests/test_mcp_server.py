@@ -223,39 +223,16 @@ def test_direct_mcp_app_routing(test_settings: Settings) -> None:
         assert r3.status_code == 200
 
 
-def test_check_and_rewrite_path_logic() -> None:
-    """_check_and_rewrite_path всегда возвращает remaining без добавления prefix /mcp."""
+def test_extract_path_token_logic() -> None:
+    """_extract_path_token возвращает токен из пути и остаток пути без префикса /mcp."""
+    extract = mcp_mod.MCPAuthMiddleware._extract_path_token
     token = "secret123"
-
-    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path(f"/mcp/{token}/", token)
-    assert ok is True
-    assert rewritten == "/"
-
-    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path(f"/mcp/{token}", token)
-    assert ok is True
-    assert rewritten == "/"
-
-    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path(f"/{token}/", token)
-    assert ok is True
-    assert rewritten == "/"
-
-    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path(f"/{token}", token)
-    assert ok is True
-    assert rewritten == "/"
-
-    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path(f"/mcp/{token}/sse", token)
-    assert ok is True
-    assert rewritten == "/sse"
-
-    # Неверный токен или отсутствие токена
-    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path("/mcp/wrong/", token)
-    assert ok is False
-
-    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path("/mcp/", token)
-    assert ok is False
-
-    ok, rewritten = mcp_mod.MCPAuthMiddleware._check_and_rewrite_path("/", token)
-    assert ok is False
+    for path in (f"/mcp/{token}/", f"/mcp/{token}", f"/{token}/", f"/{token}"):
+        assert extract(path) == (token, "/")
+    assert extract(f"/mcp/{token}/sse") == (token, "/sse")
+    # Нет токена в пути
+    assert extract("/mcp/") == ("", "/mcp/")
+    assert extract("/") == ("", "/")
 
 
 @pytest.mark.asyncio
@@ -628,7 +605,7 @@ def test_auth_unknown_token_401(test_settings: Settings, monkeypatch) -> None:
             return Client(name="test_client")
         return None
 
-    monkeypatch.setattr(mcp_mod, "resolve_token", fake_resolve)
+    monkeypatch.setattr("hub.mcp_server.auth.resolve_token", fake_resolve)
     app = create_app(test_settings)
 
     with TestClient(app) as client:
@@ -653,7 +630,7 @@ def test_auth_empty_token_401(test_settings: Settings, monkeypatch) -> None:
             return Client(name="valid_client")
         return None
 
-    monkeypatch.setattr(mcp_mod, "resolve_token", fake_resolve)
+    monkeypatch.setattr("hub.mcp_server.auth.resolve_token", fake_resolve)
     app = create_app(test_settings)
 
     with TestClient(app) as client:
@@ -689,7 +666,7 @@ def test_two_clients_with_different_actors_and_limits(
     def fake_resolve(token: str, settings: Settings | None = None) -> Client | None:
         return clients_db.get(token)
 
-    monkeypatch.setattr(mcp_mod, "resolve_token", fake_resolve)
+    monkeypatch.setattr("hub.mcp_server.auth.resolve_token", fake_resolve)
     app = create_app(test_settings)
 
     with patch("hub.devices.actions.tap", new_callable=AsyncMock) as mock_tap:
@@ -961,7 +938,7 @@ async def test_fallback_rate_limit_from_settings(
 
     c_no_limit = Client(name="client_no_limit", rate_limit_per_min=None)
 
-    with patch("hub.mcp_server.get_settings") as mock_get_settings:
+    with patch("hub.mcp_server.ratelimit.get_settings") as mock_get_settings:
         mock_get_settings.return_value = Settings(rate_limit_per_min=2)
         with mcp_mod.client_context(c_no_limit):
             with patch("hub.devices.actions.tap", new_callable=AsyncMock):
@@ -989,29 +966,3 @@ def test_token_not_logged_anywhere(
     for record in server_records:
         assert secret_token not in record.message
         assert secret_token not in str(record.args)
-
-
-def test_monkeypatch_resolve_token_priority_over_hub_auth(
-    test_settings: Settings,
-    monkeypatch,
-) -> None:
-    """Заглушка через monkeypatch в mcp_mod.resolve_token имеет приоритет над hub.auth.resolve_token."""
-    import sys
-    import types
-
-    fake_auth = types.ModuleType("hub.auth")
-    fake_auth.resolve_token = lambda tok, settings=None: None  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "hub.auth", fake_auth)
-
-    c_custom = Client(name="custom_user")
-    monkeypatch.setattr(
-        mcp_mod,
-        "resolve_token",
-        lambda tok, settings=None: c_custom if tok == "my-tok" else None,
-    )
-
-    resolved = mcp_mod._call_resolve_token("my-tok", settings=test_settings)
-    assert resolved == c_custom
-    assert resolved.name == "custom_user"
-
-
