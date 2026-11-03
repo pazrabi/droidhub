@@ -101,6 +101,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         https_only=cookie_secure,
     )
 
+    # Встраивание в iframe единого сайта molokohub (только свои домены)
+    frame_ancestors = os.getenv("HUB_FRAME_ANCESTORS", "'self' https://molokohub.site")
+
+    @app.middleware("http")
+    async def _frame_policy(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = f"frame-ancestors {frame_ancestors}"
+        return response
+
     # Подключение роутеров
     app.include_router(public_router)
     app.include_router(api_router)

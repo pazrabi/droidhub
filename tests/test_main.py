@@ -222,3 +222,12 @@ def test_mcp_initialization_unexpected_error_not_swallowed(monkeypatch: pytest.M
     settings = Settings(db_path=":memory:", devices_file="")
     with pytest.raises(TypeError, match="Unexpected type error"):
         main_mod.create_app(settings)
+
+
+def test_frame_ancestors_header_allows_only_own_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(db_path=":memory:", devices_file="")
+    monkeypatch.setattr("hub.main.get_settings", lambda: settings)
+    monkeypatch.delenv("HUB_FRAME_ANCESTORS", raising=False)
+    with TestClient(app_factory()) as client:
+        csp = client.get("/health").headers.get("content-security-policy", "")
+    assert csp == "frame-ancestors 'self' https://molokohub.site"

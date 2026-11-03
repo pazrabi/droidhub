@@ -1001,3 +1001,8 @@ a:hover {
   justify-content: flex-end;
   gap: 0.75rem;
 }
+
+/* Режим встраивания в molokohub (?embed=1): общая шапка у внешнего сайта */
+html.embed .owner-nav-bar,
+html.embed .app-footer,
+html.embed .logout-form { display: none; }

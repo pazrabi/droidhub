@@ -76,3 +76,8 @@
 - Подключить MCP хаба к Claude (токен из /opt/phone-hub/.env).
 - Этап 2: auth.py, веб-панель, API routes, main.py, deploy-файлы. Этап 3: mcp_server.py, README.
 - Этап 0 с владельцем: ОС сервера, домен, Tailscale, подготовка телефонов (docs/phone-setup.md).
+
+## 2026-11-03 — molokohub, фаза 1 (сторона DroidHub)
+- Создан репозиторий `pazrabi/molokohub` (владелец создал вручную), оболочка запушена.
+- DroidHub: режим `?embed=1` (скрипт в base.html + CSS `html.embed`), заголовок `Content-Security-Policy: frame-ancestors 'self' https://molokohub.site` (настройка `HUB_FRAME_ANCESTORS`), тест. 354 теста проходят.
+- Написана `docs/embed-for-pool.md` для разработчика пула. На сервер ещё не выложено.

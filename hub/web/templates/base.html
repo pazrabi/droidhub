@@ -6,6 +6,17 @@
   <meta name="color-scheme" content="dark">
   <title>{% block title %}DroidHub{% endblock %}</title>
   <link rel="stylesheet" href="/static/style.css">
+  <script>
+    // Режим ?embed=1: панель внутри единого сайта molokohub (без своей шапки). Запоминается на вкладку.
+    (function () {
+      try {
+        if (location.search.indexOf('embed=1') >= 0) sessionStorage.setItem('hub.embed', '1');
+        if (window.self !== window.top && sessionStorage.getItem('hub.embed') === '1') {
+          document.documentElement.classList.add('embed');
+        }
+      } catch (e) {}
+    })();
+  </script>
 </head>
 <body class="dark-theme">
   {% set _nav_items = nav_items if nav_items is defined else (nav_links if nav_links is defined else (get_nav_links(request if request is defined else None) if get_nav_links is defined else [])) %}
