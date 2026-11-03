@@ -13,10 +13,16 @@ from hub.devices.h264 import AnnexBSplitter, codec_string
 logger = logging.getLogger(__name__)
 
 TIME_LIMIT_S = 180  # потолок screenrecord; по истечении процесс перезапускается
-IDLE_FLUSH_S = 0.2  # короткие паузы бывают и внутри кадра (замер: до 70 мс), поэтому ждём с запасом
+# Сколько ждать продолжения, прежде чем считать накопленный NAL целым. Внутри больших кадров бывают паузы
+# в сотни миллисекунд (замер: 350 мс на кадре 16+ КБ), поэтому чем больше накоплено, тем дольше ждём.
+IDLE_FLUSH_STEPS = ((4_000, 0.15), (12_000, 0.5), (float("inf"), 1.2))
 QUEUE_SIZE = 400
 GOP_LIMIT = 300  # кадров от последнего ключевого; больше не держим
 RESTART_DELAY_S = 0.3
+
+
+def _idle_timeout(pending: int) -> float:
+    return next(t for limit, t in IDLE_FLUSH_STEPS if pending < limit)
 
 
 @dataclass
@@ -124,7 +130,7 @@ class StreamSession:
                 assert self._proc.stdout is not None
                 while True:
                     try:
-                        chunk = await asyncio.wait_for(self._proc.stdout.read(65536), IDLE_FLUSH_S)
+                        chunk = await asyncio.wait_for(self._proc.stdout.read(65536), _idle_timeout(splitter.pending_size()))
                     except asyncio.TimeoutError:
                         self._on_frames(splitter.flush_tail(), splitter)
                         continue

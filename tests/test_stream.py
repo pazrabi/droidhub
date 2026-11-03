@@ -85,6 +85,17 @@ def test_splitter_flush_then_new_start_code_is_fine() -> None:
     assert not sp.corrupt
 
 
+def test_idle_timeout_grows_with_pending_size() -> None:
+    assert stream_mod._idle_timeout(100) < stream_mod._idle_timeout(8_000) < stream_mod._idle_timeout(50_000)
+
+
+def test_splitter_pending_size() -> None:
+    sp = AnnexBSplitter()
+    assert sp.pending_size() == 0
+    sp.feed(annexb(SPS, PPS) + START_CODE + SLICE)
+    assert sp.pending_size() == len(SLICE)
+
+
 def test_splitter_skips_delta_before_parameter_sets() -> None:
     assert AnnexBSplitter().feed(annexb(IDR, SLICE, SLICE)) == [(False, annexb(SLICE))]
 

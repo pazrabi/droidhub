@@ -71,6 +71,11 @@ class AnnexBSplitter:
             del self._buf[:-3]  # мусор до первого стартового кода
         return units
 
+    def pending_size(self) -> int:
+        """Сколько байт последнего (возможно неполного) NAL уже накоплено."""
+        ranges = self._nal_ranges()
+        return ranges[-1][1] - ranges[-1][0] if ranges else 0
+
     def flush_tail(self, allow_key: bool = False) -> list[tuple[bool, bytes]]:
         """
         Выдаёт последний NAL, если поток затих (кадры идут только при изменении экрана,
