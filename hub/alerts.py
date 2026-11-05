@@ -267,8 +267,8 @@ class AlertMonitor:
                 self._offline_alerted.discard(dev_id)
             self._offline_since.pop(dev_id, None)
 
-        # 2. Проверка 100% заряда
-        if status.battery is not None:
+        # 2. Проверка 100% заряда (full_charge_hours = 0 отключает напоминание)
+        if status.battery is not None and self.settings.full_charge_hours > 0:
             if status.battery >= 100:
                 if dev_id not in self._full_charge_since:
                     self._full_charge_since[dev_id] = now

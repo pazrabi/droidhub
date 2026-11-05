@@ -142,6 +142,19 @@ async def test_temperature_cooldown_and_2c_rise(manager: DeviceManager) -> None:
     assert notifier.send.call_count == 1
 
 
+@pytest.mark.asyncio
+async def test_full_charge_alert_disabled_by_zero_hours(manager: DeviceManager) -> None:
+    settings = Settings(full_charge_hours=0.0, alert_cooldown_min=30.0)
+    notifier = AsyncMock(spec=TelegramNotifier)
+    notifier.send = AsyncMock(return_value=True)
+    monitor = AlertMonitor(manager, settings, notifier=notifier)
+
+    status = DeviceStatus(id="dev1", name="Pixel 6", online=True, battery=100)
+    await monitor.check_device(status, now=1000.0)
+    await monitor.check_device(status, now=1000.0 + 48 * 3600)
+    notifier.send.assert_not_called()
+
+
 # 3. 100% заряда дольше N часов
 @pytest.mark.asyncio
 async def test_full_charge_longer_than_n_hours(manager: DeviceManager) -> None:
