@@ -239,6 +239,20 @@ async def test_offline_alert_and_recovery(manager: DeviceManager) -> None:
     notifier.send.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_offline_alert_sent_once_per_outage(manager: DeviceManager) -> None:
+    settings = Settings(offline_alert_min=10.0, alert_cooldown_min=30.0)
+    notifier = AsyncMock(spec=TelegramNotifier)
+    notifier.send = AsyncMock(return_value=True)
+    monitor = AlertMonitor(manager, settings, notifier=notifier)
+
+    t0 = 1000.0
+    s_off = DeviceStatus(id="dev1", name="Pixel 6", online=False, last_seen=t0)
+    for minutes in (10, 50, 100, 500):  # далеко за пределами кулдауна
+        await monitor.check_device(s_off, now=t0 + minutes * 60)
+    assert notifier.send.call_count == 1
+
+
 # 5. Авто-выключение и отключение авто-выключения при 0
 @pytest.mark.asyncio
 async def test_auto_shutdown_behavior(manager: DeviceManager, mock_power: AsyncMock) -> None:

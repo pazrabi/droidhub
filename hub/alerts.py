@@ -251,7 +251,8 @@ class AlertMonitor:
                     status.last_seen if (status.last_seen and status.last_seen <= now) else now
                 )
             offline_duration_min = (now - self._offline_since[dev_id]) / 60.0
-            if offline_duration_min >= self.settings.offline_alert_min:
+            # одно сообщение на один период оффлайна; следующее только после возврата в онлайн
+            if offline_duration_min >= self.settings.offline_alert_min and dev_id not in self._offline_alerted:
                 if self._can_alert(dev_id, "offline", now=now):
                     msg = self._format_msg(
                         f"Устройство {dev_name} оффлайн более {self.settings.offline_alert_min:.0f} мин"
