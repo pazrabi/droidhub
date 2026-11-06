@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -253,3 +254,161 @@ async def test_guarded_maps_network_failures() -> None:
 
     with pytest.raises(browser.BrowserUnavailable):
         await browser._guarded(slow)()
+
+
+# --- Новые тесты для времени (t, t_first_match) и woke ---
+
+class FakeDevToolsContext:
+    def __init__(self, cdp: Any) -> None:
+        self.cdp = cdp
+
+    async def __aenter__(self) -> "FakeDevToolsContext":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        pass
+
+    async def new_tab(self, url: str = "about:blank") -> dict:
+        return {"id": "fake-tab-id"}
+
+    async def connect(self, tab: dict) -> Any:
+        return self.cdp
+
+    async def close_tab(self, tab_id: str) -> None:
+        pass
+
+
+class FakeFullCdp:
+    def __init__(self, events: list[dict] | None = None, body_map: dict[str, str] | None = None) -> None:
+        self.events: asyncio.Queue[dict] = asyncio.Queue()
+        for e in (events or []):
+            self.events.put_nowait(e)
+        self.body_map = body_map or {}
+
+    async def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+        if method == "Network.getResponseBody":
+            rid = (params or {}).get("requestId", "")
+            return {"body": self.body_map.get(rid, '{"status": "ok"}'), "base64Encoded": False}
+        return {}
+
+    async def close(self) -> None:
+        pass
+
+
+async def test_timing_responses_grow_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Несколько ответов приходят друг за другом с задержкой: поле t растёт по порядку."""
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.1)
+
+    cdp = FakeCdp([])
+
+    async def _feed() -> None:
+        for ev in _request("1", "https://x.ru/api/1"):
+            cdp.events.put_nowait(ev)
+        await asyncio.sleep(0.04)
+        for ev in _request("2", "https://x.ru/api/2"):
+            cdp.events.put_nowait(ev)
+        await asyncio.sleep(0.04)
+        for ev in _request("3", "https://x.ru/api/3"):
+            cdp.events.put_nowait(ev)
+        cdp.events.put_nowait({"method": "Page.loadEventFired", "params": {}})
+
+    feeder = asyncio.create_task(_feed())
+
+    captured: dict = {}
+    bodies: dict = {}
+    finish_times: dict[str, float] = {}
+    started = time.monotonic()
+
+    ok = await browser._wait_for_page(
+        cdp, 2.0, captured, [], bodies, started=started, finish_times=finish_times
+    )
+    assert ok is True
+    await feeder
+
+    out = await browser._collect_json(bodies, finish_times=finish_times)
+    assert len(out) == 3
+    assert [r["url"] for r in out] == [
+        "https://x.ru/api/1",
+        "https://x.ru/api/2",
+        "https://x.ru/api/3",
+    ]
+    t_vals = [r["t"] for r in out]
+    assert all(isinstance(t, float) for t in t_vals)
+    assert t_vals[0] <= t_vals[1] <= t_vals[2]
+    assert t_vals[2] > t_vals[0]
+
+
+async def test_fetch_page_woke_true(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """fetch_page возвращает woke=True, если экран пришлось будить."""
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=True))
+    cdp = FakeFullCdp([{"method": "Page.loadEventFired", "params": {}}])
+    monkeypatch.setattr(browser, "_DevTools", lambda serial: FakeDevToolsContext(cdp))
+    monkeypatch.setattr(browser, "_read_page", AsyncMock(return_value={
+        "url": "https://example.com/", "title": "Example", "text": "Page text", "truncated": False, "captcha": False
+    }))
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.05)
+
+    res = await browser.fetch_page("realme", "https://example.com/")
+    assert res["woke"] is True
+
+
+async def test_fetch_page_woke_false(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """fetch_page возвращает woke=False, если экран уже был включен."""
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+    cdp = FakeFullCdp([{"method": "Page.loadEventFired", "params": {}}])
+    monkeypatch.setattr(browser, "_DevTools", lambda serial: FakeDevToolsContext(cdp))
+    monkeypatch.setattr(browser, "_read_page", AsyncMock(return_value={
+        "url": "https://example.com/", "title": "Example", "text": "Page text", "truncated": False, "captcha": False
+    }))
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.05)
+
+    res = await browser.fetch_page("realme", "https://example.com/")
+    assert res["woke"] is False
+
+
+async def test_fetch_page_t_first_match_and_timing(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Проверка t_first_match: null если подходящих ответов нет, и float если есть."""
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+    monkeypatch.setattr(browser, "_read_page", AsyncMock(return_value={
+        "url": "https://example.com/", "title": "Example", "text": "Page text", "truncated": False, "captcha": False
+    }))
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.05)
+
+    # 1. capture_json задан, но подходящих ответов нет -> t_first_match is None
+    events_no_match = (
+        _request("1", "https://example.com/api/other")
+        + [{"method": "Page.loadEventFired", "params": {}}]
+    )
+    cdp1 = FakeFullCdp(events_no_match)
+    monkeypatch.setattr(browser, "_DevTools", lambda serial: FakeDevToolsContext(cdp1))
+
+    res1 = await browser.fetch_page("realme", "https://example.com/", capture_json=["/api/target"])
+    assert res1["t_first_match"] is None
+    assert len(res1["json_responses"]) == 0
+
+    # 2. capture_json задан и есть подходящий ответ -> t_first_match является числом float
+    events_with_match = (
+        _request("1", "https://example.com/api/target")
+        + [{"method": "Page.loadEventFired", "params": {}}]
+    )
+    cdp2 = FakeFullCdp(events_with_match)
+    monkeypatch.setattr(browser, "_DevTools", lambda serial: FakeDevToolsContext(cdp2))
+
+    res2 = await browser.fetch_page("realme", "https://example.com/", capture_json=["/api/target"])
+    assert isinstance(res2["t_first_match"], float)
+    assert res2["t_first_match"] >= 0.0
+    assert len(res2["json_responses"]) == 1
+    assert res2["json_responses"][0]["t"] == res2["t_first_match"]
+
+    # 3. capture_json пуст -> любой возвращённый ответ подходит, t_first_match число float
+    events_empty_capture = (
+        _request("1", "https://example.com/api/anything")
+        + [{"method": "Page.loadEventFired", "params": {}}]
+    )
+    cdp3 = FakeFullCdp(events_empty_capture)
+    monkeypatch.setattr(browser, "_DevTools", lambda serial: FakeDevToolsContext(cdp3))
+
+    res3 = await browser.fetch_page("realme", "https://example.com/", capture_json=[])
+    assert isinstance(res3["t_first_match"], float)
+    assert res3["t_first_match"] >= 0.0
+    assert res3["t_first_match"] == res3["json_responses"][0]["t"]

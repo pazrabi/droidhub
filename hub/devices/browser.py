@@ -230,6 +230,8 @@ async def _wait_for_page(
     bodies: dict[str, asyncio.Task] | None = None,
     wait_for: str | None = None,
     wait_full: bool = False,
+    started: float | None = None,
+    finish_times: dict[str, float] | None = None,
 ) -> bool:
     """Ждёт загрузки и затишья сети; True если дождались, False если вышло время.
 
@@ -282,6 +284,12 @@ async def _wait_for_page(
                 matching.add(rid)
                 last_matched = time.monotonic()
         elif method in ("Network.loadingFinished", "Network.loadingFailed"):
+            finish_time = time.monotonic()
+            if method == "Network.loadingFinished" and finish_times is not None and rid is not None:
+                if started is not None:
+                    finish_times[rid] = round(max(0.0, finish_time - started), 2)
+                else:
+                    finish_times[rid] = finish_time
             inflight.discard(rid)
             last_activity = time.monotonic()
             info = captured.get(rid)
@@ -304,16 +312,32 @@ async def _wait_for_page(
             }
 
 
-async def _collect_json(bodies: dict[str, asyncio.Task]) -> list[dict]:
+async def _collect_json(
+    bodies: dict[str, asyncio.Task],
+    finish_times: dict[str, float] | None = None,
+    started: float | None = None,
+) -> list[dict]:
     out: list[dict] = []
     total = 0
-    for task in bodies.values():
+    for rid, task in bodies.items():
         item = await task
         if item is None:
             continue
         total += len(item["body"])
         if total > MAX_JSON_TOTAL:
             break
+        if finish_times is not None:
+            if rid in finish_times:
+                val = finish_times[rid]
+                if val is not None:
+                    if started is not None and val >= started:
+                        item["t"] = round(max(0.0, val - started), 2)
+                    else:
+                        item["t"] = round(val, 2)
+                else:
+                    item["t"] = None
+            else:
+                item["t"] = None
         out.append(item)
     return out
 
@@ -373,7 +397,7 @@ async def fetch_page(
     }
 
     async def _run() -> dict[str, Any]:
-        await actions.ensure_awake(device_id, actor=actor)
+        woke = await actions.ensure_awake(device_id, actor=actor)
         serial = actions._get_serial(device_id)
         started = time.monotonic()
         async with _DevTools(serial) as dev:
@@ -386,10 +410,13 @@ async def fetch_page(
                 await cdp.call("Page.enable")
                 await cdp.call("Network.enable", {"maxTotalBufferSize": 100_000_000, "maxResourceBufferSize": 20_000_000})
                 # Ответ на navigate у тяжёлых сайтов приходит поздно: не ждём его, а следим за сетью
+                nav_started = time.monotonic()
                 nav = asyncio.create_task(cdp.call("Page.navigate", {"url": url}, timeout=wait_seconds + 15.0))
                 captured: dict[str, dict] = {}
+                finish_times: dict[str, float] = {}
                 finished = await _wait_for_page(
-                    cdp, wait_seconds, captured, patterns, bodies, wait_for=wait_for, wait_full=wait_full
+                    cdp, wait_seconds, captured, patterns, bodies, wait_for=wait_for, wait_full=wait_full,
+                    started=nav_started, finish_times=finish_times,
                 )
                 if nav.done() and not nav.cancelled() and nav.exception() is None:
                     error_text = nav.result().get("errorText")
@@ -407,9 +434,17 @@ async def fetch_page(
                         f"Страница не открылась на телефоне ({code.group(0) if code else 'ошибка сети'}): "
                         "проверь интернет на телефоне и адрес"
                     )
-                result["json_responses"] = await _collect_json(bodies)
+                result["json_responses"] = await _collect_json(bodies, finish_times=finish_times)
                 result["finished"] = finished
                 result["seconds"] = round(time.monotonic() - started, 1)
+                result["woke"] = bool(woke)
+
+                matching_ts = [
+                    item["t"] for item in result["json_responses"]
+                    if item.get("t") is not None and (not patterns or any(p in item.get("url", "") for p in patterns))
+                ]
+                result["t_first_match"] = min(matching_ts) if matching_ts else None
+
                 return result
             finally:
                 if nav is not None:

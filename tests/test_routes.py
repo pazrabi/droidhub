@@ -627,3 +627,41 @@ def test_devices_list_includes_busy_status(client: TestClient) -> None:
     for item in res.json():
         assert item["busy"] is False
         assert item["activity"] is None
+
+
+def test_fetch_page_route_includes_new_timing_fields(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTP-ответ /api/devices/{id}/fetch_page отдаёт новые поля: t в json_responses, woke и t_first_match."""
+    from hub.devices import browser
+
+    mock_result = {
+        "url": "https://example.com",
+        "title": "Example",
+        "text": "Hello world",
+        "truncated": False,
+        "captcha": False,
+        "finished": True,
+        "seconds": 1.2,
+        "woke": True,
+        "t_first_match": 0.45,
+        "json_responses": [
+            {
+                "url": "https://example.com/api/data",
+                "status": 200,
+                "body": '{"ok": true}',
+                "t": 0.45,
+            }
+        ],
+    }
+    monkeypatch.setattr(browser, "fetch_page", AsyncMock(return_value=mock_result))
+
+    res = client.post(
+        "/api/devices/realme/fetch_page",
+        json={"url": "https://example.com", "capture_json": ["/api/"]},
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["woke"] is True
+    assert data["t_first_match"] == 0.45
+    assert len(data["json_responses"]) == 1
+    assert data["json_responses"][0]["t"] == 0.45
+
