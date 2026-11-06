@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from typing import Any
@@ -16,6 +17,8 @@ import websockets
 
 from hub.devices import actions
 from hub.devices.adb import AdbError, adb_shell, run_adb
+
+logger = logging.getLogger(__name__)
 
 CHROME_PACKAGE = "com.android.chrome"
 CHROME_ACTIVITY = f"{CHROME_PACKAGE}/com.google.android.apps.chrome.Main"
@@ -225,6 +228,150 @@ async def _fetch_body(cdp: _Cdp, request_id: str, info: dict) -> dict | None:
     return {"url": info["url"], "status": info["status"], "body": body}
 
 
+_SERVICE_HEADERS = {
+    "host",
+    "content-length",
+    "cookie",
+    "cookie2",
+    "connection",
+    "keep-alive",
+    "origin",
+    "referer",
+    "user-agent",
+    "accept-encoding",
+    "sec-fetch-dest",
+    "sec-fetch-mode",
+    "sec-fetch-site",
+    "sec-fetch-user",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
+    "te",
+    "trailer",
+    "upgrade",
+    "via",
+}
+
+
+def _validate_replay_post(replay_post: Any) -> None:
+    if replay_post is None:
+        return
+    if not isinstance(replay_post, dict):
+        raise ValueError("replay_post должен быть словарём")
+    url_contains = replay_post.get("url_contains")
+    if not isinstance(url_contains, str) or not url_contains:
+        raise ValueError("replay_post.url_contains должен быть непустой строкой")
+    set_dict = replay_post.get("set")
+    if not isinstance(set_dict, dict):
+        raise ValueError("replay_post.set должен быть словарём")
+
+
+async def _do_replay(
+    cdp: Any,
+    rid: str,
+    req: dict[str, Any],
+    replay_post: dict[str, Any],
+    started: float,
+) -> dict[str, Any] | None:
+    post_data = req.get("postData")
+    if post_data is None:
+        try:
+            res = await cdp.call("Network.getRequestPostData", {"requestId": rid}, timeout=15.0)
+            post_data = res.get("postData")
+        except Exception as exc:
+            logger.warning("Повтор POST пропущен: не удалось получить postData (%s)", type(exc).__name__)
+            return None
+
+    if post_data is None:
+        logger.warning("Повтор POST пропущен: отсутствует postData")
+        return None
+
+    try:
+        orig_body = json.loads(post_data)
+    except Exception:
+        logger.warning("Повтор POST пропущен: тело запроса не является валидным JSON")
+        return None
+
+    if not isinstance(orig_body, dict):
+        logger.warning("Повтор POST пропущен: тело запроса не является JSON-словарём")
+        return None
+
+    new_body = dict(orig_body)
+    new_body.update(replay_post["set"])
+
+    orig_url = req.get("url", "")
+    orig_headers = req.get("headers", {})
+
+    headers = {
+        k: v for k, v in orig_headers.items()
+        if not k.startswith(":") and k.lower() not in _SERVICE_HEADERS
+    }
+
+    js_code = (
+        "fetch(" + json.dumps(orig_url) + ", {"
+        "method: 'POST', "
+        "headers: " + json.dumps(headers) + ", "
+        "credentials: 'include', "
+        "body: JSON.stringify(" + json.dumps(new_body) + ")"
+        "}).then(async (r) => ({"
+        "ok: r.ok, "
+        "status: r.status, "
+        "body: await r.text()"
+        "})).catch((e) => ({"
+        "ok: false, "
+        "error: String(e)"
+        "}))"
+    )
+
+    try:
+        res = await cdp.call(
+            "Runtime.evaluate",
+            {"expression": js_code, "awaitPromise": True, "returnByValue": True},
+            timeout=15.0,
+        )
+    except Exception as exc:
+        logger.warning("Повтор POST пропущен: ошибка Runtime.evaluate (%s)", type(exc).__name__)
+        return None
+
+    val = res.get("result", {}).get("value") if isinstance(res.get("result"), dict) else res.get("value")
+    if isinstance(val, str):
+        try:
+            val = json.loads(val)
+        except Exception:
+            pass
+
+    if not isinstance(val, dict):
+        logger.warning("Повтор POST пропущен: некорректный ответ от Runtime.evaluate")
+        return None
+
+    if not val.get("ok"):
+        logger.warning("Повтор POST пропущен: fetch завершился ошибкой (%s)", val.get("error", "not ok"))
+        return None
+
+    status = val.get("status", 200)
+    if not (isinstance(status, int) and 200 <= status < 300):
+        logger.warning("Повтор POST пропущен: статус ответа %s не 2xx", status)
+        return None
+
+    body = val.get("body", "")
+    if not isinstance(body, str):
+        body = str(body)
+
+    if len(body) > MAX_JSON_BODY:
+        body = body[:MAX_JSON_BODY]
+
+    finish_time = time.monotonic()
+    t = round(max(0.0, finish_time - started), 2)
+
+    return {
+        "url": orig_url,
+        "status": status,
+        "body": body,
+        "t": t,
+        "replayed": True,
+    }
+
+
 async def _wait_for_page(
     cdp: _Cdp, wait_seconds: float, captured: dict[str, dict], patterns: list[str] | None = None,
     bodies: dict[str, asyncio.Task] | None = None,
@@ -232,6 +379,9 @@ async def _wait_for_page(
     wait_full: bool = False,
     started: float | None = None,
     finish_times: dict[str, float] | None = None,
+    replay_post: dict | None = None,
+    replayed_items: list[dict] | None = None,
+    replay_tasks: list[asyncio.Task] | None = None,
 ) -> bool:
     """Ждёт загрузки и затишья сети; True если дождались, False если вышло время.
 
@@ -248,6 +398,9 @@ async def _wait_for_page(
     matched_done = 0
     load_fired = False
     last_activity = last_matched = time.monotonic()
+    replay_attempted = False
+    replay_task: asyncio.Task | None = None
+    replay_handled = False
     while True:
         now = time.monotonic()
         if wait_for and not found:
@@ -255,18 +408,61 @@ async def _wait_for_page(
                 t.done() and not t.cancelled() and (r := t.result()) is not None and wait_for in r["body"]
                 for t in bodies.values()
             )
+            if not found and replay_task and replay_task.done() and not replay_task.cancelled():
+                try:
+                    r = replay_task.result()
+                    if r is not None and wait_for in r.get("body", ""):
+                        found = True
+                except Exception:
+                    pass
+
+        if replay_task is not None and replay_task.done() and not replay_handled:
+            replay_handled = True
+            last_activity = time.monotonic()
+            last_matched = time.monotonic()
+            if replayed_items is not None and not replay_task.cancelled():
+                try:
+                    r = replay_task.result()
+                    if r is not None:
+                        replayed_items.append(r)
+                        if not patterns or any(p in r.get("url", "") for p in patterns):
+                            matched_done += 1
+                except Exception:
+                    pass
+
+        replay_in_flight = replay_task is not None and not replay_task.done()
+
         if wait_full:
             if now >= deadline:
+                if replay_post is not None and not replay_attempted:
+                    logger.warning("Повтор POST пропущен: подходящий POST-запрос не был перехвачен")
                 return True
         elif wait_for:
-            if found and not (matching & inflight) and now - last_matched >= QUIET_SECONDS:
+            if found and not (matching & inflight) and not replay_in_flight and now - last_matched >= QUIET_SECONDS:
+                if replay_post is not None and not replay_attempted:
+                    logger.warning("Повтор POST пропущен: подходящий POST-запрос не был перехвачен")
                 return True
         elif patterns:
-            if matched_done and not (matching & inflight) and now - last_matched >= QUIET_SECONDS:
+            if matched_done and not (matching & inflight) and not replay_in_flight and now - last_matched >= QUIET_SECONDS:
+                if replay_post is not None and not replay_attempted:
+                    logger.warning("Повтор POST пропущен: подходящий POST-запрос не был перехвачен")
                 return True
-        elif load_fired and not inflight and now - last_activity >= QUIET_SECONDS:
+        elif load_fired and not inflight and not replay_in_flight and now - last_activity >= QUIET_SECONDS:
+            if replay_post is not None and not replay_attempted:
+                logger.warning("Повтор POST пропущен: подходящий POST-запрос не был перехвачен")
             return True
         if now >= deadline:
+            if replay_task is not None and replay_task.done() and not replay_handled:
+                replay_handled = True
+                if replayed_items is not None and not replay_task.cancelled():
+                    try:
+                        r = replay_task.result()
+                        if r is not None:
+                            replayed_items.append(r)
+                    except Exception:
+                        pass
+            if replay_post is not None and not replay_attempted:
+                logger.warning("Повтор POST пропущен: подходящий POST-запрос не был перехвачен")
             return wait_full
         try:
             ev = await asyncio.wait_for(cdp.events.get(), timeout=min(0.25, max(0.01, deadline - now)))
@@ -280,9 +476,24 @@ async def _wait_for_page(
         elif method == "Network.requestWillBeSent":
             inflight.add(rid)
             last_activity = time.monotonic()
-            if any(p in params.get("request", {}).get("url", "") for p in patterns):
+            req = params.get("request", {})
+            req_url = req.get("url", "")
+            req_method = req.get("method", "")
+            if any(p in req_url for p in patterns):
                 matching.add(rid)
                 last_matched = time.monotonic()
+            if (
+                replay_post is not None
+                and not replay_attempted
+                and req_method.upper() == "POST"
+                and replay_post.get("url_contains", "") in req_url
+            ):
+                replay_attempted = True
+                replay_task = asyncio.create_task(
+                    _do_replay(cdp, rid, req, replay_post, started=started or time.monotonic())
+                )
+                if replay_tasks is not None:
+                    replay_tasks.append(replay_task)
         elif method in ("Network.loadingFinished", "Network.loadingFailed"):
             finish_time = time.monotonic()
             if method == "Network.loadingFinished" and finish_times is not None and rid is not None:
@@ -376,6 +587,7 @@ async def fetch_page(
     max_chars: int = DEFAULT_MAX_CHARS,
     wait_for: str | None = None,
     wait_full: bool = False,
+    replay_post: dict | None = None,
     *,
     actor: str = "system",
 ) -> dict[str, Any]:
@@ -388,6 +600,7 @@ async def fetch_page(
     """
     if not re.match(r"^https?://", url, re.IGNORECASE):
         raise ValueError("Нужен адрес, начинающийся с http:// или https://")
+    _validate_replay_post(replay_post)
     wait_seconds = max(1.0, min(float(wait_seconds), MAX_WAIT_SECONDS))
     max_chars = max(1000, min(int(max_chars), 1_000_000))
     patterns = [p for p in (capture_json or []) if p]
@@ -395,6 +608,8 @@ async def fetch_page(
         "url": url, "wait_seconds": wait_seconds, "capture_json": patterns,
         "wait_for": wait_for, "wait_full": wait_full,
     }
+    if replay_post is not None:
+        params["replay_post"] = {"url_contains": replay_post.get("url_contains")}
 
     async def _run() -> dict[str, Any]:
         woke = await actions.ensure_awake(device_id, actor=actor)
@@ -405,6 +620,8 @@ async def fetch_page(
             cdp = None
             nav: asyncio.Task | None = None
             bodies: dict[str, asyncio.Task] = {}
+            replayed_items: list[dict] = []
+            replay_tasks: list[asyncio.Task] = []
             try:
                 cdp = await dev.connect(tab)
                 await cdp.call("Page.enable")
@@ -417,6 +634,7 @@ async def fetch_page(
                 finished = await _wait_for_page(
                     cdp, wait_seconds, captured, patterns, bodies, wait_for=wait_for, wait_full=wait_full,
                     started=nav_started, finish_times=finish_times,
+                    replay_post=replay_post, replayed_items=replayed_items, replay_tasks=replay_tasks,
                 )
                 if nav.done() and not nav.cancelled() and nav.exception() is None:
                     error_text = nav.result().get("errorText")
@@ -435,6 +653,12 @@ async def fetch_page(
                         "проверь интернет на телефоне и адрес"
                     )
                 result["json_responses"] = await _collect_json(bodies, finish_times=finish_times)
+                for item in replayed_items:
+                    total_json = sum(len(r["body"]) for r in result["json_responses"])
+                    if total_json + len(item["body"]) <= MAX_JSON_TOTAL:
+                        result["json_responses"].append(item)
+                    else:
+                        logger.warning("Превышен суммарный лимит JSON при повторе POST")
                 result["finished"] = finished
                 result["seconds"] = round(time.monotonic() - started, 1)
                 result["woke"] = bool(woke)
@@ -451,6 +675,9 @@ async def fetch_page(
                     nav.cancel()
                 for task in bodies.values():
                     task.cancel()
+                for task in replay_tasks:
+                    if not task.done():
+                        task.cancel()
                 if cdp is not None:
                     await cdp.close()
                 await dev.close_tab(tab["id"])

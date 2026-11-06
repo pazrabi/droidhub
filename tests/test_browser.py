@@ -412,3 +412,265 @@ async def test_fetch_page_t_first_match_and_timing(manager: DeviceManager, monke
     assert isinstance(res3["t_first_match"], float)
     assert res3["t_first_match"] >= 0.0
     assert res3["t_first_match"] == res3["json_responses"][0]["t"]
+
+
+# --- Тесты для replay_post ---
+
+class ReplayFakeCdp:
+    def __init__(
+        self,
+        events: list[dict],
+        evaluate_response: dict | None = None,
+        evaluate_exception: Exception | None = None,
+        post_data: str | None = None,
+    ) -> None:
+        self.events: asyncio.Queue[dict] = asyncio.Queue()
+        for e in events:
+            self.events.put_nowait(e)
+        self.evaluate_response = evaluate_response
+        self.evaluate_exception = evaluate_exception
+        self.post_data = post_data
+        self.evaluate_calls: list[dict] = []
+        self.get_post_data_calls: list[dict] = []
+
+    async def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+        params = params or {}
+        if method == "Network.getResponseBody":
+            return {"body": '{"initial": 10}', "base64Encoded": False}
+        if method == "Network.getRequestPostData":
+            self.get_post_data_calls.append(params)
+            if self.post_data is not None:
+                return {"postData": self.post_data}
+            return {}
+        if method == "Runtime.evaluate":
+            self.evaluate_calls.append(params)
+            if self.evaluate_exception is not None:
+                raise self.evaluate_exception
+            if self.evaluate_response is not None:
+                return self.evaluate_response
+            return {"result": {"value": {"ok": True, "status": 200, "body": '{"replayed": 50}'}}}
+        return {}
+
+    async def close(self) -> None:
+        pass
+
+
+def _post_request_events(
+    rid: str,
+    url: str,
+    post_data: str | None = None,
+    headers: dict | None = None,
+) -> list[dict]:
+    req: dict[str, Any] = {
+        "url": url,
+        "method": "POST",
+        "headers": headers or {"Content-Type": "application/json"},
+    }
+    if post_data is not None:
+        req["postData"] = post_data
+    return [
+        {"method": "Network.requestWillBeSent", "params": {"requestId": rid, "request": req}},
+        {
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": rid,
+                "type": "XHR",
+                "response": {"url": url, "status": 200, "mimeType": "application/json"},
+            },
+        },
+        {"method": "Network.loadingFinished", "params": {"requestId": rid}},
+    ]
+
+
+async def test_fetch_page_replay_post_success(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Перехват POST, перезапись полей в fetch, рост t и флаг replayed: True."""
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+    monkeypatch.setattr(browser, "_read_page", AsyncMock(return_value={
+        "url": "https://avia.ru/", "title": "Avia", "text": "Offers", "truncated": False, "captcha": False
+    }))
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.05)
+
+    headers = {
+        "Content-Type": "application/json",
+        "Host": "avia.ru",
+        "Cookie": "session=xyz",
+        "Authorization": "Bearer token123",
+        "Content-Length": "34",
+    }
+    events = (
+        _post_request_events("1", "https://avia.ru/avia/offers/v2?query=1", post_data='{"limit": 10, "page": 1}', headers=headers)
+        + [{"method": "Page.loadEventFired", "params": {}}]
+    )
+    cdp = ReplayFakeCdp(events)
+    monkeypatch.setattr(browser, "_DevTools", lambda serial: FakeDevToolsContext(cdp))
+
+    res = await browser.fetch_page(
+        "realme",
+        "https://avia.ru/",
+        replay_post={"url_contains": "/avia/offers/v2", "set": {"limit": 50, "extra": "yes"}},
+    )
+
+    # 1. Проверяем, что в fetch ушло тело с перезаписанными полями и отфильтрованными заголовками
+    assert len(cdp.evaluate_calls) == 1
+    eval_call = cdp.evaluate_calls[0]
+    assert eval_call.get("awaitPromise") is True
+    assert eval_call.get("returnByValue") is True
+    expr = eval_call["expression"]
+    assert 'fetch("https://avia.ru/avia/offers/v2?query=1"' in expr
+    assert '"credentials": "include"' in expr or "credentials: 'include'" in expr
+    assert '"Content-Type": "application/json"' in expr or '"content-type": "application/json"' in expr
+    assert "Authorization" in expr
+    # Служебные заголовки удалены
+    assert "Cookie" not in expr and "cookie" not in expr
+    assert "Host" not in expr and "host" not in expr
+    assert "Content-Length" not in expr and "content-length" not in expr
+    # Тело содержит перезаписанные поля
+    assert '"limit": 50' in expr
+    assert '"extra": "yes"' in expr
+    assert '"page": 1' in expr
+
+    # 2. Проверяем json_responses: начальный + повторный с replayed: True и ростом t
+    responses = res["json_responses"]
+    assert len(responses) == 2
+    orig_resp, replay_resp = responses[0], responses[1]
+    assert orig_resp["url"] == "https://avia.ru/avia/offers/v2?query=1"
+    assert orig_resp["body"] == '{"initial": 10}'
+    assert orig_resp.get("replayed") is not True
+
+    assert replay_resp["url"] == "https://avia.ru/avia/offers/v2?query=1"
+    assert replay_resp["body"] == '{"replayed": 50}'
+    assert replay_resp["replayed"] is True
+    assert isinstance(replay_resp["t"], float)
+    assert replay_resp["t"] >= orig_resp["t"]
+    assert res["finished"] is True
+
+
+async def test_fetch_page_replay_post_via_get_request_post_data(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Если postData не пришёл в Network.requestWillBeSent, берём через Network.getRequestPostData."""
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+    monkeypatch.setattr(browser, "_read_page", AsyncMock(return_value={
+        "url": "https://avia.ru/", "title": "Avia", "text": "Offers", "truncated": False, "captcha": False
+    }))
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.05)
+
+    # post_data=None в событии
+    events = (
+        _post_request_events("r10", "https://avia.ru/api/tickets", post_data=None)
+        + [{"method": "Page.loadEventFired", "params": {}}]
+    )
+    cdp = ReplayFakeCdp(events, post_data='{"offset": 0, "size": 10}')
+    monkeypatch.setattr(browser, "_DevTools", lambda serial: FakeDevToolsContext(cdp))
+
+    res = await browser.fetch_page(
+        "realme",
+        "https://avia.ru/",
+        replay_post={"url_contains": "/api/tickets", "set": {"size": 100}},
+    )
+
+    assert len(cdp.get_post_data_calls) == 1
+    assert cdp.get_post_data_calls[0]["requestId"] == "r10"
+    assert len(cdp.evaluate_calls) == 1
+    assert '"size": 100' in cdp.evaluate_calls[0]["expression"]
+    assert len(res["json_responses"]) == 2
+    assert res["json_responses"][1]["replayed"] is True
+
+
+async def test_fetch_page_replay_post_not_intercepted_silently_skipped(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Если POST не перехвачен, повтор молча пропускается без ошибок."""
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+    monkeypatch.setattr(browser, "_read_page", AsyncMock(return_value={
+        "url": "https://avia.ru/", "title": "Avia", "text": "Offers", "truncated": False, "captcha": False
+    }))
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.05)
+
+    events = (
+        _request("1", "https://avia.ru/api/other")
+        + [{"method": "Page.loadEventFired", "params": {}}]
+    )
+    cdp = ReplayFakeCdp(events)
+    monkeypatch.setattr(browser, "_DevTools", lambda serial: FakeDevToolsContext(cdp))
+
+    res = await browser.fetch_page(
+        "realme",
+        "https://avia.ru/",
+        replay_post={"url_contains": "/avia/offers/v2", "set": {"limit": 50}},
+    )
+    assert len(cdp.evaluate_calls) == 0
+    assert len(res["json_responses"]) == 1
+    assert "replayed" not in res["json_responses"][0]
+
+
+async def test_fetch_page_replay_post_body_not_json_dict_silently_skipped(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Если тело перехваченного запроса не JSON-словарь (строка или массив), повтор пропускается."""
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+    monkeypatch.setattr(browser, "_read_page", AsyncMock(return_value={
+        "url": "https://avia.ru/", "title": "Avia", "text": "Offers", "truncated": False, "captcha": False
+    }))
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.05)
+
+    # Тело запроса — JSON массив, а не словарь
+    events = (
+        _post_request_events("1", "https://avia.ru/api/offers", post_data="[1, 2, 3]")
+        + [{"method": "Page.loadEventFired", "params": {}}]
+    )
+    cdp = ReplayFakeCdp(events)
+    monkeypatch.setattr(browser, "_DevTools", lambda serial: FakeDevToolsContext(cdp))
+
+    res = await browser.fetch_page(
+        "realme",
+        "https://avia.ru/",
+        replay_post={"url_contains": "/api/offers", "set": {"limit": 50}},
+    )
+    assert len(cdp.evaluate_calls) == 0
+    assert len(res["json_responses"]) == 1
+
+
+async def test_fetch_page_replay_post_fetch_error_silently_skipped(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Если fetch завершился ошибкой или вернул не-2xx статус, повтор пропускается."""
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+    monkeypatch.setattr(browser, "_read_page", AsyncMock(return_value={
+        "url": "https://avia.ru/", "title": "Avia", "text": "Offers", "truncated": False, "captcha": False
+    }))
+    monkeypatch.setattr(browser, "QUIET_SECONDS", 0.05)
+
+    # 1. Fetch вернул 500
+    events1 = (
+        _post_request_events("1", "https://avia.ru/api/offers", post_data='{"limit": 10}')
+        + [{"method": "Page.loadEventFired", "params": {}}]
+    )
+    cdp1 = ReplayFakeCdp(
+        events1,
+        evaluate_response={"result": {"value": {"ok": False, "status": 500, "body": "server error"}}},
+    )
+    monkeypatch.setattr(browser, "_DevTools", lambda serial: FakeDevToolsContext(cdp1))
+    res1 = await browser.fetch_page(
+        "realme", "https://avia.ru/", replay_post={"url_contains": "/api/offers", "set": {"limit": 50}}
+    )
+    assert len(res1["json_responses"]) == 1
+
+    # 2. Runtime.evaluate бросил исключение
+    events2 = (
+        _post_request_events("1", "https://avia.ru/api/offers", post_data='{"limit": 10}')
+        + [{"method": "Page.loadEventFired", "params": {}}]
+    )
+    cdp2 = ReplayFakeCdp(
+        events2,
+        evaluate_exception=browser.BrowserError("JS runtime error"),
+    )
+    monkeypatch.setattr(browser, "_DevTools", lambda serial: FakeDevToolsContext(cdp2))
+    res2 = await browser.fetch_page(
+        "realme", "https://avia.ru/", replay_post={"url_contains": "/api/offers", "set": {"limit": 50}}
+    )
+    assert len(res2["json_responses"]) == 1
+
+
+async def test_fetch_page_replay_post_validation(manager: DeviceManager) -> None:
+    """Валидация: url_contains непустая строка, set словарь."""
+    with pytest.raises(ValueError, match="url_contains"):
+        await browser.fetch_page("realme", "https://x.ru", replay_post={"url_contains": "", "set": {}})
+
+    with pytest.raises(ValueError, match="set"):
+        await browser.fetch_page("realme", "https://x.ru", replay_post={"url_contains": "/api", "set": "not-a-dict"})
+
+    with pytest.raises(ValueError, match="словарём"):
+        await browser.fetch_page("realme", "https://x.ru", replay_post="invalid")

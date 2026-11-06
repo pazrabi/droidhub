@@ -120,6 +120,7 @@ class FetchJob:
         nav_task: asyncio.Task,
         activity_token: int,
         lock_held: bool = True,
+        replay_post: dict | None = None,
     ) -> None:
         self.job_id = job_id
         self.device_id = device_id
@@ -140,6 +141,9 @@ class FetchJob:
         self._nav_task: asyncio.Task | None = nav_task
         self._activity_token: int | None = activity_token
         self._lock_held: bool = lock_held
+        self.replay_post: dict | None = replay_post
+        self._replay_task: asyncio.Task | None = None
+        self._replay_attempted: bool = False
 
         self.state: str = "running"
         self.error: str | None = None
@@ -179,7 +183,9 @@ class FetchJob:
         old_ev.set()
 
     def _has_inflight_bodies(self) -> bool:
-        """Проверяет, есть ли ещё выполняющиеся фоновые задачи загрузки тел ответов."""
+        """Проверяет, есть ли ещё выполняющиеся фоновые задачи загрузки тел ответов или повтора POST."""
+        if self._replay_task is not None and not self._replay_task.done():
+            return True
         return any(not t.done() for t in self._bodies_tasks)
 
     def is_network_quiet(self) -> bool:
@@ -261,6 +267,44 @@ class FetchJob:
             self._last_matched_time = time.monotonic()
             self._last_activity_time = time.monotonic()
 
+    async def _execute_replay(self, rid: str, req: dict[str, Any]) -> None:
+        try:
+            item = await browser._do_replay(
+                self.cdp, rid, req, self.replay_post, started=self.nav_started
+            )
+            if item is None:
+                return
+            body = item.get("body", "")
+            if self._total_json_bytes + len(body) > MAX_JSON_TOTAL:
+                logger.warning(
+                    "Превышен суммарный лимит JSON при повторе POST (job_id=%s, url=%s)",
+                    self.job_id,
+                    item.get("url", ""),
+                )
+                return
+            self._total_json_bytes += len(body)
+            resp_obj = {
+                "i": len(self.responses),
+                "t": item["t"],
+                "url": item["url"],
+                "status": item["status"],
+                "body": body,
+                "replayed": True,
+            }
+            self.responses.append(resp_obj)
+            if self.wait_for and self.wait_for in body:
+                self.wait_for_seen = True
+            if not self.capture_json or any(p in item["url"] for p in self.capture_json):
+                if self.t_first_match is None or item["t"] < self.t_first_match:
+                    self.t_first_match = item["t"]
+                self._matched_done += 1
+            self._notify()
+        except Exception as exc:
+            logger.warning("Ошибка при повторе POST (job_id=%s): %s", self.job_id, type(exc).__name__)
+        finally:
+            self._last_matched_time = time.monotonic()
+            self._last_activity_time = time.monotonic()
+
     async def _collector_loop(self) -> None:
         """Основной цикл обработки CDP-событий сети и навигации."""
         try:
@@ -330,7 +374,9 @@ class FetchJob:
                     self._load_event_fired = True
                     self._last_activity_time = time.monotonic()
                 elif method == "Network.requestWillBeSent":
-                    req_url = params.get("request", {}).get("url", "")
+                    req = params.get("request", {})
+                    req_url = req.get("url", "")
+                    req_method = req.get("method", "")
                     self._inflight_reqs.add(rid)
                     self._last_activity_time = time.monotonic()
                     if self.capture_json:
@@ -340,6 +386,17 @@ class FetchJob:
                     else:
                         self._matching_reqs.add(rid)
                         self._last_matched_time = time.monotonic()
+
+                    if (
+                        self.replay_post is not None
+                        and not self._replay_attempted
+                        and req_method.upper() == "POST"
+                        and self.replay_post.get("url_contains", "") in req_url
+                    ):
+                        self._replay_attempted = True
+                        self._replay_task = asyncio.create_task(
+                            self._execute_replay(rid, req)
+                        )
                 elif method == "Network.responseReceived":
                     resp = params.get("response", {})
                     self._captured[rid] = {
@@ -364,6 +421,11 @@ class FetchJob:
                             self._matched_done += 1
                         task = asyncio.create_task(self._fetch_body_and_store(rid, info, t))
                         self._bodies_tasks.append(task)
+            if self.replay_post is not None and not self._replay_attempted:
+                logger.warning(
+                    "Повтор POST пропущен: подходящий POST-запрос не был перехвачен (job_id=%s)",
+                    self.job_id,
+                )
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -434,6 +496,9 @@ class FetchJob:
         for t in self._bodies_tasks:
             if t is not None and t is not current and not t.done():
                 t.cancel()
+
+        if self._replay_task is not None and self._replay_task is not current and not self._replay_task.done():
+            self._replay_task.cancel()
 
         try:
             # Сначала закрываем вкладку: Chrome на загружающейся странице не отвечает на закрытие сокета
@@ -550,6 +615,8 @@ class FetchJob:
 
         try:
             pending = [t for t in self._bodies_tasks if not t.done()]
+            if self._replay_task is not None and not self._replay_task.done():
+                pending.append(self._replay_task)
             if pending:
                 done, not_done = await asyncio.wait(
                     pending, timeout=_get_finish_body_wait_seconds()
@@ -586,6 +653,7 @@ class FetchJob:
                     "status": r["status"],
                     "body": r["body"],
                     "t": r["t"],
+                    **({"replayed": r["replayed"]} if "replayed" in r else {}),
                 }
                 for r in self.responses
                 if r["i"] >= self._max_served_next
@@ -663,12 +731,14 @@ async def create_fetch_job(
     wait_for: str | None = None,
     wait_full: bool = False,
     max_seconds: float = DEFAULT_MAX_SECONDS,
+    replay_post: dict | None = None,
     *,
     actor: str = "system",
 ) -> str:
     """Создаёт и запускает задание на загрузку страницы."""
     if not re.match(r"^https?://", url, re.IGNORECASE):
         raise ValueError("Нужен адрес, начинающийся с http:// или https://")
+    browser._validate_replay_post(replay_post)
 
     min_s = _get_min_max_seconds()
     max_s = _get_max_max_seconds()
@@ -737,6 +807,7 @@ async def create_fetch_job(
             nav_task=nav_task,
             activity_token=activity_token,
             lock_held=True,
+            replay_post=replay_post,
         )
 
         job.start_tasks()
@@ -756,6 +827,7 @@ async def create_fetch_job(
                     "capture_json": patterns,
                     "wait_for": wait_for,
                     "wait_full": wait_full,
+                    **({"replay_post": {"url_contains": replay_post["url_contains"]}} if replay_post else {}),
                 },
                 ok=True,
                 actor=actor,
