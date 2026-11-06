@@ -394,24 +394,27 @@ class FetchJob:
                 t.cancel()
 
         try:
+            # Сначала закрываем вкладку: Chrome на загружающейся странице не отвечает на закрытие сокета
+            # (websockets ждёт до 10 с), а закрытая вкладка рвёт сокет сама.
+            if self.dev is not None and self.tab_id:
+                tab_id = self.tab_id
+                self.tab_id = None
+                try:
+                    await asyncio.wait_for(self.dev.close_tab(tab_id), timeout=3.0)
+                except BaseException:
+                    pass
+
             if self.cdp is not None:
                 cdp = self.cdp
                 self.cdp = None
                 try:
-                    await cdp.close()
+                    await asyncio.wait_for(cdp.close(), timeout=1.0)
                 except BaseException:
                     pass
 
             if self.dev is not None:
                 dev = self.dev
                 self.dev = None
-                tab_id = self.tab_id
-                self.tab_id = None
-                if tab_id:
-                    try:
-                        await dev.close_tab(tab_id)
-                    except BaseException:
-                        pass
                 try:
                     await dev.__aexit__(None, None, None)
                 except BaseException:
