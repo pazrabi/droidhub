@@ -24,6 +24,7 @@ class DeviceStatus:
     battery: int | None = None
     temperature: float | None = None
     screen_on: bool | None = None
+    charging: bool | None = None
     last_seen: float | None = None
     error: str | None = None
 
@@ -54,6 +55,18 @@ def parse_battery_dumpsys(dumpsys_output: str) -> tuple[int | None, float | None
             temperature = None
 
     return battery, temperature
+
+
+def parse_charging_dumpsys(dumpsys_output: str) -> bool | None:
+    """Подключено ли питание (AC/USB/беспроводная/док) по выводу dumpsys battery."""
+    if not dumpsys_output:
+        return None
+    found = False
+    for m in re.finditer(r"\b(?:AC|USB|Wireless|Dock) powered:\s*(true|false)", dumpsys_output, re.IGNORECASE):
+        found = True
+        if m.group(1).lower() == "true":
+            return True
+    return False if found else None
 
 
 def parse_screen_dumpsys(dumpsys_output: str) -> bool | None:
@@ -133,6 +146,7 @@ class DeviceManager:
         try:
             battery_out = await adb_shell(target, "dumpsys battery")
             battery, temp = parse_battery_dumpsys(battery_out)
+            charging = parse_charging_dumpsys(battery_out)
 
             screen_on: bool | None = None
             try:
@@ -148,6 +162,7 @@ class DeviceManager:
                 battery=battery,
                 temperature=temp,
                 screen_on=screen_on,
+                charging=charging,
                 last_seen=time.time(),
                 error=None,
             )
@@ -216,6 +231,7 @@ __all__ = [
     "DeviceStatus",
     "DeviceManager",
     "parse_battery_dumpsys",
+    "parse_charging_dumpsys",
     "parse_screen_dumpsys",
     "parse_dumpsys_battery",
     "parse_dumpsys_screen",

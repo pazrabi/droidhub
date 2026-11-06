@@ -423,3 +423,11 @@ async def test_manager_parallel_poll(monkeypatch):
 
     assert max_concurrent > 1
 
+
+
+def test_parse_charging_dumpsys():
+    from hub.devices.manager import parse_charging_dumpsys
+
+    assert parse_charging_dumpsys("AC powered: false\n  USB powered: true\n") is True
+    assert parse_charging_dumpsys("AC powered: false\n  USB powered: false\n  Wireless powered: false\n") is False
+    assert parse_charging_dumpsys("level: 50") is None

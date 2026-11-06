@@ -154,6 +154,7 @@ class AlertMonitor:
     - тревога при температуре >= temp_alert_c с inline-кнопкой «Открыть панель» (url=<public_url>/device/<id>)
     - авто-выключение при температуре >= temp_shutdown_c (если > 0)
     - фраза «Зарядка не остановлена...» при тревоге и автовыключении
+    - просьба поставить на зарядку при заряде < low_battery_pct (и срочно < critical_battery_pct), по одному разу
     - напоминание при заряде 100% дольше full_charge_hours
     - оповещение о выходе в оффлайн дольше offline_alert_min и оповещение «снова онлайн» при возврате
     - кулдаун alert_cooldown_min на каждое правило и устройство, температурные тревоги не молчат при росте на >= 2 °C
@@ -189,6 +190,8 @@ class AlertMonitor:
         self._offline_since: dict[str, float] = {}
         self._offline_alerted: set[str] = set()
         self._full_charge_since: dict[str, float] = {}
+        # уровни, по которым уже отправлено сообщение «поставь на зарядку» (сбрасывается при зарядке)
+        self._low_battery_sent: dict[str, set[str]] = {}
 
     def _format_msg(self, text: str) -> str:
         tag = self.settings.alert_tag.strip() if self.settings.alert_tag else ""
@@ -281,6 +284,28 @@ class AlertMonitor:
                         self._record_alert(dev_id, "full_charge", now=now)
             else:
                 self._full_charge_since.pop(dev_id, None)
+
+        # 2.5. Низкий заряд без зарядки: одно сообщение на уровень (low_battery_pct = 0 отключает)
+        if status.battery is not None and self.settings.low_battery_pct > 0:
+            sent = self._low_battery_sent.setdefault(dev_id, set())
+            if status.charging is True or status.battery >= self.settings.low_battery_pct:
+                sent.clear()
+            elif status.charging is False:
+                crit = self.settings.critical_battery_pct
+                level = "critical" if (crit > 0 and status.battery < crit) else "low"
+                if level not in sent:
+                    sent.add(level)
+                    if level == "critical":
+                        sent.add("low")
+                    prefix = "Срочно" if level == "critical" else "Нужна зарядка"
+                    msg = self._format_msg(
+                        f"{prefix}: поставь {dev_name} на зарядку, заряд {status.battery}%"
+                    )
+                    buttons = None
+                    if self.settings.public_url and self.settings.public_url.strip():
+                        base_url = self.settings.public_url.strip().rstrip("/")
+                        buttons = [{"text": "Открыть панель", "url": f"{base_url}/device/{dev_id}"}]
+                    await self.notifier.send(msg, buttons=buttons)
 
         # 3. Проверка температуры (warn / alert / shutdown)
         if status.temperature is not None:

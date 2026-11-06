@@ -437,24 +437,22 @@ def test_power_action_rate_limiter_429(client: TestClient, monkeypatch: pytest.M
 
 
 def test_get_devices_charging_field(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    """GET /api/devices добавляет charging (bool|None) если оно есть у DeviceStatus, иначе не меняет."""
-    # 1. По умолчанию у DeviceStatus нет charging -> в ответе поля charging нет
+    """GET /api/devices отдаёт charging (bool|None) для каждого устройства."""
     res_default = client.get("/api/devices")
     assert res_default.status_code == 200
     data_default = res_default.json()
     assert len(data_default) == 2
     for item in data_default:
-        assert "charging" not in item
-
-    # 2. Если у DeviceStatus есть charging -> в ответе появляется поле charging
-    monkeypatch.setattr(DeviceStatus, "charging", True, raising=False)
-    res_with_charging = client.get("/api/devices")
-    assert res_with_charging.status_code == 200
-    data_with_charging = res_with_charging.json()
-    assert len(data_with_charging) == 2
-    for item in data_with_charging:
         assert "charging" in item
-        assert item["charging"] is True
+        assert item["charging"] is None
+
+    monkeypatch.setattr(DeviceStatus, "charging", True, raising=False)
+    monkeypatch.setattr(
+        "hub.devices.manager.DeviceManager.statuses",
+        lambda self: [DeviceStatus(id="realme", name="R", online=True, charging=True)],
+    )
+    data = client.get("/api/devices").json()
+    assert data[0]["charging"] is True
 
 
 try:

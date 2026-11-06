@@ -253,6 +253,37 @@ async def test_offline_alert_sent_once_per_outage(manager: DeviceManager) -> Non
     assert notifier.send.call_count == 1
 
 
+@pytest.mark.asyncio
+async def test_low_battery_alert(manager: DeviceManager) -> None:
+    settings = Settings(low_battery_pct=50, critical_battery_pct=20)
+    notifier = AsyncMock(spec=TelegramNotifier)
+    notifier.send = AsyncMock(return_value=True)
+    monitor = AlertMonitor(manager, settings, notifier=notifier)
+
+    def st(b, ch):
+        return DeviceStatus(id="dev1", name="Pixel 6", online=True, battery=b, charging=ch, last_seen=1.0)
+
+    await monitor.check_device(st(60, False), now=1.0)
+    await monitor.check_device(st(40, True), now=2.0)  # на зарядке — молчим
+    notifier.send.assert_not_called()
+
+    await monitor.check_device(st(49, False), now=3.0)
+    assert notifier.send.call_count == 1
+    assert "поставь Pixel 6 на зарядку" in notifier.send.call_args[0][0]
+    await monitor.check_device(st(45, False), now=4.0)  # повтора нет
+    assert notifier.send.call_count == 1
+
+    await monitor.check_device(st(19, False), now=5.0)  # критический уровень — ещё одно
+    assert notifier.send.call_count == 2
+    assert "Срочно" in notifier.send.call_args[0][0]
+    await monitor.check_device(st(15, False), now=6.0)
+    assert notifier.send.call_count == 2
+
+    await monitor.check_device(st(30, True), now=7.0)  # зарядили — сброс
+    await monitor.check_device(st(49, False), now=8.0)
+    assert notifier.send.call_count == 3
+
+
 # 5. Авто-выключение и отключение авто-выключения при 0
 @pytest.mark.asyncio
 async def test_auto_shutdown_behavior(manager: DeviceManager, mock_power: AsyncMock) -> None:
