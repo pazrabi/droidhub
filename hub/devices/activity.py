@@ -8,6 +8,7 @@ from typing import AsyncIterator
 # Понятные названия действий для панели; остальные показываем как есть
 LABELS: dict[str, str] = {
     "fetch_page": "читает сайт",
+    "fetch_job": "читает сайт",
     "browser_tabs": "читает вкладки",
     "page_text": "читает страницу",
     "tap": "нажатие",
@@ -30,21 +31,32 @@ _active: dict[str, dict[int, tuple[str, str, float]]] = {}
 _counter = 0
 
 
-@asynccontextmanager
-async def track(device_id: str, action: str, actor: str = "system") -> AsyncIterator[None]:
-    """Отмечает устройство занятым на время действия."""
+def begin(device_id: str, action: str, actor: str = "system") -> int:
+    """Отмечает устройство занятым действием и возвращает токен."""
     global _counter
     _counter += 1
     token = _counter
     _active.setdefault(device_id, {})[token] = (action, actor, time.time())
+    return token
+
+
+def end(device_id: str, token: int) -> None:
+    """Снимает отметку занятости устройства по токену."""
+    ops = _active.get(device_id)
+    if ops is not None:
+        ops.pop(token, None)
+        if not ops:
+            _active.pop(device_id, None)
+
+
+@asynccontextmanager
+async def track(device_id: str, action: str, actor: str = "system") -> AsyncIterator[None]:
+    """Отмечает устройство занятым на время действия."""
+    token = begin(device_id, action, actor)
     try:
         yield
     finally:
-        ops = _active.get(device_id)
-        if ops is not None:
-            ops.pop(token, None)
-            if not ops:
-                _active.pop(device_id, None)
+        end(device_id, token)
 
 
 def current(device_id: str) -> dict | None:

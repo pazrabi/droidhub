@@ -14,7 +14,7 @@ from hub.alerts import AlertMonitor
 from hub.api.routes import api_router, public_router
 from hub.audit import init_audit
 from hub.config import Settings, get_settings, load_devices
-from hub.devices import actions
+from hub.devices import actions, fetch_jobs
 from hub.devices.adb import AdbError
 from hub.devices.manager import DeviceManager
 from hub.auth import auth_router
@@ -62,6 +62,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 yield
         finally:
+            await fetch_jobs.cancel_all()
             await monitor.stop()
             await manager.stop()
 

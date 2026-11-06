@@ -12,7 +12,7 @@ from pydantic import BaseModel
 
 import hub.audit as audit_module
 from hub.config import get_settings
-from hub.devices import actions, activity, browser
+from hub.devices import actions, activity, browser, fetch_jobs
 from hub.devices.adb import AdbError, AdbTimeout, DeviceOffline, adb_shell
 from hub.devices.manager import DeviceStatus
 
@@ -53,6 +53,16 @@ class FetchPageRequest(BaseModel):
     max_chars: int = 200000
     wait_for: str | None = None
     wait_full: bool = False
+
+
+class FetchJobsRequest(BaseModel):
+    url: str
+    wait_seconds: float = 15.0
+    capture_json: list[str] = []
+    max_chars: int = 200000
+    wait_for: str | None = None
+    wait_full: bool = False
+    max_seconds: float = 45.0
 
 
 class PowerRequest(BaseModel):
@@ -529,6 +539,94 @@ async def fetch_page_device(
         )
     except _BROWSER_ERRORS as exc:
         raise _browser_http_error(exc)
+
+
+@api_router.post("/devices/{device_id}/fetch_jobs")
+async def create_fetch_job_device(
+    device_id: str,
+    req: FetchJobsRequest,
+    request: Request,
+    actor: str = Depends(require_api),
+) -> dict[str, str]:
+    """Запустить фоновое задание загрузки страницы для стриминга ответов."""
+    await _check_device_and_rate_limit(device_id, request=request)
+    try:
+        job_id = await fetch_jobs.create_fetch_job(
+            device_id=device_id,
+            url=req.url,
+            wait_seconds=req.wait_seconds,
+            capture_json=req.capture_json,
+            max_chars=req.max_chars,
+            wait_for=req.wait_for,
+            wait_full=req.wait_full,
+            max_seconds=req.max_seconds,
+            actor=actor,
+        )
+        return {"job_id": job_id}
+    except _BROWSER_ERRORS as exc:
+        raise _browser_http_error(exc)
+
+
+@api_router.get("/fetch_jobs/{job_id}")
+async def get_fetch_job(
+    job_id: str,
+    since: int = Query(default=0, ge=0),
+    actor: str = Depends(require_api),
+) -> dict[str, Any]:
+    """Получить очередную порцию ответов задания (длинный опрос)."""
+    job = fetch_jobs.get_active_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Задание не найдено или уже закрыто",
+        )
+    job.touch()
+    await job.wait_for_data(since=since, timeout=1.0)
+    job.touch()
+    responses, next_i = job.get_slice(since=since)
+    return {
+        "responses": responses,
+        "next": next_i,
+        "state": job.state,
+        "wait_for_seen": job.wait_for_seen,
+        "network_quiet": job.is_network_quiet(),
+        "elapsed": round(time.monotonic() - job.started, 1),
+        "captcha": job.captcha,
+        "error": job.error,
+    }
+
+
+@api_router.post("/fetch_jobs/{job_id}/finish")
+async def finish_fetch_job(
+    job_id: str,
+    actor: str = Depends(require_api),
+) -> dict[str, Any]:
+    """Завершить задание: прочитать страницу, закрыть вкладку, снять замок."""
+    job = fetch_jobs.get_active_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Задание не найдено или уже закрыто",
+        )
+    try:
+        return await job.finish()
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Задание не найдено или уже закрыто",
+        )
+    except _BROWSER_ERRORS as exc:
+        raise _browser_http_error(exc)
+
+
+@api_router.delete("/fetch_jobs/{job_id}")
+async def cancel_fetch_job(
+    job_id: str,
+    actor: str = Depends(require_api),
+) -> dict[str, bool]:
+    """Отменить задание: закрыть вкладку, снять замок."""
+    cancelled = await fetch_jobs.cancel_job(job_id)
+    return {"cancelled": cancelled}
 
 
 @api_router.get("/devices/{device_id}/browser/tabs")

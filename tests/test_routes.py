@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 import types
 from io import BytesIO
@@ -664,4 +666,140 @@ def test_fetch_page_route_includes_new_timing_fields(client: TestClient, monkeyp
     assert data["t_first_match"] == 0.45
     assert len(data["json_responses"]) == 1
     assert data["json_responses"][0]["t"] == 0.45
+
+
+def test_fetch_jobs_routes_unauthorized(app: FastAPI, client: TestClient) -> None:
+    """HTTP-маршруты fetch_jobs требуют авторизации (401 без токена)."""
+    async def mock_unauthorized() -> str:
+        raise HTTPException(status_code=401, detail="Не авторизован")
+
+    app.dependency_overrides[require_api] = mock_unauthorized
+    try:
+        assert client.post("/api/devices/realme/fetch_jobs", json={"url": "https://example.com"}).status_code == 401
+        assert client.get("/api/fetch_jobs/job123").status_code == 401
+        assert client.post("/api/fetch_jobs/job123/finish").status_code == 401
+        assert client.delete("/api/fetch_jobs/job123").status_code == 401
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_fetch_jobs_routes_not_found(client: TestClient) -> None:
+    """HTTP-маршруты fetch_jobs отдают 404 для неизвестных устройств и заданий."""
+    res_dev = client.post("/api/devices/nonexistent/fetch_jobs", json={"url": "https://example.com"})
+    assert res_dev.status_code == 404
+    assert "не найдено" in res_dev.json()["detail"]
+
+    res_get = client.get("/api/fetch_jobs/nonexistent_job")
+    assert res_get.status_code == 404
+    assert "не найдено или уже закрыто" in res_get.json()["detail"]
+
+    res_finish = client.post("/api/fetch_jobs/nonexistent_job/finish")
+    assert res_finish.status_code == 404
+    assert "не найдено или уже закрыто" in res_finish.json()["detail"]
+
+
+def test_fetch_jobs_routes_bad_request(client: TestClient) -> None:
+    """HTTP-маршруты fetch_jobs отдают 400 при некорректном url или max_seconds."""
+    res_url = client.post("/api/devices/realme/fetch_jobs", json={"url": "ftp://bad.com"})
+    assert res_url.status_code == 400
+    assert "http" in res_url.json()["detail"]
+
+    res_min = client.post("/api/devices/realme/fetch_jobs", json={"url": "https://ok.com", "max_seconds": 0.5})
+    assert res_min.status_code == 400
+    assert "max_seconds" in res_min.json()["detail"]
+
+    res_max = client.post("/api/devices/realme/fetch_jobs", json={"url": "https://ok.com", "max_seconds": 120.0})
+    assert res_max.status_code == 400
+    assert "max_seconds" in res_max.json()["detail"]
+
+
+def test_fetch_jobs_http_full_cycle(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Полный цикл работы с fetch_jobs через HTTP API: POST старт -> GET опрос -> POST finish -> второй finish 404."""
+    from hub.devices import browser, fetch_jobs
+
+    class FakeCtx:
+        def __init__(self, cdp):
+            self.cdp = cdp
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def new_tab(self, url="about:blank"):
+            return {"id": "fake-tab"}
+
+        async def connect(self, tab):
+            return self.cdp
+
+        async def close_tab(self, tab_id):
+            pass
+
+    class FakeCdp:
+        def __init__(self):
+            self.events = asyncio.Queue()
+
+        async def call(self, method, params=None, timeout=15.0):
+            if method == "Network.getResponseBody":
+                return {"body": '{"price": 500}', "base64Encoded": False}
+            if method == "Runtime.evaluate":
+                return {"result": {"value": json.dumps({"url": "https://example.com", "title": "Example", "text": "Page text"})}}
+            return {}
+
+        async def close(self):
+            pass
+
+    cdp = FakeCdp()
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: FakeCtx(cdp))
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+    monkeypatch.setattr(browser, "_read_page", AsyncMock(return_value={
+        "url": "https://example.com",
+        "title": "Example",
+        "text": "Page text",
+        "truncated": False,
+        "captcha": False,
+    }))
+
+    # 1. Запуск задания
+    post_res = client.post(
+        "/api/devices/realme/fetch_jobs",
+        json={"url": "https://example.com", "wait_seconds": 5.0, "max_seconds": 30.0},
+    )
+    assert post_res.status_code == 200
+    job_id = post_res.json()["job_id"]
+    assert bool(job_id)
+
+    # Подаем событие сети в очередь
+    for ev in [
+        {"method": "Network.requestWillBeSent", "params": {"requestId": "r1", "request": {"url": "https://example.com/api"}}},
+        {"method": "Network.responseReceived", "params": {"requestId": "r1", "type": "XHR", "response": {"url": "https://example.com/api", "status": 200, "mimeType": "application/json"}}},
+        {"method": "Network.loadingFinished", "params": {"requestId": "r1"}},
+    ]:
+        cdp.events.put_nowait(ev)
+
+    # 2. GET опрос
+    get_res = client.get(f"/api/fetch_jobs/{job_id}?since=0")
+    assert get_res.status_code == 200
+    get_data = get_res.json()
+    assert get_data["state"] in ("running", "done")
+    assert "responses" in get_data
+    assert "network_quiet" in get_data
+    assert "elapsed" in get_data
+
+    # 3. POST finish
+    finish_res = client.post(f"/api/fetch_jobs/{job_id}/finish")
+    assert finish_res.status_code == 200
+    finish_data = finish_res.json()
+    assert finish_data["url"] == "https://example.com"
+    assert finish_data["json_responses"] == []
+
+    # 4. Повторный finish отдаёт 404
+    finish2_res = client.post(f"/api/fetch_jobs/{job_id}/finish")
+    assert finish2_res.status_code == 404
+
+    # 5. DELETE на закрытое задание отдаёт 200 {"cancelled": false}
+    del_res = client.delete(f"/api/fetch_jobs/{job_id}")
+    assert del_res.status_code == 200
+    assert del_res.json() == {"cancelled": False}
 
