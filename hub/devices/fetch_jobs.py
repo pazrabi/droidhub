@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import secrets
 import sys
@@ -34,6 +35,9 @@ MAX_MAX_SECONDS: float = 90.0
 DEFAULT_MAX_SECONDS: float = 45.0
 CLIENT_SILENCE_SECONDS: float = 15.0
 QUIET_SECONDS: float = 1.5
+FINISH_BODY_WAIT_SECONDS: float = 15.0
+
+logger = logging.getLogger(__name__)
 
 _DevTools: Any = None
 ensure_awake: Any = None
@@ -53,6 +57,10 @@ def _get_quiet_seconds() -> float:
     if b_val != 1.5:
         return float(b_val)
     return float(mod_val)
+
+
+def _get_finish_body_wait_seconds() -> float:
+    return float(getattr(sys.modules[__name__], "FINISH_BODY_WAIT_SECONDS", 15.0))
 
 
 def _get_client_silence_seconds() -> float:
@@ -158,6 +166,7 @@ class FetchJob:
         self._last_matched_time: float = started
         self._last_activity_time: float = started
         self._load_event_fired: bool = False
+        self._max_served_next: int = 0
 
     def touch(self) -> None:
         """Сбрасывает таймер автоотмены при активности клиента."""
@@ -169,18 +178,27 @@ class FetchJob:
         self._new_item_event = asyncio.Event()
         old_ev.set()
 
+    def _has_inflight_bodies(self) -> bool:
+        """Проверяет, есть ли ещё выполняющиеся фоновые задачи загрузки тел ответов."""
+        return any(not t.done() for t in self._bodies_tasks)
+
     def is_network_quiet(self) -> bool:
         """Проверяет затишье сети по подходящим запросам."""
         if self._matched_done < 1:
             return False
         if self._matching_reqs & self._inflight_reqs:
             return False
+        if self._has_inflight_bodies():
+            return False
         return (time.monotonic() - self._last_matched_time) >= _get_quiet_seconds()
 
     def get_slice(self, since: int) -> tuple[list[dict[str, Any]], int]:
         """Возвращает порцию ответов с i >= since и следующий индекс next."""
         items = [r for r in self.responses if r["i"] >= since]
-        return items, len(self.responses)
+        next_i = len(self.responses)
+        if items:
+            self._max_served_next = max(self._max_served_next, next_i)
+        return items, next_i
 
     async def wait_for_data(self, since: int, timeout: float = 1.0) -> None:
         """Длинный опрос: ждёт появления нового ответа или смены состояния до 1 с."""
@@ -199,12 +217,23 @@ class FetchJob:
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
     async def _fetch_body_and_store(self, rid: str, info: dict[str, Any], t: float) -> None:
+        url = info.get("url", "")
         try:
             item = await browser._fetch_body(self.cdp, rid, info)
             if item is None:
+                logger.warning(
+                    "Не удалось получить тело ответа (job_id=%s, url=%s)",
+                    self.job_id,
+                    url,
+                )
                 return
             body = item.get("body", "")
             if self._total_json_bytes + len(body) > MAX_JSON_TOTAL:
+                logger.warning(
+                    "Превышен суммарный лимит JSON (job_id=%s, url=%s)",
+                    self.job_id,
+                    url,
+                )
                 return
             self._total_json_bytes += len(body)
             resp_obj = {
@@ -221,8 +250,16 @@ class FetchJob:
                 if self.t_first_match is None or t < self.t_first_match:
                     self.t_first_match = t
             self._notify()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Ошибка при получении тела ответа (job_id=%s, url=%s): %s",
+                self.job_id,
+                url,
+                exc,
+            )
+        finally:
+            self._last_matched_time = time.monotonic()
+            self._last_activity_time = time.monotonic()
 
     async def _collector_loop(self) -> None:
         """Основной цикл обработки CDP-событий сети и навигации."""
@@ -250,7 +287,12 @@ class FetchJob:
                         self.state = "done"
                         self._notify()
                         break
-                elif self._load_event_fired and not self._inflight_reqs and (now - self._last_activity_time >= quiet_sec):
+                elif (
+                    self._load_event_fired
+                    and not self._inflight_reqs
+                    and not self._has_inflight_bodies()
+                    and (now - self._last_activity_time >= quiet_sec)
+                ):
                     self.finished = True
                     self.state = "done"
                     self._notify()
@@ -507,6 +549,14 @@ class FetchJob:
             self._watchdog_task.cancel()
 
         try:
+            pending = [t for t in self._bodies_tasks if not t.done()]
+            if pending:
+                done, not_done = await asyncio.wait(
+                    pending, timeout=_get_finish_body_wait_seconds()
+                )
+                for t in not_done:
+                    t.cancel()
+
             if self._nav_task and self._nav_task.done() and not self._nav_task.cancelled():
                 if self._nav_task.exception() is not None:
                     raise self._nav_task.exception()
@@ -530,6 +580,18 @@ class FetchJob:
                     "проверь интернет на телефоне и адрес"
                 )
 
+            unserved = [
+                {
+                    "url": r["url"],
+                    "status": r["status"],
+                    "body": r["body"],
+                    "t": r["t"],
+                }
+                for r in self.responses
+                if r["i"] >= self._max_served_next
+            ]
+            self._max_served_next = max(self._max_served_next, len(self.responses))
+
             seconds = round(time.monotonic() - self.started, 1)
             res = {
                 "url": result["url"],
@@ -541,7 +603,7 @@ class FetchJob:
                 "seconds": seconds,
                 "woke": self.woke,
                 "t_first_match": self.t_first_match,
-                "json_responses": [],
+                "json_responses": unserved,
             }
 
             try:
