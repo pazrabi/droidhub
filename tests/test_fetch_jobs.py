@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any
 from unittest.mock import AsyncMock
@@ -450,3 +451,285 @@ async def test_failed_job_delayed_remove(manager: DeviceManager, monkeypatch: py
     # Запускаем delayed_remove с нулевой задержкой
     await job._delayed_remove(0.0)
     assert job_id not in fetch_jobs._jobs
+
+
+async def test_slow_body_keeps_running_and_quiet_only_after_body_stored(
+    manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """«ответ пришёл быстро, а тело отдаётся медленно»: Network.getResponseBody в поддельном CDP
+
+    отвечает через asyncio.sleep(1.0+) с крупным телом (>100 КБ); пока тело не получено,
+    state остаётся running и network_quiet=False, после получения тела ответ появляется в GET
+    и только потом наступает done/quiet.
+    """
+    monkeypatch.setattr(fetch_jobs, "QUIET_SECONDS", 0.1)
+
+    class SlowBodyCdp(FakeFullCdp):
+        async def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+            if method == "Network.getResponseBody":
+                await asyncio.sleep(1.05)
+                return {"body": "x" * 120_000, "base64Encoded": False}
+            return await super().call(method, params, timeout)
+
+    cdp = SlowBodyCdp()
+    fake_dev = FakeDevToolsContext(cdp)
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: fake_dev)
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+
+    job_id = await fetch_jobs.create_fetch_job(
+        "realme", "https://example.com/", capture_json=["/api/search"], max_seconds=10.0
+    )
+    job = fetch_jobs.get_active_job(job_id)
+    assert job is not None
+
+    for ev in _request_events("1", "https://example.com/api/search"):
+        cdp.events.put_nowait(ev)
+
+    # Даём время на обработку loadingFinished
+    await asyncio.sleep(0.05)
+
+    # Проверяем в середине загрузки тела:
+    # Тело ещё в пути (sleep 1.05 с), поэтому state=running, network_quiet=False
+    await asyncio.sleep(0.25)
+    assert job.state == "running"
+    assert job.is_network_quiet() is False
+    items_mid, next_mid = job.get_slice(since=0)
+    assert items_mid == []
+    assert next_mid == 0
+
+    # Ждём завершения загрузки тела
+    await job.wait_for_data(since=0, timeout=1.5)
+
+    # Тело получено и появилось в GET
+    items, next_i = job.get_slice(since=0)
+    assert len(items) == 1
+    assert len(items[0]["body"]) == 120_000
+    assert next_i == 1
+
+    # Сразу после получения тела тишина ещё не наступила (QUIET_SECONDS=0.1 с)
+    # state остаётся running и network_quiet=False
+    assert job.state == "running"
+    assert job.is_network_quiet() is False
+
+    # Только после истечения QUIET_SECONDS наступает quiet и done
+    await asyncio.sleep(0.15)
+    assert job.is_network_quiet() is True
+    assert job.state == "done"
+    assert job.finished is True
+
+
+async def test_finish_waits_for_inflight_body_and_returns_unserved(
+    manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """finish, вызванный ПОКА тело в пути, дожидается его и возвращает в json_responses
+
+    (ещё не выданный клиенту ответ), а второй такой ответ, уже выданный через GET,
+    в finish не повторяется.
+    """
+    monkeypatch.setattr(fetch_jobs, "QUIET_SECONDS", 0.1)
+
+    class MultiBodyCdp(FakeFullCdp):
+        async def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+            if method == "Network.getResponseBody":
+                rid = (params or {}).get("requestId", "")
+                if rid == "1":
+                    return {"body": '{"first": 1}', "base64Encoded": False}
+                if rid == "2":
+                    await asyncio.sleep(0.3)
+                    return {"body": '{"second": 2}', "base64Encoded": False}
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "value": json.dumps({
+                            "url": "https://example.com/",
+                            "title": "Example",
+                            "text": "Example text",
+                        })
+                    }
+                }
+            return await super().call(method, params, timeout)
+
+    cdp = MultiBodyCdp()
+    fake_dev = FakeDevToolsContext(cdp)
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: fake_dev)
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+
+    job_id = await fetch_jobs.create_fetch_job(
+        "realme", "https://example.com/", capture_json=["/api/"]
+    )
+    job = fetch_jobs.get_active_job(job_id)
+    assert job is not None
+
+    # Подаем первый ответ, он отдается быстро
+    for ev in _request_events("1", "https://example.com/api/1"):
+        cdp.events.put_nowait(ev)
+    await asyncio.sleep(0.05)
+
+    # Клиент получает первый ответ через GET
+    items1, next1 = job.get_slice(since=0)
+    assert len(items1) == 1
+    assert items1[0]["body"] == '{"first": 1}'
+    assert next1 == 1
+
+    # Подаем второй ответ с медленным получением тела (0.3 с)
+    for ev in _request_events("2", "https://example.com/api/2"):
+        cdp.events.put_nowait(ev)
+    await asyncio.sleep(0.05)
+
+    # В этот момент тело 2 ещё в пути
+    assert job._has_inflight_bodies() is True
+
+    # Клиент зовёт finish ПОКА тело 2 в пути
+    res = await job.finish()
+
+    # finish дождался тела 2 и вернул его в json_responses
+    json_res = res["json_responses"]
+    assert len(json_res) == 1
+    assert json_res[0]["url"] == "https://example.com/api/2"
+    assert json_res[0]["body"] == '{"second": 2}'
+    assert json_res[0]["status"] == 200
+    assert isinstance(json_res[0]["t"], float)
+
+    # Первый ответ, уже выданный через GET, в finish не повторяется!
+    assert all(r["body"] != '{"first": 1}' for r in json_res)
+
+    # Вкладка закрыта, замок снят
+    lock = browser._get_lock("realme")
+    assert lock.locked() is False
+    assert "fake-tab-id" in fake_dev.closed_tabs
+
+
+async def test_finish_body_wait_timeout_does_not_hang(
+    manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """При превышении FINISH_BODY_WAIT_SECONDS finish не зависает, а возвращает что есть,
+
+    вкладка закрыта, замок снят.
+    """
+    monkeypatch.setattr(fetch_jobs, "FINISH_BODY_WAIT_SECONDS", 0.1)
+
+    class HangingBodyCdp(FakeFullCdp):
+        async def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+            if method == "Network.getResponseBody":
+                await asyncio.sleep(5.0)  # Дольше FINISH_BODY_WAIT_SECONDS (0.1 с)
+                return {"body": '{"slow": true}', "base64Encoded": False}
+            if method == "Runtime.evaluate":
+                return {
+                    "result": {
+                        "value": json.dumps({
+                            "url": "https://example.com/",
+                            "title": "Example",
+                            "text": "Page text after timeout",
+                        })
+                    }
+                }
+            return await super().call(method, params, timeout)
+
+    cdp = HangingBodyCdp()
+    fake_dev = FakeDevToolsContext(cdp)
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: fake_dev)
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+
+    job_id = await fetch_jobs.create_fetch_job(
+        "realme", "https://example.com/", capture_json=["/api/slow"]
+    )
+    job = fetch_jobs.get_active_job(job_id)
+    assert job is not None
+
+    for ev in _request_events("1", "https://example.com/api/slow"):
+        cdp.events.put_nowait(ev)
+    await asyncio.sleep(0.05)
+
+    # finish вызывается, когда тело висит
+    t0 = time.monotonic()
+    res = await job.finish()
+    elapsed = time.monotonic() - t0
+
+    # finish не завис на 5 секунд, а завершился около 0.1 с
+    assert elapsed < 0.6
+    assert res["text"] == "Page text after timeout"
+    assert res["json_responses"] == []
+
+    # Вкладка закрыта, замок снят
+    lock = browser._get_lock("realme")
+    assert lock.locked() is False
+    assert "fake-tab-id" in fake_dev.closed_tabs
+
+
+async def test_max_seconds_done_even_if_body_in_flight(
+    manager: DeviceManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """по max_seconds задание переходит в done, даже если тело ещё не пришло."""
+    monkeypatch.setattr(fetch_jobs, "MIN_MAX_SECONDS", 0.1)
+    monkeypatch.setattr(fetch_jobs, "QUIET_SECONDS", 1.0)
+
+    class HangingBodyCdp(FakeFullCdp):
+        async def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+            if method == "Network.getResponseBody":
+                await asyncio.sleep(3.0)
+                return {"body": '{"slow": true}', "base64Encoded": False}
+            return await super().call(method, params, timeout)
+
+    cdp = HangingBodyCdp()
+    fake_dev = FakeDevToolsContext(cdp)
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: fake_dev)
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+
+    job_id = await fetch_jobs.create_fetch_job(
+        "realme", "https://example.com/", capture_json=["/api/slow"], max_seconds=0.2
+    )
+    job = fetch_jobs.get_active_job(job_id)
+    assert job is not None
+
+    for ev in _request_events("1", "https://example.com/api/slow"):
+        cdp.events.put_nowait(ev)
+    await asyncio.sleep(0.05)
+
+    assert job.state == "running"
+    assert job.is_network_quiet() is False
+
+    # Ждём истечения max_seconds (0.2 с)
+    await asyncio.sleep(0.25)
+    assert job.state == "done"
+    # Тело всё ещё не пришло (sleep 3.0 c)
+    assert job._has_inflight_bodies() is True
+
+    # Замок всё ещё удерживается до вызова finish или cancel
+    lock = browser._get_lock("realme")
+    assert lock.locked() is True
+
+    await job.cancel()
+    assert lock.locked() is False
+
+
+async def test_fetch_body_warning_logged_on_none_or_exception(
+    manager: DeviceManager, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """При None или исключении в _fetch_body_and_store пишется logger.warning с job_id и url."""
+    class BrokenBodyCdp(FakeFullCdp):
+        async def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+            if method == "Network.getResponseBody":
+                raise browser.BrowserError("Тело не найдено в кеше Chrome")
+            return await super().call(method, params, timeout)
+
+    cdp = BrokenBodyCdp()
+    fake_dev = FakeDevToolsContext(cdp)
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: fake_dev)
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+
+    with caplog.at_level(logging.WARNING, logger="hub.devices.fetch_jobs"):
+        job_id = await fetch_jobs.create_fetch_job(
+            "realme", "https://example.com/", capture_json=["/api/broken"]
+        )
+        job = fetch_jobs.get_active_job(job_id)
+        assert job is not None
+
+        for ev in _request_events("1", "https://example.com/api/broken"):
+            cdp.events.put_nowait(ev)
+        await asyncio.sleep(0.1)
+
+        # Проверяем, что в логе появилось предупреждение с job_id и url
+        assert any(
+            job_id in record.message and "https://example.com/api/broken" in record.message
+            for record in caplog.records
+        )
