@@ -53,6 +53,7 @@ class FetchPageRequest(BaseModel):
     max_chars: int = 200000
     wait_for: str | None = None
     wait_full: bool = False
+    replay_post: dict | None = None
 
 
 class FetchJobsRequest(BaseModel):
@@ -63,6 +64,7 @@ class FetchJobsRequest(BaseModel):
     wait_for: str | None = None
     wait_full: bool = False
     max_seconds: float = 45.0
+    replay_post: dict | None = None
 
 
 class PowerRequest(BaseModel):
@@ -533,9 +535,12 @@ async def fetch_page_device(
     """Открыть адрес в Chrome телефона и вернуть текст страницы и JSON-ответы сайта."""
     await _check_device_and_rate_limit(device_id, request=request)
     try:
+        kwargs: dict[str, Any] = {"actor": actor}
+        if req.replay_post is not None:
+            kwargs["replay_post"] = req.replay_post
         return await browser.fetch_page(
             device_id, req.url, req.wait_seconds, req.capture_json, req.max_chars,
-            req.wait_for, req.wait_full, actor=actor
+            req.wait_for, req.wait_full, **kwargs
         )
     except _BROWSER_ERRORS as exc:
         raise _browser_http_error(exc)
@@ -551,6 +556,9 @@ async def create_fetch_job_device(
     """Запустить фоновое задание загрузки страницы для стриминга ответов."""
     await _check_device_and_rate_limit(device_id, request=request)
     try:
+        kwargs: dict[str, Any] = {"actor": actor}
+        if req.replay_post is not None:
+            kwargs["replay_post"] = req.replay_post
         job_id = await fetch_jobs.create_fetch_job(
             device_id=device_id,
             url=req.url,
@@ -560,7 +568,7 @@ async def create_fetch_job_device(
             wait_for=req.wait_for,
             wait_full=req.wait_full,
             max_seconds=req.max_seconds,
-            actor=actor,
+            **kwargs,
         )
         return {"job_id": job_id}
     except _BROWSER_ERRORS as exc:

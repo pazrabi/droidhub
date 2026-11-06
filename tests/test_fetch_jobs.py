@@ -733,3 +733,242 @@ async def test_fetch_body_warning_logged_on_none_or_exception(
             job_id in record.message and "https://example.com/api/broken" in record.message
             for record in caplog.records
         )
+
+
+# --- Тесты для replay_post в fetch_jobs ---
+
+class ReplayFetchJobCdp(FakeFullCdp):
+    def __init__(
+        self,
+        events: list[dict] | None = None,
+        body_map: dict[str, str] | None = None,
+        evaluate_response: dict | None = None,
+        evaluate_delay: float = 0.0,
+        evaluate_exception: Exception | None = None,
+        post_data_map: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(events, body_map)
+        self.evaluate_response = evaluate_response
+        self.evaluate_delay = evaluate_delay
+        self.evaluate_exception = evaluate_exception
+        self.post_data_map = post_data_map or {}
+        self.evaluate_calls: list[dict] = []
+
+    async def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+        params = params or {}
+        if method == "Network.getRequestPostData":
+            rid = params.get("requestId", "")
+            return {"postData": self.post_data_map.get(rid, '{"limit": 10}')}
+        if method == "Runtime.evaluate":
+            expr = params.get("expression", "")
+            if "fetch(" in expr:
+                self.evaluate_calls.append(params)
+                if self.evaluate_delay > 0:
+                    await asyncio.sleep(self.evaluate_delay)
+                if self.evaluate_exception is not None:
+                    raise self.evaluate_exception
+                if self.evaluate_response is not None:
+                    return self.evaluate_response
+                return {"result": {"value": {"ok": True, "status": 200, "body": '{"offers": [1, 2, 3]}'}}}
+        return await super().call(method, params, timeout)
+
+
+def _post_events(
+    rid: str,
+    url: str,
+    post_data: str | None = None,
+    headers: dict | None = None,
+) -> list[dict]:
+    req: dict[str, Any] = {
+        "url": url,
+        "method": "POST",
+        "headers": headers or {"Content-Type": "application/json"},
+    }
+    if post_data is not None:
+        req["postData"] = post_data
+    return [
+        {"method": "Network.requestWillBeSent", "params": {"requestId": rid, "request": req}},
+        {
+            "method": "Network.responseReceived",
+            "params": {
+                "requestId": rid,
+                "type": "XHR",
+                "response": {"url": url, "status": 200, "mimeType": "application/json"},
+            },
+        },
+        {"method": "Network.loadingFinished", "params": {"requestId": rid}},
+    ]
+
+
+async def test_fetch_jobs_replay_post_flow_and_streaming(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """В задании ответ попадает в responses со сквозным i, стримится без потерь/дублей, учитывается в inflight/quiet."""
+    cdp = ReplayFetchJobCdp(evaluate_delay=0.08)
+    fake_dev = FakeDevToolsContext(cdp)
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: fake_dev)
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+
+    job_id = await fetch_jobs.create_fetch_job(
+        "realme",
+        "https://example.com/search",
+        capture_json=["/api/offers"],
+        replay_post={"url_contains": "/api/offers", "set": {"limit": 100, "filter": "direct"}},
+    )
+    job = fetch_jobs.get_active_job(job_id)
+    assert job is not None
+
+    for ev in _post_events("1", "https://example.com/api/offers", post_data='{"limit": 10, "offset": 0}'):
+        cdp.events.put_nowait(ev)
+
+    # Пока повтор выполняется (evaluate_delay 0.08), _has_inflight_bodies() возвращает True
+    await asyncio.sleep(0.02)
+    assert job._has_inflight_bodies() is True
+    assert job.is_network_quiet() is False
+
+    # Дожидаемся завершения исходного запроса и повтора
+    await asyncio.sleep(0.12)
+    assert job._has_inflight_bodies() is False
+
+    # Проверяем, что в fetch ушло тело с перезаписанными полями
+    assert len(cdp.evaluate_calls) == 1
+    expr = cdp.evaluate_calls[0]["expression"]
+    assert '"limit": 100' in expr
+    assert '"filter": "direct"' in expr
+    assert '"offset": 0' in expr
+
+    # Проверяем responses: начальный i=0 и повторный i=1 с replayed=True
+    assert len(job.responses) == 2
+    r0 = job.responses[0]
+    r1 = job.responses[1]
+    assert r0["i"] == 0
+    assert r0["url"] == "https://example.com/api/offers"
+    assert "replayed" not in r0
+
+    assert r1["i"] == 1
+    assert r1["url"] == "https://example.com/api/offers"
+    assert r1["replayed"] is True
+    assert r1["body"] == '{"offers": [1, 2, 3]}'
+    assert r1["t"] >= r0["t"]
+    assert job.t_first_match == r0["t"]
+
+    # Проверяем стриминг через get_slice: since=0 отдаёт оба, since=next отдаёт пусто
+    items0, next0 = job.get_slice(since=0)
+    assert len(items0) == 2
+    assert next0 == 2
+
+    items1, next1 = job.get_slice(since=next0)
+    assert len(items1) == 0
+    assert next1 == 2
+
+    # Завершаем: unserved пуст, так как всё выдано
+    fin = await job.finish()
+    assert fin["json_responses"] == []
+    assert fin["t_first_match"] == r0["t"]
+
+
+async def test_fetch_jobs_replay_post_finish_unserved(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Если finish вызван без предварительного get_slice, replayed: True возвращается в json_responses."""
+    cdp = ReplayFetchJobCdp()
+    fake_dev = FakeDevToolsContext(cdp)
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: fake_dev)
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+
+    job_id = await fetch_jobs.create_fetch_job(
+        "realme",
+        "https://example.com/search",
+        capture_json=["/api/offers"],
+        replay_post={"url_contains": "/api/offers", "set": {"limit": 100}},
+    )
+    job = fetch_jobs.get_active_job(job_id)
+    assert job is not None
+
+    for ev in _post_events("1", "https://example.com/api/offers", post_data='{"limit": 10}'):
+        cdp.events.put_nowait(ev)
+    await asyncio.sleep(0.08)
+
+    fin = await job.finish()
+    assert len(fin["json_responses"]) == 2
+    replayed = [r for r in fin["json_responses"] if r.get("replayed") is True]
+    assert len(replayed) == 1
+    assert replayed[0]["body"] == '{"offers": [1, 2, 3]}'
+
+
+async def test_fetch_jobs_replay_post_not_intercepted_silently_skipped(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Если подходящий POST-запрос не пришёл, повтор пропускается без ошибки."""
+    cdp = ReplayFetchJobCdp()
+    fake_dev = FakeDevToolsContext(cdp)
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: fake_dev)
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+
+    job_id = await fetch_jobs.create_fetch_job(
+        "realme",
+        "https://example.com/",
+        replay_post={"url_contains": "/api/offers", "set": {"limit": 100}},
+    )
+    job = fetch_jobs.get_active_job(job_id)
+    assert job is not None
+
+    for ev in _request_events("1", "https://example.com/api/other"):
+        cdp.events.put_nowait(ev)
+    await asyncio.sleep(0.05)
+
+    assert len(cdp.evaluate_calls) == 0
+    assert len(job.responses) == 1
+    assert "replayed" not in job.responses[0]
+
+
+async def test_fetch_jobs_replay_post_body_not_json_dict_silently_skipped(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Если тело перехваченного запроса не является JSON-словарём, повтор пропускается."""
+    cdp = ReplayFetchJobCdp()
+    fake_dev = FakeDevToolsContext(cdp)
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: fake_dev)
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+
+    job_id = await fetch_jobs.create_fetch_job(
+        "realme",
+        "https://example.com/",
+        replay_post={"url_contains": "/api/offers", "set": {"limit": 100}},
+    )
+    job = fetch_jobs.get_active_job(job_id)
+    assert job is not None
+
+    for ev in _post_events("1", "https://example.com/api/offers", post_data="not json string"):
+        cdp.events.put_nowait(ev)
+    await asyncio.sleep(0.05)
+
+    assert len(cdp.evaluate_calls) == 0
+    assert len(job.responses) == 1
+
+
+async def test_fetch_jobs_replay_post_fetch_error_silently_skipped(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Если fetch возвращает ошибку, повтор пропускается."""
+    cdp = ReplayFetchJobCdp(evaluate_response={"result": {"value": {"ok": False, "status": 500, "body": "error"}}})
+    fake_dev = FakeDevToolsContext(cdp)
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: fake_dev)
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+
+    job_id = await fetch_jobs.create_fetch_job(
+        "realme",
+        "https://example.com/",
+        replay_post={"url_contains": "/api/offers", "set": {"limit": 100}},
+    )
+    job = fetch_jobs.get_active_job(job_id)
+    assert job is not None
+
+    for ev in _post_events("1", "https://example.com/api/offers", post_data='{"limit": 10}'):
+        cdp.events.put_nowait(ev)
+    await asyncio.sleep(0.05)
+
+    assert len(job.responses) == 1
+    assert "replayed" not in job.responses[0]
+
+
+async def test_fetch_jobs_replay_post_validation(manager: DeviceManager) -> None:
+    """Валидация replay_post в create_fetch_job: url_contains непустая строка, set словарь."""
+    with pytest.raises(ValueError, match="url_contains"):
+        await fetch_jobs.create_fetch_job("realme", "https://example.com", replay_post={"url_contains": "", "set": {}})
+
+    with pytest.raises(ValueError, match="set"):
+        await fetch_jobs.create_fetch_job("realme", "https://example.com", replay_post={"url_contains": "/api", "set": []})
+
+    with pytest.raises(ValueError, match="словарём"):
+        await fetch_jobs.create_fetch_job("realme", "https://example.com", replay_post=123)

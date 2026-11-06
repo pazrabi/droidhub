@@ -803,3 +803,74 @@ def test_fetch_jobs_http_full_cycle(client: TestClient, monkeypatch: pytest.Monk
     assert del_res.status_code == 200
     assert del_res.json() == {"cancelled": False}
 
+
+def test_fetch_page_and_jobs_replay_post_routes(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Проверка передачи replay_post в fetch_page и fetch_jobs, а также 400 при невалидном replay_post."""
+    from hub.devices import browser, fetch_jobs
+    mock_fetch_page = AsyncMock(return_value={"url": "https://avia.ru", "json_responses": []})
+    mock_create_job = AsyncMock(return_value="test_job_123")
+    monkeypatch.setattr(browser, "fetch_page", mock_fetch_page)
+    monkeypatch.setattr(fetch_jobs, "create_fetch_job", mock_create_job)
+
+    # 1. fetch_page с валидным replay_post
+    res_page = client.post(
+        "/api/devices/realme/fetch_page",
+        json={
+            "url": "https://avia.ru",
+            "replay_post": {"url_contains": "/avia/offers/v2", "set": {"limit": 50}},
+        },
+    )
+    assert res_page.status_code == 200
+    mock_fetch_page.assert_called_once()
+    assert mock_fetch_page.call_args.kwargs.get("replay_post") == {
+        "url_contains": "/avia/offers/v2",
+        "set": {"limit": 50},
+    }
+
+    # 2. fetch_jobs с валидным replay_post
+    res_jobs = client.post(
+        "/api/devices/realme/fetch_jobs",
+        json={
+            "url": "https://avia.ru",
+            "replay_post": {"url_contains": "/avia/offers/v2", "set": {"limit": 50}},
+        },
+    )
+    assert res_jobs.status_code == 200
+    assert res_jobs.json() == {"job_id": "test_job_123"}
+    mock_create_job.assert_called_once()
+    assert mock_create_job.call_args.kwargs.get("replay_post") == {
+        "url_contains": "/avia/offers/v2",
+        "set": {"limit": 50},
+    }
+
+
+def test_fetch_page_and_jobs_replay_post_bad_request(client: TestClient) -> None:
+    """Невалидный replay_post возвращает 400 Bad Request."""
+    # 1. fetch_page: пустой url_contains
+    res1 = client.post(
+        "/api/devices/realme/fetch_page",
+        json={"url": "https://avia.ru", "replay_post": {"url_contains": "", "set": {}}},
+    )
+    assert res1.status_code == 400
+
+    # 2. fetch_page: set не словарь
+    res2 = client.post(
+        "/api/devices/realme/fetch_page",
+        json={"url": "https://avia.ru", "replay_post": {"url_contains": "/api", "set": "not-dict"}},
+    )
+    assert res2.status_code == 400
+
+    # 3. fetch_jobs: пустой url_contains
+    res3 = client.post(
+        "/api/devices/realme/fetch_jobs",
+        json={"url": "https://avia.ru", "replay_post": {"url_contains": "", "set": {}}},
+    )
+    assert res3.status_code == 400
+
+    # 4. fetch_jobs: set не словарь
+    res4 = client.post(
+        "/api/devices/realme/fetch_jobs",
+        json={"url": "https://avia.ru", "replay_post": {"url_contains": "/api", "set": "not-dict"}},
+    )
+    assert res4.status_code == 400
+
