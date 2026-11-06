@@ -340,6 +340,7 @@ class FetchJob:
                 )
             except Exception:
                 pass
+            asyncio.create_task(self._delayed_remove(60.0))
 
     async def _captcha_loop(self) -> None:
         """Периодическая проверка наличия капчи на странице (раз в ~2 с)."""
@@ -382,46 +383,54 @@ class FetchJob:
 
     async def _release_resources(self) -> None:
         """Освобождает вкладку, закрывает порт и снимает замок (гарантированно один раз)."""
+        current = asyncio.current_task()
         tasks = [self._collector_task, self._captcha_task, self._watchdog_task, self._nav_task]
         for t in tasks:
-            if t is not None and not t.done():
+            if t is not None and t is not current and not t.done():
                 t.cancel()
 
         for t in self._bodies_tasks:
-            if not t.done():
+            if t is not None and t is not current and not t.done():
                 t.cancel()
 
-        if self.cdp is not None:
-            try:
-                await self.cdp.close()
-            except Exception:
-                pass
-            self.cdp = None
-
-        if self.dev is not None:
-            if self.tab_id:
+        try:
+            if self.cdp is not None:
+                cdp = self.cdp
+                self.cdp = None
                 try:
-                    await self.dev.close_tab(self.tab_id)
-                except Exception:
+                    await cdp.close()
+                except BaseException:
                     pass
+
+            if self.dev is not None:
+                dev = self.dev
+                self.dev = None
+                tab_id = self.tab_id
                 self.tab_id = None
-            try:
-                await self.dev.__aexit__(None, None, None)
-            except Exception:
-                pass
-            self.dev = None
+                if tab_id:
+                    try:
+                        await dev.close_tab(tab_id)
+                    except BaseException:
+                        pass
+                try:
+                    await dev.__aexit__(None, None, None)
+                except BaseException:
+                    pass
+        finally:
+            if self._activity_token is not None:
+                token = self._activity_token
+                self._activity_token = None
+                try:
+                    activity.end(self.device_id, token)
+                except BaseException:
+                    pass
 
-        if self._activity_token is not None:
-            activity.end(self.device_id, self._activity_token)
-            self._activity_token = None
-
-        if self._lock_held:
-            self._lock_held = False
-            lock = browser._get_lock(self.device_id)
-            try:
-                lock.release()
-            except RuntimeError:
-                pass
+            if self._lock_held:
+                self._lock_held = False
+                try:
+                    browser._get_lock(self.device_id).release()
+                except RuntimeError:
+                    pass
 
     async def _delayed_remove(self, delay: float = 60.0) -> None:
         """Удаляет завершённое задание из реестра памяти через delay секунд."""
@@ -617,6 +626,7 @@ async def create_fetch_job(
     dev = None
     cdp = None
     tab_id = None
+    lock_held = True
     try:
         activity_token = activity.begin(device_id, "fetch_job", actor)
         ensure_awake_fn = _get_ensure_awake_fn()
@@ -666,6 +676,7 @@ async def create_fetch_job(
 
         job.start_tasks()
         _jobs[job_id] = job
+        lock_held = False
 
         try:
             await actions._record_audit(
@@ -688,23 +699,29 @@ async def create_fetch_job(
             pass
 
         return job_id
-    except Exception:
-        if cdp is not None:
-            try:
-                await cdp.close()
-            except Exception:
-                pass
-        if dev is not None:
-            if tab_id:
+    finally:
+        if lock_held:
+            if cdp is not None:
                 try:
-                    await dev.close_tab(tab_id)
-                except Exception:
+                    await cdp.close()
+                except BaseException:
+                    pass
+            if dev is not None:
+                if tab_id:
+                    try:
+                        await dev.close_tab(tab_id)
+                    except BaseException:
+                        pass
+                try:
+                    await dev.__aexit__(None, None, None)
+                except BaseException:
+                    pass
+            if activity_token is not None:
+                try:
+                    activity.end(device_id, activity_token)
+                except BaseException:
                     pass
             try:
-                await dev.__aexit__(None, None, None)
-            except Exception:
+                lock.release()
+            except RuntimeError:
                 pass
-        if activity_token is not None:
-            activity.end(device_id, activity_token)
-        lock.release()
-        raise

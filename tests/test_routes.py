@@ -725,7 +725,7 @@ def test_fetch_jobs_http_full_cycle(client: TestClient, monkeypatch: pytest.Monk
             return self
 
         async def __aexit__(self, *args):
-            pass
+            await asyncio.sleep(0)
 
         async def new_tab(self, url="about:blank"):
             return {"id": "fake-tab"}
@@ -734,7 +734,7 @@ def test_fetch_jobs_http_full_cycle(client: TestClient, monkeypatch: pytest.Monk
             return self.cdp
 
         async def close_tab(self, tab_id):
-            pass
+            await asyncio.sleep(0)
 
     class FakeCdp:
         def __init__(self):
@@ -748,7 +748,7 @@ def test_fetch_jobs_http_full_cycle(client: TestClient, monkeypatch: pytest.Monk
             return {}
 
         async def close(self):
-            pass
+            await asyncio.sleep(0)
 
     cdp = FakeCdp()
     monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: FakeCtx(cdp))

@@ -26,6 +26,7 @@ class FakeDevToolsContext:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
+        await asyncio.sleep(0)
         self.exited = True
 
     async def new_tab(self, url: str = "about:blank") -> dict:
@@ -35,6 +36,7 @@ class FakeDevToolsContext:
         return self.cdp
 
     async def close_tab(self, tab_id: str) -> None:
+        await asyncio.sleep(0)
         self.closed_tabs.append(tab_id)
 
 
@@ -63,6 +65,7 @@ class FakeFullCdp:
         return {}
 
     async def close(self) -> None:
+        await asyncio.sleep(0)
         self.closed = True
 
 
@@ -406,3 +409,44 @@ async def test_long_polling_wakes_up_early_on_new_data(manager: DeviceManager, m
     items, next_i = job.get_slice(since=0)
     assert len(items) == 1
     assert next_i == 1
+
+
+async def test_create_fetch_job_cancelled_releases_lock_and_activity(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """При отмене создания задания (asyncio.CancelledError) замок и активность освобождаются."""
+    async def _cancelled_ensure_awake(*args: Any, **kwargs: Any) -> bool:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(actions, "ensure_awake", _cancelled_ensure_awake)
+    lock = browser._get_lock("realme")
+    assert lock.locked() is False
+
+    with pytest.raises(asyncio.CancelledError):
+        await fetch_jobs.create_fetch_job("realme", "https://example.com/")
+
+    assert lock.locked() is False
+    assert activity.current("realme") is None
+
+
+async def test_failed_job_delayed_remove(manager: DeviceManager, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Упавшее задание удаляется из реестра памяти через delayed_remove."""
+    class BrokenCdp(FakeFullCdp):
+        async def call(self, method: str, params: dict | None = None, timeout: float = 15.0) -> dict:
+            if method == "Page.navigate":
+                raise browser.BrowserUnavailable("Chrome упал")
+            return await super().call(method, params, timeout)
+
+    cdp = BrokenCdp()
+    fake_dev = FakeDevToolsContext(cdp)
+    monkeypatch.setattr(fetch_jobs, "_DevTools", lambda serial: fake_dev)
+    monkeypatch.setattr(actions, "ensure_awake", AsyncMock(return_value=False))
+
+    job_id = await fetch_jobs.create_fetch_job("realme", "https://example.com/")
+    job = fetch_jobs.get_active_job(job_id)
+    assert job is not None
+    await asyncio.sleep(0.05)
+    assert job.state == "failed"
+    assert job_id in fetch_jobs._jobs
+
+    # Запускаем delayed_remove с нулевой задержкой
+    await job._delayed_remove(0.0)
+    assert job_id not in fetch_jobs._jobs
