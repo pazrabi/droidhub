@@ -124,12 +124,12 @@
     return { text, className: 'temp-neutral', isOverheat: false };
   }
 
-  function formatBattery(batt) {
+  function formatBattery(batt, charging) {
     if (batt === null || batt === undefined || isNaN(batt)) {
       return { text: '—', className: '' };
     }
     const val = Number(batt);
-    const text = `${Math.round(val)}%`;
+    const text = `${Math.round(val)}%` + (charging === true ? ' ⚡ заряжается' : '');
     let className = 'battery-neutral';
     if (val <= 15) {
       className = 'battery-danger';

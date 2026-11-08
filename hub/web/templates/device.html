@@ -16,7 +16,7 @@
       <div class="telemetry-item" id="telemetry-battery">
         <span class="telemetry-label">Заряд:</span>
         <span class="telemetry-value battery-value" id="device-battery-val">
-          {% if device_status and device_status.battery is not none %}{{ device_status.battery }}%{% else %}—{% endif %}
+          {% if device_status and device_status.battery is not none %}{{ device_status.battery }}%{% if device_status.charging %} ⚡ заряжается{% endif %}{% else %}—{% endif %}
         </span>
       </div>
       <div class="telemetry-item" id="telemetry-temp">

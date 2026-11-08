@@ -40,7 +40,7 @@
           <div class="device-meta-row">
             <span class="meta-label">Батарея:</span>
             <span class="meta-value battery-value" id="battery-{{ d.id }}">
-              {% if d.battery is not none %}{{ d.battery }}%{% else %}—{% endif %}
+              {% if d.battery is not none %}{{ d.battery }}%{% if d.charging %} ⚡ заряжается{% endif %}{% else %}—{% endif %}
             </span>
           </div>
           <div class="device-meta-row">

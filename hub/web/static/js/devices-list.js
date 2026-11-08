@@ -104,7 +104,7 @@
         // Батарея
         const batteryEl = document.getElementById(`battery-${d.id}`);
         if (batteryEl) {
-          const bInfo = formatBattery(d.battery);
+          const bInfo = formatBattery(d.battery, d.charging);
           batteryEl.textContent = bInfo.text;
           batteryEl.className = `meta-value battery-value ${bInfo.className}`;
         }

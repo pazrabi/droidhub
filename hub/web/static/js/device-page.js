@@ -649,7 +649,7 @@
     function updateDevicePageStatus(status) {
       const batteryEl = document.getElementById('device-battery-val');
       if (batteryEl) {
-        const bInfo = formatBattery(status.battery);
+        const bInfo = formatBattery(status.battery, status.charging);
         batteryEl.textContent = bInfo.text;
         batteryEl.className = `telemetry-value battery-value ${bInfo.className}`;
       }
