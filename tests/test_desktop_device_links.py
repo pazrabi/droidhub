@@ -48,13 +48,13 @@ class TestValidateIdentifier:
     )
     def test_non_string_types(self, invalid_val: object) -> None:
         """Нестроковые типы вызывают ошибку валидации."""
-        with pytest.raises(DeviceLinkValidationError, match="must be a string"):
+        with pytest.raises(DeviceLinkValidationError, match="должен быть строкой"):
             validate_identifier(invalid_val)  # type: ignore[arg-type]
 
     @pytest.mark.parametrize("empty_val", ["", "   ", "\t", "\n", "\r\n"])
     def test_empty_or_whitespace(self, empty_val: str) -> None:
         """Пустые строки и строки только из пробелов запрещены."""
-        with pytest.raises(DeviceLinkValidationError, match="cannot be empty"):
+        with pytest.raises(DeviceLinkValidationError, match="не может быть пустым"):
             validate_identifier(empty_val)
 
     @pytest.mark.parametrize(
@@ -68,7 +68,7 @@ class TestValidateIdentifier:
 
     def test_too_long(self) -> None:
         """Превышение максимальной длины вызывает ошибку."""
-        with pytest.raises(DeviceLinkValidationError, match="exceeds maximum length"):
+        with pytest.raises(DeviceLinkValidationError, match="превышает максимальную длину"):
             validate_identifier("a" * 257)
 
     @pytest.mark.parametrize(
@@ -87,7 +87,7 @@ class TestValidateIdentifier:
     )
     def test_control_characters(self, control_char: str) -> None:
         """Управляющие и непечатные символы запрещены."""
-        with pytest.raises(DeviceLinkValidationError, match="control or non-printable"):
+        with pytest.raises(DeviceLinkValidationError, match="недопустимый управляющий или непечатный"):
             validate_identifier(f"serial{control_char}123")
 
     @pytest.mark.parametrize(
@@ -99,11 +99,17 @@ class TestValidateIdentifier:
             "wss://secure.hub/ws",
             "ftp://files.local",
             "tcp://192.168.1.1:5555",
+            "file:///etc/hosts",
+            "ssh://user@server:22",
+            "adb://192.168.1.5:5555",
+            "intent://package/#Intent;scheme=android;end",
+            "grpc://127.0.0.1:50051",
+            "custom-scheme://test",
         ],
     )
     def test_urls_forbidden(self, url_val: str) -> None:
         """Сетевые URL и адреса запрещены в качестве идентификаторов."""
-        with pytest.raises(DeviceLinkValidationError, match="cannot be a network URL"):
+        with pytest.raises(DeviceLinkValidationError, match="не может быть сетевым URL"):
             validate_identifier(url_val)
 
     @pytest.mark.parametrize(
@@ -116,7 +122,7 @@ class TestValidateIdentifier:
     )
     def test_auth_headers_forbidden(self, auth_val: str) -> None:
         """Учетные данные и токены запрещены в качестве идентификаторов."""
-        with pytest.raises(DeviceLinkValidationError, match="credentials or authorization"):
+        with pytest.raises(DeviceLinkValidationError, match="учетные данные или токены авторизации"):
             validate_identifier(auth_val)
 
 
@@ -207,7 +213,7 @@ class TestLinkRegistryConflicts:
         reg = LinkRegistry(storage_file)
         reg.link("serial-1", "hub-1")
 
-        with pytest.raises(DeviceLinkConflictError, match="already linked to hub device 'hub-1'"):
+        with pytest.raises(DeviceLinkConflictError, match="уже связан с устройством хаба 'hub-1'"):
             reg.link("serial-1", "hub-2")
 
         # Существующая связь не изменилась
@@ -220,7 +226,7 @@ class TestLinkRegistryConflicts:
         reg = LinkRegistry(storage_file)
         reg.link("serial-1", "hub-1")
 
-        with pytest.raises(DeviceLinkConflictError, match="already linked to serial 'serial-1'"):
+        with pytest.raises(DeviceLinkConflictError, match="уже связано с серийным номером 'serial-1'"):
             reg.link("serial-2", "hub-1")
 
         # Существующая связь не изменилась
@@ -299,7 +305,7 @@ class TestLinkRegistryIdempotency:
         reg.link("serial-1", "hub-1")
         reg.link("serial-2", "hub-2")
 
-        with pytest.raises(DeviceLinkConflictError, match="Mismatch"):
+        with pytest.raises(DeviceLinkConflictError, match="Несоответствие"):
             reg.unlink("serial-1", "hub-2")
 
         # Ни одна связь не удалена
@@ -309,7 +315,7 @@ class TestLinkRegistryIdempotency:
         """Вызов unlink без параметров вызывает DeviceLinkValidationError."""
         storage_file = tmp_path / "links.json"
         reg = LinkRegistry(storage_file)
-        with pytest.raises(DeviceLinkValidationError, match="At least one"):
+        with pytest.raises(DeviceLinkValidationError, match="необходимо указать хотя бы"):
             reg.unlink()
 
 
@@ -328,7 +334,7 @@ class TestLinkRegistryLimits:
         reg.link("s1", "h1")
 
         # Добавление 3-й связи вызывает ошибку
-        with pytest.raises(DeviceLinkLimitError, match="maximum entries limit"):
+        with pytest.raises(DeviceLinkLimitError, match="достигнут максимальный лимит записей"):
             reg.link("s3", "h3")
 
         assert len(reg) == 2
@@ -383,7 +389,7 @@ class TestCorruptionAndNoOverwrite:
             reg.load()
 
         # Попытка вызвать save()
-        with pytest.raises(DeviceLinkCorruptedFileError, match="Refusing to overwrite"):
+        with pytest.raises(DeviceLinkCorruptedFileError, match="Отказ от перезаписи"):
             reg.save()
 
         # Попытка вызвать link()
@@ -412,6 +418,30 @@ class TestCorruptionAndNoOverwrite:
             reg.save()
 
         assert storage_file.read_text(encoding="utf-8") == initial_content
+
+    def test_direct_save_without_load_preserves_existing_data(self, tmp_path: Path) -> None:
+        """Вызов save() на неинициализированном экземпляре не стирает существующие данные."""
+        storage_file = tmp_path / "links.json"
+        reg1 = LinkRegistry(storage_file)
+        reg1.link("serial-1", "hub-1")
+        reg1.link("serial-2", "hub-2")
+        assert len(reg1) == 2
+
+        # Создаем второй экземпляр БЕЗ предварительного load() и сразу вызываем save()
+        reg2 = LinkRegistry(storage_file, autoload=False)
+        assert not reg2._loaded
+        reg2.save()
+
+        # Проверяем, что существующие связи не затерлись
+        reg3 = LinkRegistry(storage_file)
+        links = reg3.load()
+        assert len(links) == 2
+        assert reg3.get_hub_id("serial-1") == "hub-1"
+        assert reg3.get_hub_id("serial-2") == "hub-2"
+        assert reg3.list() == [
+            DeviceLink("serial-1", "hub-1"),
+            DeviceLink("serial-2", "hub-2"),
+        ]
 
 
 class TestAtomicityOnError:

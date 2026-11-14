@@ -119,40 +119,39 @@ def validate_identifier(value: Any, name: str = "ID") -> str:
     """
     if not isinstance(value, str) or isinstance(value, bool):
         raise DeviceLinkValidationError(
-            f"{name} must be a string, got {type(value).__name__}"
+            f"{name} должен быть строкой, получено {type(value).__name__}"
         )
 
     if not value or value.strip() == "":
-        raise DeviceLinkValidationError(f"{name} cannot be empty")
+        raise DeviceLinkValidationError(f"{name} не может быть пустым")
 
     if value != value.strip():
         raise DeviceLinkValidationError(
-            f"{name} cannot contain leading or trailing whitespace"
+            f"{name} не должен содержать пробелов в начале или конце"
         )
 
     if len(value) > MAX_ID_LENGTH:
         raise DeviceLinkValidationError(
-            f"{name} exceeds maximum length limit of {MAX_ID_LENGTH} characters"
+            f"{name} превышает максимальную длину в {MAX_ID_LENGTH} символов"
         )
 
     for ch in value:
         cat = unicodedata.category(ch)
         if cat in ("Cc", "Cs") or ord(ch) < 32 or ord(ch) == 127 or not ch.isprintable():
             raise DeviceLinkValidationError(
-                f"{name} contains invalid control or non-printable character (ord {ord(ch)})"
+                f"{name} содержит недопустимый управляющий или непечатный символ (код {ord(ch)})"
             )
 
     lower = value.lower()
-    for prefix in FORBIDDEN_URL_PREFIXES:
-        if lower.startswith(prefix):
-            raise DeviceLinkValidationError(
-                f"{name} cannot be a network URL or address: {value}"
-            )
+    if "://" in lower or any(lower.startswith(prefix) for prefix in FORBIDDEN_URL_PREFIXES):
+        raise DeviceLinkValidationError(
+            f"{name} не может быть сетевым URL или адресом: {value}"
+        )
 
     for prefix in FORBIDDEN_AUTH_PREFIXES:
         if lower.startswith(prefix):
             raise DeviceLinkValidationError(
-                f"{name} cannot contain credentials or authorization tokens"
+                f"{name} не может содержать учетные данные или токены авторизации"
             )
 
     return value
@@ -167,51 +166,51 @@ def _parse_and_validate_json(
     При любых нарушениях схемы или синтаксиса выбрасывает DeviceLinkCorruptedFileError.
     """
     if not raw_text.strip():
-        raise DeviceLinkCorruptedFileError("Storage file is empty")
+        raise DeviceLinkCorruptedFileError("Файл хранилища пуст")
 
     try:
         data = json.loads(raw_text)
     except json.JSONDecodeError as exc:
         raise DeviceLinkCorruptedFileError(
-            f"Storage file contains invalid JSON: {exc}"
+            f"Файл хранилища содержит некорректный JSON: {exc}"
         ) from exc
 
     if not isinstance(data, dict):
         raise DeviceLinkCorruptedFileError(
-            f"Storage JSON root must be an object, got {type(data).__name__}"
+            f"Корневой элемент JSON хранилища должен быть объектом, получено {type(data).__name__}"
         )
 
     root_keys = set(data.keys())
     extra_keys = root_keys - ALLOWED_ROOT_KEYS
     if extra_keys:
         raise DeviceLinkCorruptedFileError(
-            f"Storage JSON contains unexpected root fields: {sorted(extra_keys)}"
+            f"JSON хранилища содержит непредвиденные корневые поля: {sorted(extra_keys)}"
         )
 
     if "version" not in data:
-        raise DeviceLinkCorruptedFileError("Storage JSON missing required field 'version'")
+        raise DeviceLinkCorruptedFileError("В JSON хранилища отсутствует обязательное поле 'version'")
 
     version = data["version"]
     if not isinstance(version, int) or isinstance(version, bool):
-        raise DeviceLinkCorruptedFileError("Storage JSON field 'version' must be an integer")
+        raise DeviceLinkCorruptedFileError("Поле 'version' в JSON хранилища должно быть целым числом")
 
     if version != SCHEMA_VERSION:
         raise DeviceLinkCorruptedFileError(
-            f"Unsupported schema version: {version} (expected {SCHEMA_VERSION})"
+            f"Неподдерживаемая версия схемы: {version} (ожидается {SCHEMA_VERSION})"
         )
 
     if "links" not in data:
-        raise DeviceLinkCorruptedFileError("Storage JSON missing required field 'links'")
+        raise DeviceLinkCorruptedFileError("В JSON хранилища отсутствует обязательное поле 'links'")
 
     links = data["links"]
     if not isinstance(links, list):
         raise DeviceLinkCorruptedFileError(
-            f"Storage JSON field 'links' must be a list, got {type(links).__name__}"
+            f"Поле 'links' в JSON хранилища должно быть списком, получено {type(links).__name__}"
         )
 
     if len(links) > max_entries:
         raise DeviceLinkCorruptedFileError(
-            f"Storage JSON contains {len(links)} links, exceeding limit of {max_entries}"
+            f"JSON хранилища содержит {len(links)} связей, что превышает лимит {max_entries}"
         )
 
     serial_to_hub: dict[str, str] = {}
@@ -220,14 +219,14 @@ def _parse_and_validate_json(
     for idx, item in enumerate(links):
         if not isinstance(item, dict):
             raise DeviceLinkCorruptedFileError(
-                f"Link entry at index {idx} must be an object, got {type(item).__name__}"
+                f"Запись связи по индексу {idx} должна быть объектом, получено {type(item).__name__}"
             )
 
         item_keys = set(item.keys())
         if item_keys != ALLOWED_ENTRY_KEYS:
             diff = item_keys.symmetric_difference(ALLOWED_ENTRY_KEYS)
             raise DeviceLinkCorruptedFileError(
-                f"Link entry at index {idx} has invalid fields: {sorted(diff)}"
+                f"Запись связи по индексу {idx} содержит недопустимые поля: {sorted(diff)}"
             )
 
         try:
@@ -235,17 +234,17 @@ def _parse_and_validate_json(
             hub_id = validate_identifier(item["hub_id"], name=f"Link[{idx}].hub_id")
         except DeviceLinkValidationError as err:
             raise DeviceLinkCorruptedFileError(
-                f"Invalid identifier in link entry at index {idx}: {err}"
+                f"Недопустимый идентификатор в записи связи по индексу {idx}: {err}"
             ) from err
 
         if serial in serial_to_hub:
             raise DeviceLinkCorruptedFileError(
-                f"Storage file contains duplicate serial '{serial}' at index {idx}"
+                f"Файл хранилища содержит дубликат serial '{serial}' по индексу {idx}"
             )
 
         if hub_id in hub_to_serial:
             raise DeviceLinkCorruptedFileError(
-                f"Storage file contains duplicate hub_id '{hub_id}' at index {idx}"
+                f"Файл хранилища содержит дубликат hub_id '{hub_id}' по индексу {idx}"
             )
 
         serial_to_hub[serial] = hub_id
@@ -295,7 +294,7 @@ class LinkRegistry:
         """Убеждается, что данные загружены из файла, если он существует."""
         if self._corrupted:
             raise DeviceLinkCorruptedFileError(
-                f"Storage file '{self.path}' is corrupted and cannot be used"
+                f"Файл хранилища '{self.path}' поврежден и не может использоваться"
             )
         if not self._loaded and self.path.exists():
             self.load()
@@ -308,18 +307,7 @@ class LinkRegistry:
         Предотвращает случайную перезапись поврежденного файла, если реестр
         был инициализирован без предварительного load().
         """
-        if not self.path.exists():
-            return
-        try:
-            raw_text = self.path.read_text(encoding="utf-8")
-            _parse_and_validate_json(raw_text, self.max_entries)
-        except Exception as exc:
-            self._corrupted = True
-            if isinstance(exc, DeviceLinkCorruptedFileError):
-                raise
-            raise DeviceLinkCorruptedFileError(
-                f"Existing storage file '{self.path}' is corrupted: {exc}"
-            ) from exc
+        self._ensure_loaded()
 
     def load(self) -> list[DeviceLink]:
         """Загружает связи из файла хранилища.
@@ -344,7 +332,7 @@ class LinkRegistry:
         except OSError as exc:
             self._corrupted = True
             raise DeviceLinkCorruptedFileError(
-                f"Failed to read storage file '{self.path}': {exc}"
+                f"Не удалось прочитать файл хранилища '{self.path}': {exc}"
             ) from exc
 
         self._serial_to_hub = serial_to_hub
@@ -391,21 +379,21 @@ class LinkRegistry:
         # Конфликт по serial
         if existing_hub is not None and existing_hub != val_hub_id:
             raise DeviceLinkConflictError(
-                f"Serial '{val_serial}' is already linked to hub device '{existing_hub}'. "
-                f"Unlink it before re-linking."
+                f"Серийный номер '{val_serial}' уже связан с устройством хаба '{existing_hub}'. "
+                f"Сначала выполните unlink."
             )
 
         # Конфликт по hub_id
         if existing_serial is not None and existing_serial != val_serial:
             raise DeviceLinkConflictError(
-                f"Hub device '{val_hub_id}' is already linked to serial '{existing_serial}'. "
-                f"Unlink it before re-linking."
+                f"Устройство хаба '{val_hub_id}' уже связано с серийным номером '{existing_serial}'. "
+                f"Сначала выполните unlink."
             )
 
         # Проверка лимита количества записей
         if len(self._serial_to_hub) >= self.max_entries:
             raise DeviceLinkLimitError(
-                f"Cannot link: registry reached maximum entries limit ({self.max_entries})"
+                f"Невозможно создать связь: достигнут максимальный лимит записей ({self.max_entries})"
             )
 
         # Транзакционное обновление в памяти с откатом при ошибке сохранения
@@ -446,7 +434,7 @@ class LinkRegistry:
 
         if serial is None and hub_id is None:
             raise DeviceLinkValidationError(
-                "At least one of 'serial' or 'hub_id' must be specified for unlink"
+                "Для unlink необходимо указать хотя бы 'serial' или 'hub_id'"
             )
 
         val_serial = validate_identifier(serial, name="serial") if serial is not None else None
@@ -464,8 +452,8 @@ class LinkRegistry:
 
             if s_linked_hub != val_hub_id or h_linked_serial != val_serial:
                 raise DeviceLinkConflictError(
-                    f"Mismatch: serial '{val_serial}' is linked to '{s_linked_hub}', "
-                    f"while hub_id '{val_hub_id}' is linked to '{h_linked_serial}'"
+                    f"Несоответствие: серийный номер '{val_serial}' связан с '{s_linked_hub}', "
+                    f"а hub_id '{val_hub_id}' связан с '{h_linked_serial}'"
                 )
 
             target_serial = val_serial
@@ -511,11 +499,10 @@ class LinkRegistry:
         """
         if self._corrupted:
             raise DeviceLinkCorruptedFileError(
-                f"Refusing to overwrite corrupted storage file: '{self.path}'"
+                f"Отказ от перезаписи поврежденного файла хранилища: '{self.path}'"
             )
 
-        if self.path.exists() and not self._loaded:
-            self._check_file_integrity_before_save()
+        self._ensure_loaded()
 
         payload = {
             "version": SCHEMA_VERSION,
