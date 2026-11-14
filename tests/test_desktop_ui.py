@@ -15,14 +15,20 @@ from desktop.hub_client import HubDevice
 from desktop.ui import DesktopApp
 
 
+_CAN_INIT_TK: bool | None = None
+
+
 def can_init_tk() -> bool:
     """Проверяет возможность создания реального Tk окна в текущем окружении."""
-    try:
-        root = tk.Tk()
-        root.destroy()
-        return True
-    except Exception:
-        return False
+    global _CAN_INIT_TK
+    if _CAN_INIT_TK is None:
+        try:
+            root = tk.Tk()
+            root.destroy()
+            _CAN_INIT_TK = True
+        except Exception:
+            _CAN_INIT_TK = False
+    return _CAN_INIT_TK
 
 
 @pytest.fixture
@@ -226,6 +232,8 @@ def test_ui_guard_against_tcl_error_when_closing(tk_root):
 
             app._render_devices([])
             app._show_refresh_error("test error")
+
+            ctrl.shutdown()
 
 
 def test_ui_hub_tab_and_widgets(tk_root):
@@ -469,5 +477,32 @@ def test_ui_hub_error_does_not_break_usb(tk_root):
             # Список USB устройств остался нетронутым!
             assert len(app.tree.get_children()) == 1
             assert "Готов" in app.status_msg_label.cget("text")
+
+            app.on_close()
+
+
+def test_ui_hub_error_clears_previous_devices_in_table(tk_root):
+    """При ошибке подключения таблица устройств хаба очищается от устаревших данных."""
+    fake_adb = BinaryInfo(name="adb", found=True, path="/fake/adb")
+    fake_scrcpy = BinaryInfo(name="scrcpy", found=True, path="/fake/scrcpy")
+
+    with patch("desktop.controller.find_adb", return_value=fake_adb):
+        with patch("desktop.controller.find_scrcpy", return_value=fake_scrcpy):
+            ctrl = AppController()
+            app = DesktopApp(tk_root, controller=ctrl)
+
+            # 1. Успешный рендеринг устройств
+            prev_dev = HubDevice(id="dev_prev", name="Pixel Prev", online=True, battery=90)
+            app._render_hub_devices([prev_dev])
+            assert len(app.hub_tree.get_children()) == 1
+
+            # 2. Появление ошибки сервера (например, 401 Unauthorized)
+            app._show_hub_error("Ошибка авторизации: 401 Unauthorized")
+
+            # Таблица очищена!
+            assert len(app.hub_tree.get_children()) == 0
+            assert "401 Unauthorized" in app.hub_status_msg_label.cget("text")
+            assert "ошибка" in app.hub_summary_label.cget("text")
+            assert str(app.btn_hub_connect.cget("state")) == "normal"
 
             app.on_close()

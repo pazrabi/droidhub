@@ -662,7 +662,7 @@ class DesktopApp:
             )
         except Exception as exc:
             self.btn_hub_connect.config(state=tk.NORMAL)
-            safe_msg = f"Ошибка запуска запроса: {exc}".replace(token, "***")
+            safe_msg = AppController._sanitize_token(f"Ошибка запуска запроса: {exc}", token)
             self._show_hub_error(safe_msg)
 
     def _poll_hub_queue(self) -> None:
@@ -763,6 +763,9 @@ class DesktopApp:
                 return
         except Exception:
             return
+
+        for item in self.hub_tree.get_children():
+            self.hub_tree.delete(item)
 
         self.btn_hub_connect.config(state=tk.NORMAL)
         self.hub_status_msg_label.config(text=f"Ошибка: {err_text}", style="Warning.TLabel")

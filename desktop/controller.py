@@ -252,9 +252,43 @@ class AppController:
     @staticmethod
     def _sanitize_token(message: str, token: str) -> str:
         """Маскирует секретный токен в строке сообщения об ошибке."""
-        if token and token in message:
-            return message.replace(token, "***")
+        if not message:
+            return ""
+        if token:
+            clean = token.strip()
+            if clean and clean in message:
+                message = message.replace(clean, "***")
+            if token in message:
+                message = message.replace(token, "***")
         return message
+
+    def _fetch_hub_devices_network(
+        self,
+        base_url: str,
+        token: str,
+        timeout: float = 5.0,
+    ) -> tuple[list[HubDevice], str | None]:
+        """Выполняет сетевой запрос к серверу без изменения внутреннего состояния контроллера."""
+        clean_url = (base_url or "").strip()
+        clean_token = (token or "").strip()
+
+        if not clean_url:
+            return [], "Укажите URL сервера DroidHub (HTTPS)."
+        if not clean_token:
+            return [], "Укажите токен авторизации (Bearer token)."
+
+        try:
+            client = HubClient(base_url=clean_url, token=clean_token, timeout=timeout)
+            devices = client.list_devices()
+            return devices, None
+        except HubClientError as err:
+            err_msg = self._sanitize_token(str(err), clean_token)
+            logger.warning("Ошибка при обращении к серверу DroidHub: %s", err_msg)
+            return [], err_msg
+        except Exception as exc:
+            err_msg = self._sanitize_token(f"Ошибка подключения к серверу: {exc}", clean_token)
+            logger.error("Непредвиденная ошибка при запросе к серверу DroidHub: %s", err_msg)
+            return [], err_msg
 
     def fetch_hub_devices_sync(
         self,
@@ -267,28 +301,11 @@ class AppController:
         Возвращает: (список_устройств_хаба, сообщение_об_ошибке | None)
         Токен держится только в памяти приложения, не логируется и не сохраняется.
         """
-        clean_url = (base_url or "").strip()
-        clean_token = (token or "").strip()
-
-        if not clean_url:
-            return [], "Укажите URL сервера DroidHub (HTTPS)."
-        if not clean_token:
-            return [], "Укажите токен авторизации (Bearer token)."
-
-        try:
-            client = HubClient(base_url=clean_url, token=clean_token, timeout=timeout)
-            devices = client.list_devices()
+        devices, err = self._fetch_hub_devices_network(base_url, token, timeout=timeout)
+        if not err:
             with self._hub_devices_lock:
                 self._hub_devices = list(devices)
-            return devices, None
-        except HubClientError as err:
-            err_msg = self._sanitize_token(str(err), clean_token)
-            logger.warning("Ошибка при обращении к серверу DroidHub: %s", err_msg)
-            return [], err_msg
-        except Exception as exc:
-            logger.exception("Непредвиденная ошибка при запросе к серверу DroidHub")
-            err_msg = self._sanitize_token(f"Ошибка подключения к серверу: {exc}", clean_token)
-            return [], err_msg
+        return devices, err
 
     def fetch_hub_devices_async(
         self,
@@ -317,13 +334,17 @@ class AppController:
 
         def _worker(req_id: int) -> None:
             try:
-                devices, err = self.fetch_hub_devices_sync(base_url, token, timeout=timeout)
+                devices, err = self._fetch_hub_devices_network(base_url, token, timeout=timeout)
 
                 # Проверяем актуальность запроса
                 with self._hub_refresh_lock:
                     if req_id != self._hub_request_id:
                         # Запрос устарел, результат отбрасывается
                         return
+
+                if not err:
+                    with self._hub_devices_lock:
+                        self._hub_devices = list(devices)
 
                 if result_queue is not None:
                     result_queue.put((req_id, devices, err))

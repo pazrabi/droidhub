@@ -213,38 +213,45 @@ def test_controller_hub_fetch_sync_success():
         assert ctrl.get_hub_device("non_existent") is None
 
 
-def test_controller_hub_fetch_sync_error_and_token_not_exposed():
-    """Проверка обработки ошибок сервера и защита от раскрытия токена в сообщении."""
+def test_controller_hub_fetch_sync_error_and_token_not_exposed(caplog):
+    """Проверка обработки ошибок сервера и защита от раскрытия токена в сообщении и логах."""
+    import logging
     ctrl = AppController()
     secret_token = "ultra-secret-bearer-token-456"
 
-    # 1. Ошибка HubClientError
-    with patch("desktop.controller.HubClient") as mock_client_cls:
-        mock_instance = mock_client_cls.return_value
-        mock_instance.list_devices.side_effect = HubClientError(
-            f"Ошибка авторизации с токеном {secret_token}: 401 Unauthorized"
-        )
+    with caplog.at_level(logging.DEBUG):
+        # 1. Ошибка HubClientError
+        with patch("desktop.controller.HubClient") as mock_client_cls:
+            mock_instance = mock_client_cls.return_value
+            mock_instance.list_devices.side_effect = HubClientError(
+                f"Ошибка авторизации с токеном {secret_token}: 401 Unauthorized"
+            )
 
-        devices, err = ctrl.fetch_hub_devices_sync("https://hub.example.com", secret_token)
+            devices, err = ctrl.fetch_hub_devices_sync("https://hub.example.com", secret_token)
 
-        assert len(devices) == 0
-        assert err is not None
-        assert secret_token not in err
-        assert "***" in err
+            assert len(devices) == 0
+            assert err is not None
+            assert secret_token not in err
+            assert "***" in err
+            assert secret_token not in caplog.text
 
-    # 2. Непредвиденное исключение
-    with patch("desktop.controller.HubClient") as mock_client_cls:
-        mock_instance = mock_client_cls.return_value
-        mock_instance.list_devices.side_effect = RuntimeError(
-            f"Сетевой сбой при отправке {secret_token}"
-        )
+        caplog.clear()
 
-        devices, err = ctrl.fetch_hub_devices_sync("https://hub.example.com", secret_token)
+        # 2. Непредвиденное исключение
+        with patch("desktop.controller.HubClient") as mock_client_cls:
+            mock_instance = mock_client_cls.return_value
+            mock_instance.list_devices.side_effect = RuntimeError(
+                f"Сетевой сбой при отправке {secret_token}"
+            )
 
-        assert len(devices) == 0
-        assert err is not None
-        assert secret_token not in err
-        assert "***" in err
+            devices, err = ctrl.fetch_hub_devices_sync("https://hub.example.com", secret_token)
+
+            assert len(devices) == 0
+            assert err is not None
+            assert secret_token not in err
+            assert "***" in err
+            # Секретный токен не должен попадать в логи даже при RuntimeError
+            assert secret_token not in caplog.text
 
 
 def test_controller_hub_fetch_empty_url_or_token():
@@ -402,6 +409,9 @@ def test_controller_hub_fetch_async_ignores_stale_requests():
         # Очередь должна быть пуста, коллбэк запроса #1 не вызван
         assert q.empty()
         assert len(stale_calls) == 0
+        # КРИТИЧНО: состояние контроллера НЕ должно обновиться данными от отменённого запроса!
+        assert len(ctrl.hub_devices) == 0
+        assert ctrl.get_hub_device("stale_dev") is None
 
 
 def test_controller_hub_shutdown_invalidates_in_flight():
@@ -433,5 +443,41 @@ def test_controller_hub_shutdown_invalidates_in_flight():
         finish_event.set()
         time.sleep(0.2)
 
-        # Результат отброшен
+        # Результат отброшен, состояние контроллера не загрязнено
         assert q.empty()
+        assert len(ctrl.hub_devices) == 0
+        assert ctrl.get_hub_device("dev_shutdown") is None
+
+
+def test_controller_hub_fetch_async_stale_preserves_previous_active_devices():
+    """Устаревший фоновый запрос не затирает ранее успешно полученные устройства."""
+    ctrl = AppController()
+    old_dev = HubDevice(id="active_dev", name="Active Phone")
+    ctrl._hub_devices = [old_dev]
+
+    ready_event = threading.Event()
+    finish_event = threading.Event()
+
+    def slow_list():
+        ready_event.set()
+        finish_event.wait(timeout=2.0)
+        return [HubDevice(id="stale_dev", name="Stale Phone")]
+
+    with patch("desktop.controller.HubClient") as mock_client_cls:
+        mock_instance = mock_client_cls.return_value
+        mock_instance.list_devices.side_effect = slow_list
+
+        q = queue.Queue()
+        rid = ctrl.fetch_hub_devices_async("https://hub.example.com", "token", result_queue=q)
+        assert ready_event.wait(timeout=1.0)
+
+        # Новый запрос или отмена
+        with ctrl._hub_refresh_lock:
+            ctrl._hub_request_id += 1
+
+        finish_event.set()
+        time.sleep(0.2)
+
+        assert q.empty()
+        # Старые активные устройства сохранены!
+        assert ctrl.hub_devices == [old_dev]
