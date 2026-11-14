@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import subprocess
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -282,6 +283,57 @@ class TestDuplicatesAndLimits:
             finally:
                 worker.close()
 
+    def test_fair_alternation_under_slow_adb(self) -> None:
+        """При задержках ADB >= 0.5 с устройства честно чередуются и ни одно не голодает."""
+        dev1 = make_test_device("DEV_SLOW_1", usb_info="1-1")
+        dev2 = make_test_device("DEV_SLOW_2", usb_info="1-2")
+
+        called_order: list[str] = []
+        call_lock = threading.Lock()
+        four_calls_event = threading.Event()
+        valid_png = make_png_bytes(50, 50)
+
+        def mock_slow_run(cmd: list[str], **kwargs: object) -> MagicMock:
+            serial = None
+            if "-s" in cmd:
+                serial = cmd[cmd.index("-s") + 1]
+            elif "-t" in cmd:
+                serial = cmd[cmd.index("-t") + 1]
+
+            with call_lock:
+                if serial:
+                    called_order.append(serial)
+                    if len(called_order) >= 4:
+                        four_calls_event.set()
+
+            # Имитация задержки реального ADB exec-out screencap >= TARGET_INTERVAL (0.5 c)
+            time.sleep(0.55)
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.stdout = valid_png
+            return proc
+
+        with patch("subprocess.run", side_effect=mock_slow_run):
+            worker = USBPreviewWorker(adb_path="adb")
+            try:
+                worker.update_devices([dev1, dev2])
+                assert four_calls_event.wait(timeout=5.0), (
+                    f"Не дождались 4 вызовов, получено только: {called_order}"
+                )
+
+                with call_lock:
+                    first_four = list(called_order[:4])
+
+                # Проверяем строгое чередование без голодания:
+                assert first_four[0] != first_four[1]
+                assert first_four[1] != first_four[2]
+                assert first_four[2] != first_four[3]
+                assert set(first_four) == {"DEV_SLOW_1", "DEV_SLOW_2"}
+                assert first_four.count("DEV_SLOW_1") == 2
+                assert first_four.count("DEV_SLOW_2") == 2
+            finally:
+                worker.close()
+
 
 # ===========================================================================
 # 3. Тесты правильности argv и вызова subprocess
@@ -387,6 +439,54 @@ class TestArgvAndSubprocess:
                 assert cmd == ["adb", "-t", "99", "exec-out", "screencap", "-p"]
             finally:
                 worker.close()
+
+    def test_capture_device_rejects_unverified_device_without_transport_id(self) -> None:
+        """_capture_device возвращает (None, False) и не вызывает -s для непроверенного USB."""
+        worker = USBPreviewWorker(adb_path="adb")
+        try:
+            # 1. Сетевое устройство без transport_id
+            net_dev = make_test_device("DEV_NET", is_network=True, usb_info=None, transport_id=None)
+            with patch("subprocess.run") as mock_run:
+                frame, success = worker._capture_device(net_dev)
+                assert frame is None
+                assert success is False
+                mock_run.assert_not_called()
+
+            # 2. Устройство без usb_info
+            no_usb_info_dev = make_test_device("DEV_NO_USB", usb_info=None, transport_id=None)
+            with patch("subprocess.run") as mock_run:
+                frame, success = worker._capture_device(no_usb_info_dev)
+                assert frame is None
+                assert success is False
+                mock_run.assert_not_called()
+
+            # 3. Неготовое устройство (offline)
+            offline_dev = make_test_device("DEV_OFFLINE", state="offline", is_ready=False, transport_id=None)
+            with patch("subprocess.run") as mock_run:
+                frame, success = worker._capture_device(offline_dev)
+                assert frame is None
+                assert success is False
+                mock_run.assert_not_called()
+        finally:
+            worker.close()
+
+    def test_capture_device_uses_transport_id_even_if_not_standard_usb(self) -> None:
+        """При наличии валидного положительного transport_id используется -t <id>."""
+        dev = make_test_device("DEV_TID_ONLY", transport_id="123")
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = make_png_bytes(50, 50)
+
+        worker = USBPreviewWorker(adb_path="adb")
+        try:
+            with patch("subprocess.run", return_value=mock_proc) as mock_run:
+                frame, success = worker._capture_device(dev)
+                assert success is True
+                assert frame is not None
+                cmd = mock_run.call_args[0][0]
+                assert cmd == ["adb", "-t", "123", "exec-out", "screencap", "-p"]
+        finally:
+            worker.close()
 
 
 # ===========================================================================
@@ -792,6 +892,55 @@ class TestSnapshotChangeAndInsignificantFields:
                 with patch.object(worker, "_capture_device", return_value=(None, False)):
                     worker.update_devices([dev2])
                     assert "DEV_PORT" not in worker._pending
+            finally:
+                worker.close()
+
+    def test_device_connection_key_normalizes_transport_id(self) -> None:
+        """_device_connection_key нормализует transport_id и игнорирует различия форматирования."""
+        dev_none = make_test_device("DEV_K", transport_id=None)
+        dev_empty = make_test_device("DEV_K", transport_id="")
+        dev_zero = make_test_device("DEV_K", transport_id=0)
+        dev_neg = make_test_device("DEV_K", transport_id="-1")
+        dev_spaces = make_test_device("DEV_K", transport_id="   ")
+
+        base_key = _device_connection_key(dev_none)
+        assert base_key == ("DEV_K", "1-1.2", None)
+        assert _device_connection_key(dev_empty) == base_key
+        assert _device_connection_key(dev_zero) == base_key
+        assert _device_connection_key(dev_neg) == base_key
+        assert _device_connection_key(dev_spaces) == base_key
+
+        dev_pos_int = make_test_device("DEV_K", transport_id=77)
+        dev_pos_str = make_test_device("DEV_K", transport_id="77")
+        dev_pos_spaced = make_test_device("DEV_K", transport_id="  77  ")
+
+        pos_key = _device_connection_key(dev_pos_int)
+        assert pos_key == ("DEV_K", "1-1.2", "77")
+        assert _device_connection_key(dev_pos_str) == pos_key
+        assert _device_connection_key(dev_pos_spaced) == pos_key
+
+    def test_transport_id_format_change_does_not_invalidate_frame(self) -> None:
+        """Смена формата transport_id (None -> пустая строка, или '5' -> '  5  ') не инвалидирует кадр."""
+        dev1 = make_test_device("DEV_FMT", usb_info="1-1.1", transport_id=None)
+        dev2 = make_test_device("DEV_FMT", usb_info="1-1.1", transport_id="")
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = make_png_bytes(50, 50)
+
+        with patch("subprocess.run", return_value=mock_proc):
+            worker = USBPreviewWorker(adb_path="adb")
+            try:
+                worker.update_devices([dev1])
+                worker._frame_event.wait(1.0)
+                assert "DEV_FMT" in worker._pending
+
+                # Обновление с transport_id="" не должно инвалидировать кадр
+                worker.update_devices([dev2])
+                assert "DEV_FMT" in worker._pending
+                res = worker.drain()
+                assert "DEV_FMT" in res
+                assert res["DEV_FMT"] is not None
             finally:
                 worker.close()
 

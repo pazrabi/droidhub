@@ -73,8 +73,7 @@ def _device_connection_key(device: DeviceInfo) -> tuple[str, str | None, str | N
     serial = str(getattr(device, "serial", "")).strip()
     usb_info = getattr(device, "usb_info", None)
     usb_info_str = str(usb_info).strip() if usb_info is not None else None
-    tid = getattr(device, "transport_id", None)
-    tid_str = str(tid).strip() if tid is not None and not isinstance(tid, bool) else None
+    tid_str = _get_valid_positive_transport_id(device)
     return (serial, usb_info_str, tid_str)
 
 
@@ -220,21 +219,23 @@ class USBPreviewWorker:
                 if s not in active_keys:
                     del next_allowed_time[s]
 
-            # Ищем устройство, готовое к снятию кадра прямо сейчас
-            ready_device: DeviceInfo | None = None
-            min_wait: float | None = None
-            for dev in devices:
-                allowed = next_allowed_time.get(dev.serial, 0.0)
-                if allowed <= now:
-                    ready_device = dev
-                    break
-                wait_for = allowed - now
-                if min_wait is None or wait_for < min_wait:
-                    min_wait = wait_for
-
-            if ready_device is None:
-                # Ни одно устройство не готово прямо сейчас - ожидаем до времени готовности
-                if min_wait is not None and min_wait > 0:
+            # Ищем устройство, готовое к снятию кадра прямо сейчас (выбираем ожидающее дольше всех)
+            ready_candidates = [
+                dev for dev in devices
+                if next_allowed_time.get(dev.serial, 0.0) <= now
+            ]
+            if ready_candidates:
+                ready_device = min(
+                    ready_candidates,
+                    key=lambda d: next_allowed_time.get(d.serial, 0.0),
+                )
+            else:
+                ready_device = None
+                min_wait = min(
+                    next_allowed_time.get(dev.serial, 0.0) - now
+                    for dev in devices
+                )
+                if min_wait > 0:
                     if self._wake_event.wait(min_wait):
                         self._wake_event.clear()
                 continue
@@ -276,7 +277,14 @@ class USBPreviewWorker:
         if tid_str is not None:
             target_args = ["-t", tid_str]
         else:
-            target_args = ["-s", device.serial]
+            try:
+                is_usb = is_valid_usb_device(device)
+            except Exception:
+                is_usb = False
+            if is_usb:
+                target_args = ["-s", device.serial]
+            else:
+                return None, False
 
         cmd = [self._adb_path, *target_args, *SCREEN_ARGV]
 
