@@ -259,7 +259,7 @@ def test_set_preview_and_preservation(tk_root):
 
 
 def test_frame_removed_on_loss_of_readiness(tk_root):
-    """Кадр удаляется при потере готовности устройства."""
+    """Кадр удаляется при потере готовности устройства, а при возврате готовности отображается 'Нет кадра'."""
     grid = PreviewGrid(tk_root, open_devices=lambda s: None)
 
     dev_ready = make_device("USB_1", is_ready=True, state="device")
@@ -276,6 +276,28 @@ def test_frame_removed_on_loss_of_readiness(tk_root):
     assert grid._previews.get("USB_1") is None
     assert grid._cards["USB_1"]._photo_ref is None
     assert grid._cards["USB_1"]._preview_label.cget("text") == "Не готов"
+
+    # Обратный переход: устройство снова готово, но нового кадра еще нет
+    dev_ready_again = make_device("USB_1", is_ready=True, state="device")
+    grid.set_devices([dev_ready_again])
+
+    assert grid._previews.get("USB_1") is None
+    assert grid._cards["USB_1"]._photo_ref is None
+    assert grid._cards["USB_1"]._preview_label.cget("text") == "Нет кадра"
+
+
+def test_card_unready_to_ready_without_frame_switches_to_no_frame(tk_root):
+    """Если устройство подключается неготовым, а затем становится готовым без кадра, текст меняется на 'Нет кадра'."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+
+    dev_unready = make_device("USB_1", is_ready=False, state="unauthorized")
+    grid.set_devices([dev_unready])
+    assert grid._cards["USB_1"]._preview_label.cget("text") == "Не готов"
+
+    dev_ready = make_device("USB_1", is_ready=True, state="device")
+    grid.set_devices([dev_ready])
+    assert grid._cards["USB_1"]._photo_ref is None
+    assert grid._cards["USB_1"]._preview_label.cget("text") == "Нет кадра"
 
 
 def test_frame_removed_on_disappearance(tk_root):
@@ -394,27 +416,99 @@ def test_keyboard_navigation_support(tk_root):
     """Поддержка клавиатуры через список устройств (Space, Return) и кнопку."""
     opened = []
     grid = PreviewGrid(tk_root, open_devices=lambda s: opened.append(s))
+    grid.pack()
+    tk_root.update()
 
     dev1 = make_device("USB_1", is_ready=True)
     dev2 = make_device("USB_2", is_ready=True)
-    grid.set_devices([dev1, dev2])
+    dev3 = make_device("USB_3", is_ready=True)
+    grid.set_devices([dev1, dev2, dev3])
 
-    # Выбираем первый элемент в listbox
-    grid._listbox.selection_set(0)
-    grid._listbox.activate(0)
+    # Выбираем второй элемент в listbox (индекс 1)
+    grid._listbox.selection_set(1)
+    grid._listbox.activate(1)
+    assert grid._listbox.index(tk.ACTIVE) == 1
 
-    # Нажатие Space переключает чекбокс
+    # Нажатие Space переключает чекбокс и сохраняет активный курсор (ACTIVE == 1)
     grid._on_listbox_space()
-    assert grid.selected_serials() == ["USB_1"]
+    assert grid.selected_serials() == ["USB_2"]
+    assert grid._listbox.index(tk.ACTIVE) == 1
 
     grid._on_listbox_space()
     assert grid.selected_serials() == []
+    assert grid._listbox.index(tk.ACTIVE) == 1
 
     # Нажатие Return открывает готовое устройство
     grid._on_listbox_return()
-    assert opened == [["USB_1"]]
+    assert opened == [["USB_2"]]
 
     # Нажатие Return на кнопке «Открыть выбранные»
-    grid._toggle_selection("USB_2")
+    grid._toggle_selection("USB_3")
     grid._open_btn.invoke()
-    assert opened[-1] == ["USB_2"]
+    assert opened[-1] == ["USB_3"]
+
+
+def test_mousewheel_dynamic_binding_on_enter_leave(tk_root):
+    """Колесо мыши перехватывается динамически при наведении на правую панель и отвязывается при выходе."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+    grid.pack()
+    tk_root.update()
+
+    # Вход мыши на правую панель привязывает события
+    grid._bind_mousewheel()
+
+    class FakeWheelEvent:
+        num = 4
+        delta = 0
+
+    grid._on_mousewheel(FakeWheelEvent())
+
+    # Выход отвязывает события
+    grid._unbind_mousewheel()
+
+
+def test_listbox_click_outside_items_ignored(tk_root):
+    """Клик ниже элементов списка в пустой области не должен переключать выбор."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+    grid.pack()
+    tk_root.update()
+
+    dev1 = make_device("USB_1", is_ready=True)
+    grid.set_devices([dev1])
+    tk_root.update()
+
+    assert grid.selected_serials() == []
+
+    class FakeClickEvent:
+        def __init__(self, y: int):
+            self.y = y
+
+    # Клик в пустую область далеко ниже элемента списка
+    grid._on_listbox_click(FakeClickEvent(y=450))
+    assert grid.selected_serials() == []
+
+    # Клик по элементу списка переключает выбор
+    bbox = grid._listbox.bbox(0)
+    if bbox:
+        item_y = bbox[1] + bbox[3] // 2
+        grid._on_listbox_click(FakeClickEvent(y=item_y))
+        assert grid.selected_serials() == ["USB_1"]
+
+
+def test_set_preview_subsample_error_handled(tk_root, monkeypatch):
+    """Сбой при subsample обрабатывается безопасно и очищает превью."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+    dev1 = make_device("USB_1", is_ready=True)
+    grid.set_devices([dev1])
+
+    # Подменяем subsample так, чтобы он вызывал ошибку
+    def mock_subsample(self, *args, **kwargs):
+        raise tk.TclError("Simulated subsample failure")
+
+    monkeypatch.setattr(tk.PhotoImage, "subsample", mock_subsample)
+
+    huge_png = make_png(300, 600)
+    grid.set_preview("USB_1", huge_png)
+
+    assert grid._previews.get("USB_1") is None
+    assert grid._cards["USB_1"]._photo_ref is None

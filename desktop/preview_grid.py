@@ -198,7 +198,7 @@ class PreviewCard(tk.Frame):
         self._model_label.config(text=device.model_display)
         self._serial_label.config(text=device.serial)
 
-        if not device.is_ready:
+        if not device.is_ready or self._photo_ref is None:
             self.clear_preview()
 
     def set_photo(self, photo: tk.PhotoImage | None) -> None:
@@ -335,9 +335,22 @@ class PreviewGrid(tk.Frame):
         self._cards_container.bind("<Configure>", self._on_cards_configure)
         self._canvas.bind("<Configure>", self._on_canvas_configure)
 
+        self._right_pane.bind("<Enter>", self._bind_mousewheel)
+        self._right_pane.bind("<Leave>", self._unbind_mousewheel)
+        self.bind("<Destroy>", self._unbind_mousewheel, add="+")
+
+    def _bind_mousewheel(self, event: tk.Event | None = None) -> None:
         self._canvas.bind_all("<Button-4>", self._on_mousewheel)
         self._canvas.bind_all("<Button-5>", self._on_mousewheel)
         self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _unbind_mousewheel(self, event: tk.Event | None = None) -> None:
+        try:
+            self._canvas.unbind_all("<Button-4>")
+            self._canvas.unbind_all("<Button-5>")
+            self._canvas.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
 
     def _on_mousewheel(self, event: tk.Event) -> None:
         try:
@@ -479,19 +492,19 @@ class PreviewGrid(tk.Frame):
                 photo = tk.PhotoImage(master=self, data=png, format="png")
             except Exception:
                 photo = tk.PhotoImage(master=self, data=png)
+
+            # Aspect fit: пропорциональное уменьшение, если кадр больше портретного места
+            w = photo.width()
+            h = photo.height()
+            if w > 0 and h > 0 and (w > PREVIEW_WIDTH or h > PREVIEW_HEIGHT):
+                scale = max((w + PREVIEW_WIDTH - 1) // PREVIEW_WIDTH, (h + PREVIEW_HEIGHT - 1) // PREVIEW_HEIGHT)
+                if scale > 1:
+                    photo = photo.subsample(scale, scale)
         except Exception:
             self._previews.pop(serial, None)
             if card is not None:
                 card.clear_preview()
             return
-
-        # Aspect fit: пропорциональное уменьшение, если кадр больше портретного места
-        w = photo.width()
-        h = photo.height()
-        if w > 0 and h > 0 and (w > PREVIEW_WIDTH or h > PREVIEW_HEIGHT):
-            scale = max((w + PREVIEW_WIDTH - 1) // PREVIEW_WIDTH, (h + PREVIEW_HEIGHT - 1) // PREVIEW_HEIGHT)
-            if scale > 1:
-                photo = photo.subsample(scale, scale)
 
         self._previews[serial] = photo
         if card is not None:
@@ -542,8 +555,10 @@ class PreviewGrid(tk.Frame):
 
     def _on_listbox_click(self, event: tk.Event) -> None:
         idx = self._listbox.nearest(event.y)
-        if 0 <= idx < len(self._usb_devices):
-            self._toggle_selection(self._usb_devices[idx].serial)
+        bbox = self._listbox.bbox(idx)
+        if bbox and bbox[1] <= event.y <= bbox[1] + bbox[3]:
+            if 0 <= idx < len(self._usb_devices):
+                self._toggle_selection(self._usb_devices[idx].serial)
 
     def _update_listbox(self) -> None:
         cur_sel = self._listbox.curselection()
@@ -560,6 +575,7 @@ class PreviewGrid(tk.Frame):
         if self._listbox.size() > 0:
             if cur_sel and cur_sel[0] < self._listbox.size():
                 self._listbox.selection_set(cur_sel[0])
+                self._listbox.activate(cur_sel[0])
             elif 0 <= active_idx < self._listbox.size():
                 self._listbox.activate(active_idx)
 
