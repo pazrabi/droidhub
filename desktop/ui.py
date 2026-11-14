@@ -30,10 +30,20 @@ class DesktopApp:
         # Выбранные серийные номера (чекбоксы)
         self.checked_serials: set[str] = set()
 
-        # Флаг автообновления
-        self.auto_refresh_var = tk.BooleanVar(value=True)
+        # Флаги состояния и жизненного цикла
         self._is_closing = False
+        self._cleaned_up = False
+
+        # Открытые диалоговые окна
+        self._open_dialogs: list[tk.Toplevel] = []
+
+        # Флаг автообновления с явным указанием master=self.root
+        self.auto_refresh_var = tk.BooleanVar(master=self.root, value=True)
         self._timer_id: str | None = None
+
+        # Очередь и опрос для локальных устройств (USB / ADB)
+        self._device_queue: queue.Queue = queue.Queue()
+        self._device_poll_timer: str | None = None
 
         # Очередь и состояние запросов для удалённого сервера DroidHub
         self._hub_queue: queue.Queue = queue.Queue()
@@ -43,15 +53,25 @@ class DesktopApp:
         self._init_styles()
         self._create_widgets()
 
-        # Протокол закрытия окна
+        # Протокол закрытия окна и обработчик события уничтожения окна Tk
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        try:
+            self.root.bind("<Destroy>", self._on_root_destroy, add="+")
+        except Exception:
+            pass
 
         # Первичное обновление
         self.trigger_refresh()
         # Запуск цикла автообновления
         self._schedule_auto_refresh()
-        # Запуск цикла опроса очереди хаба в UI-потоке
+        # Запуск циклов опроса очередей в UI-потоке
+        self._poll_device_queue()
         self._poll_hub_queue()
+
+    def _on_root_destroy(self, event: tk.Event) -> None:
+        """Обрабатывает событие <Destroy> на случай прямого уничтожения корневого окна."""
+        if getattr(event, "widget", None) == self.root:
+            self._cleanup()
 
     def _init_styles(self) -> None:
         """Настройка стилей интерфейса."""
@@ -328,25 +348,54 @@ class DesktopApp:
 
     def trigger_refresh(self) -> None:
         """Инициирует неблокирующее фоновое обновление списка устройств."""
-        self.status_msg_label.config(text="Обновление списка устройств...")
+        if self._is_closing:
+            return
+        try:
+            if hasattr(self.root, "winfo_exists") and not self.root.winfo_exists():
+                return
+            self.status_msg_label.config(text="Обновление списка устройств...")
+        except Exception:
+            pass
 
+        device_q = self._device_queue
+
+        # Коллбеки выполняются в фоновом потоке AdbRefreshWorker.
+        # Они изолированы от вызовов Tk и НЕ захватывают ссылку на self (DesktopApp),
+        # гарантируя отсутствие операций Tk и уничтожения объектов Tk в фоновом потоке.
         def on_success(devices: list[DeviceInfo]) -> None:
-            if not self._is_closing:
-                try:
-                    if self.root.winfo_exists():
-                        self.root.after(0, self._render_devices, devices)
-                except Exception:
-                    pass
+            device_q.put(("success", devices))
 
         def on_error(err: str) -> None:
-            if not self._is_closing:
-                try:
-                    if self.root.winfo_exists():
-                        self.root.after(0, self._show_refresh_error, err)
-                except Exception:
-                    pass
+            device_q.put(("error", err))
 
         self.controller.refresh_devices_async(on_success=on_success, on_error=on_error)
+
+    def _poll_device_queue(self) -> None:
+        """Опрашивает очередь обновлений устройств ADB строго в главном потоке Tk."""
+        if self._is_closing:
+            return
+
+        try:
+            while not self._device_queue.empty():
+                item = self._device_queue.get_nowait()
+                if self._is_closing:
+                    continue
+                msg_type, payload = item
+                if msg_type == "success":
+                    self._render_devices(payload)
+                elif msg_type == "error":
+                    self._show_refresh_error(payload)
+        except queue.Empty:
+            pass
+        except Exception:
+            logger.exception("Исключение при опросе очереди устройств ADB")
+        finally:
+            if not self._is_closing:
+                try:
+                    if hasattr(self.root, "winfo_exists") and self.root.winfo_exists():
+                        self._device_poll_timer = self.root.after(100, self._poll_device_queue)
+                except Exception:
+                    pass
 
     def _render_devices(self, devices: list[DeviceInfo]) -> None:
         """Отрисовывает полученный список устройств в таблице (вызывается в главном потоке)."""
@@ -440,9 +489,15 @@ class DesktopApp:
     def _schedule_auto_refresh(self) -> None:
         """Планирует следующее автообновление через 3 секунды."""
         if not self._is_closing:
-            if self.auto_refresh_var.get():
-                self.trigger_refresh()
-            self._timer_id = self.root.after(3000, self._schedule_auto_refresh)
+            try:
+                if hasattr(self.root, "winfo_exists") and self.root.winfo_exists():
+                    var = getattr(self, "auto_refresh_var", None)
+                    if var is not None and getattr(var, "_tk", None) is not None:
+                        if var.get():
+                            self.trigger_refresh()
+                    self._timer_id = self.root.after(3000, self._schedule_auto_refresh)
+            except Exception:
+                pass
 
     def _on_tree_click(self, event: tk.Event) -> None:
         """Обрабатывает клик мышью по таблице для переключения чекбокса."""
@@ -573,6 +628,11 @@ class DesktopApp:
     def show_help_dialog(self) -> None:
         """Показывает диалоговое окно со справкой по установке и настройке."""
         help_win = tk.Toplevel(self.root)
+        self._open_dialogs.append(help_win)
+        try:
+            help_win.bind("<Destroy>", lambda e: self._open_dialogs.remove(help_win) if help_win in self._open_dialogs else None, add="+")
+        except Exception:
+            pass
         help_win.title("Справка: Установка ADB, scrcpy и настройка USB")
         help_win.geometry("740x540")
         help_win.minsize(600, 400)
@@ -597,6 +657,11 @@ class DesktopApp:
     def show_paths_dialog(self) -> None:
         """Диалог ручного указания путей к adb и scrcpy."""
         paths_win = tk.Toplevel(self.root)
+        self._open_dialogs.append(paths_win)
+        try:
+            paths_win.bind("<Destroy>", lambda e: self._open_dialogs.remove(paths_win) if paths_win in self._open_dialogs else None, add="+")
+        except Exception:
+            pass
         paths_win.title("Настройка путей к утилитам")
         paths_win.geometry("600x220")
         paths_win.resizable(False, False)
@@ -691,7 +756,7 @@ class DesktopApp:
         finally:
             if not self._is_closing:
                 try:
-                    if self.root.winfo_exists():
+                    if hasattr(self.root, "winfo_exists") and self.root.winfo_exists():
                         self._hub_poll_timer = self.root.after(100, self._poll_hub_queue)
                 except Exception:
                     pass
@@ -699,7 +764,7 @@ class DesktopApp:
     def _render_hub_devices(self, devices: list[HubDevice]) -> None:
         """Отрисовывает полученный список устройств хаба в таблице (в главном потоке Tk)."""
         try:
-            if self._is_closing or not self.root.winfo_exists():
+            if self._is_closing or (hasattr(self.root, "winfo_exists") and not self.root.winfo_exists()):
                 return
         except Exception:
             return
@@ -759,7 +824,7 @@ class DesktopApp:
     def _show_hub_error(self, err_text: str) -> None:
         """Отображает безопасное сообщение об ошибке хаба."""
         try:
-            if self._is_closing or not self.root.winfo_exists():
+            if self._is_closing or (hasattr(self.root, "winfo_exists") and not self.root.winfo_exists()):
                 return
         except Exception:
             return
@@ -771,26 +836,92 @@ class DesktopApp:
         self.hub_status_msg_label.config(text=f"Ошибка: {err_text}", style="Warning.TLabel")
         self.hub_summary_label.config(text="Сервер: ошибка подключения")
 
-    def on_close(self) -> None:
-        """Безопасное закрытие приложения с остановкой процессов scrcpy и фоновых задач."""
-        self._is_closing = True
-        if self._timer_id:
+    def _cleanup_variable(self) -> None:
+        """Безопасная очистка tkinter Variable в главном потоке до уничтожения Tk."""
+        var = getattr(self, "auto_refresh_var", None)
+        if var is not None:
             try:
-                self.root.after_cancel(self._timer_id)
+                tk_inst = getattr(var, "_tk", None)
+                if tk_inst is not None:
+                    var_name = getattr(var, "_name", None)
+                    if var_name:
+                        try:
+                            if tk_inst.getboolean(tk_inst.call("info", "exists", var_name)):
+                                tk_inst.globalunsetvar(var_name)
+                        except Exception:
+                            pass
+                    tcl_cmds = getattr(var, "_tclCommands", None)
+                    if tcl_cmds:
+                        for cmd in list(tcl_cmds):
+                            try:
+                                tk_inst.deletecommand(cmd)
+                            except Exception:
+                                pass
+                        var._tclCommands = None
             except Exception:
                 pass
-        if self._hub_poll_timer:
-            try:
-                self.root.after_cancel(self._hub_poll_timer)
-            except Exception:
-                pass
+            finally:
+                # Обнуляем ссылку на _tk, чтобы dunder-метод Variable.__del__
+                # никогда не выполнял вызовы в Tcl при сборке мусора в фоновых потоках или после тестов.
+                try:
+                    var._tk = None
+                except Exception:
+                    pass
 
+    def _cleanup(self) -> None:
+        """Внутренняя очистка ресурсов: отмена таймеров, очередей, диалогов и Tk переменных."""
+        if getattr(self, "_cleaned_up", False):
+            return
+        self._cleaned_up = True
+        self._is_closing = True
+
+        # 1. Отмена запланированных after-таймеров
+        for timer_attr in ("_timer_id", "_hub_poll_timer", "_device_poll_timer"):
+            timer = getattr(self, timer_attr, None)
+            if timer and self.root:
+                try:
+                    self.root.after_cancel(timer)
+                except Exception:
+                    pass
+                setattr(self, timer_attr, None)
+
+        # 2. Очистка очередей сообщений
+        for q_attr in ("_hub_queue", "_device_queue"):
+            q = getattr(self, q_attr, None)
+            if q is not None:
+                try:
+                    while not q.empty():
+                        q.get_nowait()
+                except Exception:
+                    pass
+
+        # 3. Закрытие открытых дочерних диалоговых окон
+        for dlg in list(getattr(self, "_open_dialogs", [])):
+            try:
+                if hasattr(dlg, "winfo_exists") and dlg.winfo_exists():
+                    dlg.destroy()
+            except Exception:
+                pass
+        if hasattr(self, "_open_dialogs"):
+            self._open_dialogs.clear()
+
+        # 4. Безопасная очистка tkinter Variable в главном потоке
+        self._cleanup_variable()
+
+        # 5. Остановка контроллера и процессов scrcpy
         try:
-            while not self._hub_queue.empty():
-                self._hub_queue.get_nowait()
+            self.controller.shutdown()
         except Exception:
             pass
 
-        # Останавливаем все открытые окна scrcpy и инвалидируем задачи хаба
-        self.controller.shutdown()
-        self.root.destroy()
+    def on_close(self) -> None:
+        """Безопасное закрытие приложения с остановкой процессов scrcpy и фоновых задач."""
+        self._cleanup()
+        try:
+            if hasattr(self.root, "winfo_exists"):
+                if self.root.winfo_exists():
+                    self.root.destroy()
+            elif hasattr(self.root, "destroy"):
+                self.root.destroy()
+        except Exception:
+            pass

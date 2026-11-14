@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import tkinter as tk
 from unittest.mock import MagicMock, patch
 
@@ -40,9 +41,16 @@ def tk_root():
     root.withdraw()  # Скрываем окно, чтобы не мешать
     yield root
     try:
+        try:
+            root.update_idletasks()
+        except Exception:
+            pass
         root.destroy()
     except Exception:
         pass
+    finally:
+        if getattr(tk, "_default_root", None) is root:
+            tk._default_root = None
 
 
 def test_ui_initialization_and_rendering(tk_root):
@@ -234,6 +242,8 @@ def test_ui_guard_against_tcl_error_when_closing(tk_root):
             app._show_refresh_error("test error")
 
             ctrl.shutdown()
+            app.root = tk_root
+            app.on_close()
 
 
 def test_ui_hub_tab_and_widgets(tk_root):
@@ -506,3 +516,94 @@ def test_ui_hub_error_clears_previous_devices_in_table(tk_root):
             assert str(app.btn_hub_connect.cget("state")) == "normal"
 
             app.on_close()
+
+
+def test_ui_variable_lifecycle_and_del_safety(tk_root):
+    """Проверка корректной очистки tkinter Variable при закрытии и безопасности вызова __del__."""
+    fake_adb = BinaryInfo(name="adb", found=True, path="/fake/adb")
+    fake_scrcpy = BinaryInfo(name="scrcpy", found=True, path="/fake/scrcpy")
+
+    with patch("desktop.controller.find_adb", return_value=fake_adb):
+        with patch("desktop.controller.find_scrcpy", return_value=fake_scrcpy):
+            ctrl = AppController()
+            app = DesktopApp(tk_root, controller=ctrl)
+            var = app.auto_refresh_var
+            assert var._tk is not None
+
+            # Закрываем приложение
+            app.on_close()
+
+            # Ссылка _tk обнулена при очистке
+            assert var._tk is None
+
+            # __del__ должен безопасно отрабатывать без RuntimeError даже в фоновом потоке
+            del_error = None
+
+            def bg_cleaner():
+                nonlocal del_error
+                try:
+                    var.__del__()
+                except Exception as exc:
+                    del_error = exc
+
+            thread = threading.Thread(target=bg_cleaner)
+            thread.start()
+            thread.join()
+
+            assert del_error is None
+
+
+def test_ui_device_queue_thread_safe_poll(tk_root):
+    """Проверка потокобезопасного обновления устройств USB через очередь _device_queue в главном потоке."""
+    fake_adb = BinaryInfo(name="adb", found=True, path="/fake/adb")
+    fake_scrcpy = BinaryInfo(name="scrcpy", found=True, path="/fake/scrcpy")
+
+    with patch("desktop.controller.find_adb", return_value=fake_adb):
+        with patch("desktop.controller.find_scrcpy", return_value=fake_scrcpy):
+            ctrl = AppController()
+            ctrl.refresh_devices_async = MagicMock()
+            app = DesktopApp(tk_root, controller=ctrl)
+
+            dev = DeviceInfo(
+                serial="QUEUE_DEV",
+                state="device",
+                state_display="Готов к работе",
+                is_network=False,
+                connection_type="USB",
+                is_ready=True,
+            )
+
+            # Передаем результат через очередь
+            app._device_queue.put(("success", [dev]))
+            app._poll_device_queue()
+
+            items = app.tree.get_children()
+            assert len(items) == 1
+            assert app.tree.item(items[0], "values")[0] == "QUEUE_DEV"
+
+            # Передаем ошибку через очередь
+            app._device_queue.put(("error", "Кабель USB отключен"))
+            app._poll_device_queue()
+            assert "Кабель USB отключен" in app.status_msg_label.cget("text")
+
+            app.on_close()
+
+
+def test_ui_root_destroy_event_cleans_up(tk_root):
+    """Проверка срабатывания _cleanup при прямом уничтожении корневого окна через root.destroy()."""
+    fake_adb = BinaryInfo(name="adb", found=True, path="/fake/adb")
+    fake_scrcpy = BinaryInfo(name="scrcpy", found=True, path="/fake/scrcpy")
+
+    with patch("desktop.controller.find_adb", return_value=fake_adb):
+        with patch("desktop.controller.find_scrcpy", return_value=fake_scrcpy):
+            ctrl = AppController()
+            app = DesktopApp(tk_root, controller=ctrl)
+            var = app.auto_refresh_var
+            assert var._tk is not None
+
+            # Прямое уничтожение окна (минуя on_close)
+            tk_root.destroy()
+
+            # Обработчик <Destroy> должен был вызвать _cleanup() и обнулить _tk
+            assert app._cleaned_up is True
+            assert var._tk is None
