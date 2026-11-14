@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 from typing import Callable
 
 from desktop.adb_client import AdbClient, AdbClientError, DeviceInfo
 from desktop.binaries import BinaryInfo, find_adb, find_scrcpy, get_installation_guide
+from desktop.hub_client import HubClient, HubClientError, HubDevice
 from desktop.scrcpy_manager import ScrcpyManager
 
 
@@ -42,6 +44,13 @@ class AppController:
         self._devices_lock = threading.Lock()
         self._is_refreshing = False
         self._refresh_lock = threading.Lock()
+
+        # Состояние удалённого сервера DroidHub
+        self._hub_devices: list[HubDevice] = []
+        self._hub_devices_lock = threading.Lock()
+        self._is_hub_refreshing = False
+        self._hub_refresh_lock = threading.Lock()
+        self._hub_request_id = 0
 
     @property
     def devices(self) -> list[DeviceInfo]:
@@ -226,6 +235,128 @@ class AppController:
         """Возвращает справочный текст с инструкциями."""
         return get_installation_guide()
 
+    @property
+    def hub_devices(self) -> list[HubDevice]:
+        """Возвращает текущую копию списка устройств удалённого сервера DroidHub."""
+        with self._hub_devices_lock:
+            return list(self._hub_devices)
+
+    def get_hub_device(self, device_id: str) -> HubDevice | None:
+        """Находит устройство удалённого сервера по его ID."""
+        with self._hub_devices_lock:
+            for dev in self._hub_devices:
+                if dev.id == device_id:
+                    return dev
+        return None
+
+    @staticmethod
+    def _sanitize_token(message: str, token: str) -> str:
+        """Маскирует секретный токен в строке сообщения об ошибке."""
+        if token and token in message:
+            return message.replace(token, "***")
+        return message
+
+    def fetch_hub_devices_sync(
+        self,
+        base_url: str,
+        token: str,
+        timeout: float = 5.0,
+    ) -> tuple[list[HubDevice], str | None]:
+        """Синхронно запрашивает список устройств с удалённого сервера DroidHub.
+
+        Возвращает: (список_устройств_хаба, сообщение_об_ошибке | None)
+        Токен держится только в памяти приложения, не логируется и не сохраняется.
+        """
+        clean_url = (base_url or "").strip()
+        clean_token = (token or "").strip()
+
+        if not clean_url:
+            return [], "Укажите URL сервера DroidHub (HTTPS)."
+        if not clean_token:
+            return [], "Укажите токен авторизации (Bearer token)."
+
+        try:
+            client = HubClient(base_url=clean_url, token=clean_token, timeout=timeout)
+            devices = client.list_devices()
+            with self._hub_devices_lock:
+                self._hub_devices = list(devices)
+            return devices, None
+        except HubClientError as err:
+            err_msg = self._sanitize_token(str(err), clean_token)
+            logger.warning("Ошибка при обращении к серверу DroidHub: %s", err_msg)
+            return [], err_msg
+        except Exception as exc:
+            logger.exception("Непредвиденная ошибка при запросе к серверу DroidHub")
+            err_msg = self._sanitize_token(f"Ошибка подключения к серверу: {exc}", clean_token)
+            return [], err_msg
+
+    def fetch_hub_devices_async(
+        self,
+        base_url: str,
+        token: str,
+        timeout: float = 5.0,
+        result_queue: queue.Queue | None = None,
+        on_success: Callable[..., None] | None = None,
+        on_error: Callable[..., None] | None = None,
+        request_id: int | None = None,
+    ) -> int:
+        """Запускает неблокирующий фоновый запрос устройств к удалённому серверу DroidHub.
+
+        Результат помещается в result_queue в формате (request_id, devices, err)
+        и/или передаётся в коллбэки on_success/on_error.
+        Возвращает идентификатор запроса (request_id).
+        """
+        with self._hub_refresh_lock:
+            if request_id is not None:
+                self._hub_request_id = request_id
+                rid = request_id
+            else:
+                self._hub_request_id += 1
+                rid = self._hub_request_id
+            self._is_hub_refreshing = True
+
+        def _worker(req_id: int) -> None:
+            try:
+                devices, err = self.fetch_hub_devices_sync(base_url, token, timeout=timeout)
+
+                # Проверяем актуальность запроса
+                with self._hub_refresh_lock:
+                    if req_id != self._hub_request_id:
+                        # Запрос устарел, результат отбрасывается
+                        return
+
+                if result_queue is not None:
+                    result_queue.put((req_id, devices, err))
+
+                if err:
+                    if on_error:
+                        try:
+                            on_error(err, req_id)
+                        except TypeError:
+                            on_error(err)
+                else:
+                    if on_success:
+                        try:
+                            on_success(devices, req_id)
+                        except TypeError:
+                            on_success(devices)
+            finally:
+                with self._hub_refresh_lock:
+                    if req_id == self._hub_request_id:
+                        self._is_hub_refreshing = False
+
+        thread = threading.Thread(
+            target=_worker,
+            args=(rid,),
+            name=f"HubRefreshWorker-{rid}",
+            daemon=True,
+        )
+        thread.start()
+        return rid
+
     def shutdown(self) -> None:
-        """Корректно останавливает все процессы при закрытии приложения."""
+        """Корректно останавливает все процессы и фоновые задачи при закрытии приложения."""
+        with self._hub_refresh_lock:
+            self._hub_request_id += 1
+            self._is_hub_refreshing = False
         self.stop_all_scrcpy()

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 import platform
+import queue
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
 from desktop.adb_client import DeviceInfo
 from desktop.controller import AppController
+from desktop.hub_client import HubDevice
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,11 @@ class DesktopApp:
         self._is_closing = False
         self._timer_id: str | None = None
 
+        # Очередь и состояние запросов для удалённого сервера DroidHub
+        self._hub_queue: queue.Queue = queue.Queue()
+        self._current_hub_request_id: int = 0
+        self._hub_poll_timer: str | None = None
+
         self._init_styles()
         self._create_widgets()
 
@@ -43,6 +50,8 @@ class DesktopApp:
         self.trigger_refresh()
         # Запуск цикла автообновления
         self._schedule_auto_refresh()
+        # Запуск цикла опроса очереди хаба в UI-потоке
+        self._poll_hub_queue()
 
     def _init_styles(self) -> None:
         """Настройка стилей интерфейса."""
@@ -85,8 +94,32 @@ class DesktopApp:
         paths_btn = ttk.Button(btns_frame, text="⚙ Пути к утилитам", command=self.show_paths_dialog)
         paths_btn.pack(side=tk.RIGHT, padx=4)
 
-        # 2. Панель управления списком и запуском scrcpy
-        toolbar = ttk.Frame(self.root, padding="10 4 10 4")
+        # 2. Вкладки приложения: Локальные устройства (USB) и Удалённый сервер DroidHub
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 4))
+
+        self.tab_usb = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_usb, text="📱 Локальные устройства (USB)")
+
+        self.tab_hub = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_hub, text="🌐 Удалённый сервер DroidHub")
+
+        self._create_usb_tab_widgets(self.tab_usb)
+        self._create_hub_tab_widgets(self.tab_hub)
+
+        # 3. Нижняя панель состояния
+        bottom_frame = ttk.Frame(self.root, relief=tk.SUNKEN, padding="6 4 6 4")
+        bottom_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
+        self.summary_label = ttk.Label(bottom_frame, text="Поиск устройств...", style="Status.TLabel")
+        self.summary_label.pack(side=tk.LEFT, padx=4)
+
+        self.status_msg_label = ttk.Label(bottom_frame, text="", style="Status.TLabel")
+        self.status_msg_label.pack(side=tk.RIGHT, padx=4)
+
+    def _create_usb_tab_widgets(self, parent: ttk.Frame) -> None:
+        """Создает элементы управления для вкладки локальных USB-устройств."""
+        toolbar = ttk.Frame(parent, padding="0 4 0 4")
         toolbar.pack(fill=tk.X)
 
         refresh_btn = ttk.Button(toolbar, text="🔄 Обновить", command=self.trigger_refresh)
@@ -114,8 +147,8 @@ class DesktopApp:
         )
         stop_all_btn.pack(side=tk.LEFT, padx=4)
 
-        # 3. Таблица обнаруженных устройств
-        table_frame = ttk.Frame(self.root, padding="10 4 10 4")
+        # Таблица обнаруженных устройств
+        table_frame = ttk.Frame(parent, padding="0 4 0 4")
         table_frame.pack(fill=tk.BOTH, expand=True)
 
         columns = ("serial", "model", "type", "state", "scrcpy")
@@ -161,8 +194,8 @@ class DesktopApp:
         self.menu.add_separator()
         self.menu.add_command(label="📋 Скопировать серийный номер", command=self._copy_serial)
 
-        # 4. Панель действий для выбранной строки
-        row_actions = ttk.Frame(self.root, padding="10 4 10 4")
+        # Панель действий для выбранной строки
+        row_actions = ttk.Frame(parent, padding="0 4 0 4")
         row_actions.pack(fill=tk.X)
 
         self.btn_single_start = ttk.Button(
@@ -186,15 +219,86 @@ class DesktopApp:
         )
         hint_label.pack(side=tk.RIGHT, padx=6)
 
-        # 5. Нижняя панель состояния
-        bottom_frame = ttk.Frame(self.root, relief=tk.SUNKEN, padding="6 4 6 4")
-        bottom_frame.pack(fill=tk.X, side=tk.BOTTOM)
+    def _create_hub_tab_widgets(self, parent: ttk.Frame) -> None:
+        """Создает элементы управления для вкладки удалённого сервера DroidHub."""
+        # 1. Панель параметров подключения
+        conn_frame = ttk.LabelFrame(parent, text=" Параметры удалённого сервера DroidHub ", padding="10 8 10 8")
+        conn_frame.pack(fill=tk.X, padx=0, pady=(6, 4))
 
-        self.summary_label = ttk.Label(bottom_frame, text="Поиск устройств...", style="Status.TLabel")
-        self.summary_label.pack(side=tk.LEFT, padx=4)
+        fields_row = ttk.Frame(conn_frame)
+        fields_row.pack(fill=tk.X, pady=(2, 6))
 
-        self.status_msg_label = ttk.Label(bottom_frame, text="", style="Status.TLabel")
-        self.status_msg_label.pack(side=tk.RIGHT, padx=4)
+        ttk.Label(fields_row, text="URL сервера (HTTPS):").pack(side=tk.LEFT, padx=(0, 4))
+        self.hub_url_entry = ttk.Entry(fields_row, width=32)
+        self.hub_url_entry.pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(fields_row, text="Bearer-токен:").pack(side=tk.LEFT, padx=(0, 4))
+        self.hub_token_entry = ttk.Entry(fields_row, width=24, show="*")
+        self.hub_token_entry.pack(side=tk.LEFT, padx=(0, 12))
+
+        self.btn_hub_connect = ttk.Button(
+            fields_row,
+            text="Подключить и обновить",
+            command=self.trigger_hub_refresh,
+        )
+        self.btn_hub_connect.pack(side=tk.LEFT, padx=4)
+
+        notice_label = ttk.Label(
+            conn_frame,
+            text="🔒 Только просмотр списка устройств (GET /api/devices). Сетевые устройства хаба не являются USB. "
+                 "Переключение транспорта, видеосвязь и удалённое управление не поддерживаются.",
+            font=("Helvetica", 8, "italic"),
+            foreground="#555555",
+        )
+        notice_label.pack(anchor=tk.W, pady=(2, 0))
+
+        # 2. Таблица устройств удалённого сервера
+        table_frame = ttk.Frame(parent, padding="0 4 0 4")
+        table_frame.pack(fill=tk.BOTH, expand=True)
+
+        hub_columns = ("name", "online", "battery", "temperature", "screen")
+        self.hub_tree = ttk.Treeview(
+            table_frame,
+            columns=hub_columns,
+            show="headings",
+            selectmode="browse",
+        )
+
+        self.hub_tree.heading("name", text="Имя устройства", anchor=tk.W)
+        self.hub_tree.heading("online", text="Онлайн", anchor=tk.CENTER)
+        self.hub_tree.heading("battery", text="Заряд", anchor=tk.CENTER)
+        self.hub_tree.heading("temperature", text="Температура", anchor=tk.CENTER)
+        self.hub_tree.heading("screen", text="Экран", anchor=tk.CENTER)
+
+        self.hub_tree.column("name", width=240, stretch=True)
+        self.hub_tree.column("online", width=120, stretch=False, anchor=tk.CENTER)
+        self.hub_tree.column("battery", width=140, stretch=False, anchor=tk.CENTER)
+        self.hub_tree.column("temperature", width=130, stretch=False, anchor=tk.CENTER)
+        self.hub_tree.column("screen", width=130, stretch=False, anchor=tk.CENTER)
+
+        hub_scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.hub_tree.yview)
+        self.hub_tree.configure(yscrollcommand=hub_scrollbar.set)
+
+        self.hub_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        hub_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 3. Нижняя панель состояния вкладки Hub
+        hub_bottom = ttk.Frame(parent, padding="0 4 0 2")
+        hub_bottom.pack(fill=tk.X)
+
+        self.hub_summary_label = ttk.Label(
+            hub_bottom,
+            text="Устройств на сервере: —",
+            style="Status.TLabel",
+        )
+        self.hub_summary_label.pack(side=tk.LEFT)
+
+        self.hub_status_msg_label = ttk.Label(
+            hub_bottom,
+            text="Сервер не подключен. Введите URL и токен.",
+            style="Status.TLabel",
+        )
+        self.hub_status_msg_label.pack(side=tk.RIGHT)
 
     def _update_binary_status_labels(self) -> None:
         """Обновляет индикаторы наличия утилит adb и scrcpy."""
@@ -525,15 +629,165 @@ class DesktopApp:
         ttk.Button(btn_box, text="Отмена", command=paths_win.destroy).pack(side=tk.RIGHT, padx=4)
         ttk.Button(btn_box, text="Сохранить и проверить", command=save_paths).pack(side=tk.RIGHT, padx=4)
 
+    def trigger_hub_refresh(self) -> None:
+        """Инициирует фоновый неблокирующий запрос к удалённому серверу DroidHub."""
+        if self._is_closing:
+            return
+
+        url = self.hub_url_entry.get().strip()
+        token = self.hub_token_entry.get().strip()
+
+        if not url:
+            self._show_hub_error("Укажите URL сервера DroidHub (HTTPS).")
+            return
+        if not token:
+            self._show_hub_error("Укажите токен авторизации (Bearer token).")
+            return
+
+        self._current_hub_request_id += 1
+        req_id = self._current_hub_request_id
+
+        self.btn_hub_connect.config(state=tk.DISABLED)
+        self.hub_status_msg_label.config(
+            text="Подключение к серверу DroidHub...",
+            style="Status.TLabel",
+        )
+
+        try:
+            self.controller.fetch_hub_devices_async(
+                base_url=url,
+                token=token,
+                result_queue=self._hub_queue,
+                request_id=req_id,
+            )
+        except Exception as exc:
+            self.btn_hub_connect.config(state=tk.NORMAL)
+            safe_msg = f"Ошибка запуска запроса: {exc}".replace(token, "***")
+            self._show_hub_error(safe_msg)
+
+    def _poll_hub_queue(self) -> None:
+        """Периодически опрашивает очередь результатов от фонового потока хаба в потоке UI."""
+        if self._is_closing:
+            return
+
+        try:
+            while not self._hub_queue.empty():
+                item = self._hub_queue.get_nowait()
+                req_id, devices, err = item
+
+                # Игнорируем устаревшие результаты после нового запроса или закрытия
+                if req_id != self._current_hub_request_id or self._is_closing:
+                    continue
+
+                self.btn_hub_connect.config(state=tk.NORMAL)
+                if err:
+                    self._show_hub_error(err)
+                else:
+                    self._render_hub_devices(devices)
+        except queue.Empty:
+            pass
+        except Exception:
+            logger.exception("Исключение при опросе очереди хаба")
+        finally:
+            if not self._is_closing:
+                try:
+                    if self.root.winfo_exists():
+                        self._hub_poll_timer = self.root.after(100, self._poll_hub_queue)
+                except Exception:
+                    pass
+
+    def _render_hub_devices(self, devices: list[HubDevice]) -> None:
+        """Отрисовывает полученный список устройств хаба в таблице (в главном потоке Tk)."""
+        try:
+            if self._is_closing or not self.root.winfo_exists():
+                return
+        except Exception:
+            return
+
+        for item in self.hub_tree.get_children():
+            self.hub_tree.delete(item)
+
+        online_count = 0
+        offline_count = 0
+
+        for dev in devices:
+            if dev.online:
+                online_count += 1
+                online_status = "🟢 Онлайн"
+            else:
+                offline_count += 1
+                online_status = "⚪ Офлайн"
+
+            if dev.battery is not None:
+                battery_str = f"{dev.battery}%"
+                if dev.charging:
+                    battery_str += " (зарядка)"
+            else:
+                battery_str = "—"
+
+            if dev.temperature is not None:
+                temp_str = f"{dev.temperature:.1f} °C"
+            else:
+                temp_str = "—"
+
+            if dev.screen_on is True:
+                screen_str = "Включен"
+            elif dev.screen_on is False:
+                screen_str = "Выключен"
+            else:
+                screen_str = "—"
+
+            name_str = dev.name if dev.name else dev.id
+
+            self.hub_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    name_str,
+                    online_status,
+                    battery_str,
+                    temp_str,
+                    screen_str,
+                ),
+            )
+
+        self.hub_summary_label.config(
+            text=f"Всего устройств на сервере: {len(devices)} (Онлайн: {online_count}, Офлайн: {offline_count})"
+        )
+        self.hub_status_msg_label.config(text="Данные обновлены", style="Success.TLabel")
+
+    def _show_hub_error(self, err_text: str) -> None:
+        """Отображает безопасное сообщение об ошибке хаба."""
+        try:
+            if self._is_closing or not self.root.winfo_exists():
+                return
+        except Exception:
+            return
+
+        self.btn_hub_connect.config(state=tk.NORMAL)
+        self.hub_status_msg_label.config(text=f"Ошибка: {err_text}", style="Warning.TLabel")
+        self.hub_summary_label.config(text="Сервер: ошибка подключения")
+
     def on_close(self) -> None:
-        """Безопасное закрытие приложения с остановкой процессов scrcpy."""
+        """Безопасное закрытие приложения с остановкой процессов scrcpy и фоновых задач."""
         self._is_closing = True
         if self._timer_id:
             try:
                 self.root.after_cancel(self._timer_id)
             except Exception:
                 pass
+        if self._hub_poll_timer:
+            try:
+                self.root.after_cancel(self._hub_poll_timer)
+            except Exception:
+                pass
 
-        # Останавливаем все открытые окна scrcpy
+        try:
+            while not self._hub_queue.empty():
+                self._hub_queue.get_nowait()
+        except Exception:
+            pass
+
+        # Останавливаем все открытые окна scrcpy и инвалидируем задачи хаба
         self.controller.shutdown()
         self.root.destroy()
