@@ -1,4 +1,4 @@
-"""Unit tests for desktop/scrcpy_video.py (read-only USB H264 transport for scrcpy v5.0.1)."""
+"""Модульные тесты для desktop/scrcpy_video.py (транспорт H.264 по USB scrcpy v5.0.1)."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from desktop.scrcpy_video import (
     SCRCPY_VERSION_PIN,
     ScrcpyVideoError,
     _get_valid_positive_transport_id,
+    _peek_exact,
     _recv_exact,
     find_preview_server,
     iter_h264_packets,
@@ -31,7 +32,7 @@ from desktop.scrcpy_video import (
 
 
 # ---------------------------------------------------------------------------
-# Test Fixtures & Helpers
+# Тестовые фикстуры и помощники
 # ---------------------------------------------------------------------------
 
 
@@ -43,7 +44,7 @@ def make_device(
     is_ready: bool = True,
     transport_id: str | None = "42",
 ) -> DeviceInfo:
-    """Creates a DeviceInfo instance for testing."""
+    """Создаёт экземпляр DeviceInfo для тестирования."""
     return DeviceInfo(
         serial=serial,
         state=state,
@@ -58,13 +59,13 @@ def make_device(
 
 
 def pack_frame(flags_and_pts: int, payload: bytes) -> bytes:
-    """Packs a 12-byte scrcpy frame header followed by the payload."""
+    """Упаковывает 12-байтный заголовок кадра scrcpy с полезной нагрузкой."""
     header = struct.pack(">QI", flags_and_pts, len(payload))
     return header + payload
 
 
 class MockStreamSocket:
-    """Simulates a TCP socket streaming synthetic scrcpy server data."""
+    """Имитирует TCP-сокет, передающий синтетические данные сервера scrcpy."""
 
     def __init__(self, data: bytes = b"", timeout_on_empty: bool = False) -> None:
         self._buffer = bytearray(data)
@@ -96,7 +97,7 @@ class MockStreamSocket:
 
 
 # ---------------------------------------------------------------------------
-# Tests: Device Validation & Addressing
+# Тесты: Валидация USB-устройства и адресация
 # ---------------------------------------------------------------------------
 
 
@@ -106,51 +107,51 @@ def test_validate_usb_device_success():
 
 
 def test_validate_usb_device_none():
-    with pytest.raises(ScrcpyVideoError, match="Device cannot be None"):
+    with pytest.raises(ScrcpyVideoError, match="Устройство не может быть None"):
         validate_usb_device(None)  # type: ignore
 
 
 def test_validate_usb_device_empty_serial():
     dev = make_device(serial="")
-    with pytest.raises(ScrcpyVideoError, match="Device serial is missing"):
+    with pytest.raises(ScrcpyVideoError, match="Серийный номер устройства отсутствует"):
         validate_usb_device(dev)
 
 
 def test_validate_usb_device_reject_network():
     dev = make_device(is_network=True)
-    with pytest.raises(ScrcpyVideoError, match="Network device.*not permitted"):
+    with pytest.raises(ScrcpyVideoError, match="Сетевое устройство.*запрещено"):
         validate_usb_device(dev)
 
 
 def test_validate_usb_device_reject_network_serial():
     dev = make_device(serial="192.168.1.100:5555")
-    with pytest.raises(ScrcpyVideoError, match="Network device.*not permitted"):
+    with pytest.raises(ScrcpyVideoError, match="Сетевое устройство.*запрещено"):
         validate_usb_device(dev)
 
 
 def test_validate_usb_device_reject_emulator():
     dev = make_device(serial="emulator-5554")
-    with pytest.raises(ScrcpyVideoError, match="Emulator.*is not permitted"):
+    with pytest.raises(ScrcpyVideoError, match="Эмулятор.*запрещён"):
         validate_usb_device(dev)
 
 
 def test_validate_usb_device_reject_missing_usb_info():
     dev = make_device(usb_info=None)
-    with pytest.raises(ScrcpyVideoError, match="has no usb_info"):
+    with pytest.raises(ScrcpyVideoError, match="не имеет usb_info"):
         validate_usb_device(dev)
 
     dev_empty = make_device(usb_info="   ")
-    with pytest.raises(ScrcpyVideoError, match="has no usb_info"):
+    with pytest.raises(ScrcpyVideoError, match="не имеет usb_info"):
         validate_usb_device(dev_empty)
 
 
 def test_validate_usb_device_reject_bad_state():
     dev_offline = make_device(state="offline", is_ready=False)
-    with pytest.raises(ScrcpyVideoError, match="not in 'device' state"):
+    with pytest.raises(ScrcpyVideoError, match="не в состоянии 'device'"):
         validate_usb_device(dev_offline)
 
     dev_not_ready = make_device(state="device", is_ready=False)
-    with pytest.raises(ScrcpyVideoError, match="is not ready"):
+    with pytest.raises(ScrcpyVideoError, match="не готово к работе"):
         validate_usb_device(dev_not_ready)
 
 
@@ -175,7 +176,7 @@ def test_get_valid_positive_transport_id():
 
 
 # ---------------------------------------------------------------------------
-# Tests: find_preview_server
+# Тесты: find_preview_server
 # ---------------------------------------------------------------------------
 
 
@@ -183,6 +184,10 @@ def test_find_preview_server_explicit_version_mismatch():
     assert find_preview_server("/usr/bin/scrcpy", "5.0.0") is None
     assert find_preview_server("/usr/bin/scrcpy", "4.0") is None
     assert find_preview_server("/usr/bin/scrcpy", "5.0.10") is None
+    assert find_preview_server("/usr/bin/scrcpy", "5.0.1.2") is None
+    assert find_preview_server("/usr/bin/scrcpy", "2.5.0.1") is None
+    assert find_preview_server("/usr/bin/scrcpy", "15.0.1") is None
+    assert find_preview_server("/usr/bin/scrcpy", "5.0.1a") is None
 
 
 def test_find_preview_server_sibling_scrcpy_server(tmp_path: Path):
@@ -226,11 +231,15 @@ def test_find_preview_server_probed_version(tmp_path: Path):
     with patch("desktop.scrcpy_video.probe_version", return_value="scrcpy 2.4"):
         assert find_preview_server(str(scrcpy_bin), None) is None
 
+    for bad_ver in ["scrcpy 5.0.1.2", "scrcpy 2.5.0.1", "scrcpy 5.0.10", "scrcpy 5.0.0"]:
+        with patch("desktop.scrcpy_video.probe_version", return_value=bad_ver):
+            assert find_preview_server(str(scrcpy_bin), None) is None
+
 
 def test_find_preview_server_not_found(tmp_path: Path):
     scrcpy_bin = tmp_path / "scrcpy"
     scrcpy_bin.write_text("#!/bin/sh\n")
-    # No sibling server file
+    # В каталоге нет соседнего файла сервера
     assert find_preview_server(str(scrcpy_bin), "5.0.1") is None
 
 
@@ -248,21 +257,21 @@ def test_find_preview_server_default_candidates(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Tests: iter_h264_packets Transport & Protocol
+# Тесты: iter_h264_packets Транспорт и протокол
 # ---------------------------------------------------------------------------
 
 
 def test_iter_h264_packets_full_protocol_stream(tmp_path: Path):
-    """Verifies complete streaming pipeline:
-
-    - Positive transport_id (-t 42) used for all subprocess calls
-    - Unique owned remote jar pushed and cleaned up
-    - tcp:0 forwarded to unique scrcpy_<scid>
-    - Connects to 127.0.0.1
-    - Correct v5.0.1 server arguments (max_size=288, max_fps=12, video_bit_rate=500000)
-    - Readiness dummy byte handled
-    - Config packets prepended to next media packet
-    - Complete Annex B access units yielded
+    """Проверяет полный пайплайн передачи видео:
+    - Положительный transport_id (-t 42) используется для всех вызовов subprocess
+    - Уникальный собственный JAR загружается и удаляется
+    - tcp:0 перенаправляется на уникальный scrcpy_<scid>
+    - Подключение строго к 127.0.0.1
+    - Корректные параметры сервера v5.0.1 (max_size=288, max_fps=12, video_bit_rate=500000)
+    - stdout=subprocess.DEVNULL для предотвращения дедлока пайпа
+    - Проверочный dummy byte обрабатывается
+    - Пакеты конфигурации добавляются перед следующим медиа-пакетом
+    - Выдаются полные единицы доступа Annex B
     """
     server_file = tmp_path / "scrcpy-server"
     server_file.write_bytes(b"DEX_OR_JAR_DATA")
@@ -270,11 +279,6 @@ def test_iter_h264_packets_full_protocol_stream(tmp_path: Path):
     device = make_device(serial="DEVICE1", transport_id="42")
     stop = threading.Event()
 
-    # Synthetic stream:
-    # 1. Dummy byte: 0x00
-    # 2. Config packet (SPS/PPS): PACKET_FLAG_CONFIG, 10 bytes
-    # 3. Media packet (IDR): keyframe flag + pts 1000, 20 bytes
-    # 4. Media packet (P-frame): pts 2000, 15 bytes
     dummy = b"\x00"
     config_payload = b"\x00\x00\x00\x01\x67\x42\x00\x1f\xe9\x01"
     config_packet = pack_frame(PACKET_FLAG_CONFIG, config_payload)
@@ -304,6 +308,8 @@ def test_iter_h264_packets_full_protocol_stream(tmp_path: Path):
     mock_proc = MagicMock()
     mock_proc.poll.return_value = None
     mock_proc.returncode = 0
+    mock_proc.stdout = None
+    mock_proc.stderr = None
 
     with (
         patch("subprocess.run", side_effect=fake_subprocess_run),
@@ -312,20 +318,19 @@ def test_iter_h264_packets_full_protocol_stream(tmp_path: Path):
     ):
         packets = list(iter_h264_packets("adb", device, server_file, stop))
 
-    # Assertions on yielded packets
+    # Проверка выданных пакетов
     assert len(packets) == 2
-    # Packet 1 must have config prepended to IDR:
+    # Пакет 1 содержит SPS/PPS перед IDR
     assert packets[0] == config_payload + idr_payload
     assert packets[0].startswith(ANNEX_B_START_CODE_4)
-    # Packet 2 must be the P-frame:
+    # Пакет 2 - P-кадр
     assert packets[1] == p_payload
     assert packets[1].startswith(ANNEX_B_START_CODE_4)
 
-    # Verify connection was made strictly to 127.0.0.1:48123
+    # Проверка адреса подключения: строго 127.0.0.1:48123
     assert mock_sock.connected_address == ("127.0.0.1", 48123)
 
-    # Verify subprocess commands
-    # 1. Push command used -t 42
+    # Проверка вызовов команд subprocess
     push_call = calls_run[0]
     assert push_call[:4] == ["adb", "-t", "42", "push"]
     assert push_call[4] == str(server_file)
@@ -333,12 +338,14 @@ def test_iter_h264_packets_full_protocol_stream(tmp_path: Path):
     assert remote_jar.startswith("/data/local/tmp/scrcpy_")
     assert remote_jar.endswith(".jar")
 
-    # 2. Forward command used -t 42 and tcp:0
     fwd_call = calls_run[1]
     assert fwd_call[:5] == ["adb", "-t", "42", "forward", "tcp:0"]
     assert fwd_call[5].startswith("localabstract:scrcpy_")
 
-    # 3. Popen command started scrcpy server v5.0.1
+    # Проверка команды запуска сервера scrcpy v5.0.1 и stdout=DEVNULL
+    assert mock_popen.call_args[1].get("stdout") == subprocess.DEVNULL
+    assert mock_popen.call_args[1].get("stderr") == subprocess.PIPE
+
     server_cmd = mock_popen.call_args[0][0]
     assert server_cmd[:4] == ["adb", "-t", "42", "shell"]
     assert f"CLASSPATH={remote_jar}" in server_cmd[4]
@@ -356,7 +363,7 @@ def test_iter_h264_packets_full_protocol_stream(tmp_path: Path):
     assert "send_dummy_byte=true" in server_cmd
     assert "send_stream_meta=false" in server_cmd
 
-    # 4. Finally cleanup: forward removed, child reaped, remote jar removed
+    # Очистка в finally: удаление forward, завершение процесса, удаление JAR
     fwd_rm_call = [c for c in calls_run if "forward" in c and "--remove" in c][0]
     assert fwd_rm_call == ["adb", "-t", "42", "forward", "--remove", "tcp:48123"]
 
@@ -367,7 +374,7 @@ def test_iter_h264_packets_full_protocol_stream(tmp_path: Path):
 
 
 def test_iter_h264_packets_serial_fallback_when_no_transport_id(tmp_path: Path):
-    """When transport_id is missing/invalid, falls back to -s <serial>."""
+    """При отсутствии или некорректном transport_id используется -s <serial>."""
     server_file = tmp_path / "scrcpy-server"
     server_file.write_bytes(b"DEX")
 
@@ -398,7 +405,6 @@ def test_iter_h264_packets_serial_fallback_when_no_transport_id(tmp_path: Path):
         packets = list(iter_h264_packets("adb", device, server_file, stop))
 
     assert len(packets) == 1
-    # Check that -s SERIAL_XYZ was used
     assert calls[0][:4] == ["adb", "-s", "SERIAL_XYZ", "push"]
     assert calls[1][:5] == ["adb", "-s", "SERIAL_XYZ", "forward", "tcp:0"]
     server_cmd = mock_popen.call_args[0][0]
@@ -406,10 +412,9 @@ def test_iter_h264_packets_serial_fallback_when_no_transport_id(tmp_path: Path):
 
 
 def test_iter_h264_packets_parses_session_packet_and_stream_meta(tmp_path: Path):
-    """Verifies that:
-
-    - Stream metadata (b"h264" + width + height) is safely consumed if present
-    - Session packets (PACKET_FLAG_SESSION) are discarded and not yielded as media
+    """Проверяет:
+    - Метаданные потока (4 байта "h264" + 12 байт начальный session packet = 16 байт) корректно поглощаются.
+    - Промежуточный 12-байтный session packet (без payload) пропускается без смещения последующего кадра H.264.
     """
     server_file = tmp_path / "scrcpy-server"
     server_file.write_bytes(b"DEX")
@@ -418,9 +423,14 @@ def test_iter_h264_packets_parses_session_packet_and_stream_meta(tmp_path: Path)
     stop = threading.Event()
 
     dummy = b"\x00"
-    stream_meta = b"h264" + struct.pack(">II", 288, 512)
-    session_payload = b"\x00" * 16
-    session_packet = pack_frame(PACKET_FLAG_SESSION, session_payload)
+    # Метаданные потока scrcpy v5.0.1: 4 байта кодек + 12 байт начальный пакет сессии (всего 16 байт)
+    stream_meta = b"h264" + struct.pack(">III", 0x80000000, 288, 512)
+    assert len(stream_meta) == 16
+
+    # Промежуточный пакет сессии при повороте экрана (ровно 12 байт без полезной нагрузки)
+    session_packet = struct.pack(">III", 0x80000000, 512, 288)
+    assert len(session_packet) == 12
+
     media_payload = b"\x00\x00\x00\x01\x65FRAME"
     media_packet = pack_frame(100, media_payload)
 
@@ -447,8 +457,50 @@ def test_iter_h264_packets_parses_session_packet_and_stream_meta(tmp_path: Path)
     assert packets[0] == media_payload
 
 
+def test_iter_h264_packets_orientation_change_mid_stream(tmp_path: Path):
+    """Проверяет, что при смене ориентации (поступлении 12-байтного session packet между кадрами)
+    следующий H.264-кадр читается точно без смещения."""
+    server_file = tmp_path / "scrcpy-server"
+    server_file.write_bytes(b"DEX")
+
+    device = make_device()
+    stop = threading.Event()
+
+    dummy = b"\x00"
+    frame1 = b"\x00\x00\x00\x01\x65FRAME_ONE"
+    frame2 = b"\x00\x00\x00\x01\x65FRAME_TWO"
+
+    packet1 = pack_frame(100, frame1)
+    # Пакет сессии при повороте устройства: ровно 12 байт, без полезной нагрузки
+    rotation_session = struct.pack(">III", 0x80000000, 512, 288)
+    packet2 = pack_frame(200, frame2)
+
+    stream_data = dummy + packet1 + rotation_session + packet2
+    mock_sock = MockStreamSocket(stream_data)
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        mock_res = MagicMock()
+        mock_res.returncode = 0
+        mock_res.stdout = "50008\n"
+        return mock_res
+
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None
+
+    with (
+        patch("subprocess.run", side_effect=fake_subprocess_run),
+        patch("subprocess.Popen", return_value=mock_proc),
+        patch("socket.socket", return_value=mock_sock),
+    ):
+        packets = list(iter_h264_packets("adb", device, server_file, stop))
+
+    assert len(packets) == 2
+    assert packets[0] == frame1
+    assert packets[1] == frame2
+
+
 def test_iter_h264_packets_ensures_annex_b_start_code(tmp_path: Path):
-    """If media packet does not start with 00 00 00 01 or 00 00 01, start code is prepended."""
+    """Если полезная нагрузка не начинается со стартового кода Annex B, он автоматически добавляется."""
     server_file = tmp_path / "scrcpy-server"
     server_file.write_bytes(b"DEX")
 
@@ -482,7 +534,7 @@ def test_iter_h264_packets_ensures_annex_b_start_code(tmp_path: Path):
 
 
 def test_iter_h264_packets_stop_cancellation_on_static_scene(tmp_path: Path):
-    """Verifies that generator exits promptly when stop.set() is called even during static scenes."""
+    """Генератор немедленно завершает работу при активации stop.set() даже на статичной сцене."""
     server_file = tmp_path / "scrcpy-server"
     server_file.write_bytes(b"DEX")
 
@@ -490,7 +542,6 @@ def test_iter_h264_packets_stop_cancellation_on_static_scene(tmp_path: Path):
     stop = threading.Event()
 
     dummy = b"\x00"
-    # timeout_on_empty will simulate static scene where no new frames arrive
     mock_sock = MockStreamSocket(dummy, timeout_on_empty=True)
 
     def fake_subprocess_run(cmd, *args, **kwargs):
@@ -502,7 +553,6 @@ def test_iter_h264_packets_stop_cancellation_on_static_scene(tmp_path: Path):
     mock_proc = MagicMock()
     mock_proc.poll.return_value = None
 
-    # Trigger stop event after short delay
     def stopper():
         time.sleep(0.05)
         stop.set()
@@ -522,7 +572,7 @@ def test_iter_h264_packets_stop_cancellation_on_static_scene(tmp_path: Path):
 
 
 def test_iter_h264_packets_oversize_packet_raises(tmp_path: Path):
-    """Rejects packets exceeding MAX_PACKET_SIZE to bound memory allocation."""
+    """Пакеты с размером, превышающим MAX_PACKET_SIZE, отклоняются с исключением."""
     server_file = tmp_path / "scrcpy-server"
     server_file.write_bytes(b"DEX")
 
@@ -547,12 +597,12 @@ def test_iter_h264_packets_oversize_packet_raises(tmp_path: Path):
         patch("subprocess.Popen", return_value=mock_proc),
         patch("socket.socket", return_value=mock_sock),
     ):
-        with pytest.raises(ScrcpyVideoError, match="exceeds maximum"):
+        with pytest.raises(ScrcpyVideoError, match="превышает максимально допустимый"):
             list(iter_h264_packets("adb", device, server_file, stop))
 
 
 def test_iter_h264_packets_safe_cleanup_on_push_failure(tmp_path: Path):
-    """If push fails, raises error and cleans up without leaking forward or child."""
+    """При ошибке adb push исключение выбрасывается, а удалённый файл подчищается."""
     server_file = tmp_path / "scrcpy-server"
     server_file.write_bytes(b"DEX")
 
@@ -572,22 +622,22 @@ def test_iter_h264_packets_safe_cleanup_on_push_failure(tmp_path: Path):
         return mock_res
 
     with patch("subprocess.run", side_effect=fake_subprocess_run):
-        with pytest.raises(ScrcpyVideoError, match="Failed to push scrcpy server JAR"):
+        with pytest.raises(ScrcpyVideoError, match="Не удалось загрузить серверный JAR scrcpy"):
             list(iter_h264_packets("adb", device, server_file, stop))
 
-    # Finally block must attempt to rm remote jar
+    # Блок finally обязательно выполняет rm удалённого jar
     assert any("rm" in c for c in calls)
 
 
 def test_iter_h264_packets_dummy_byte_missing_fails(tmp_path: Path):
-    """If server closes connection without sending dummy readiness byte, raises error."""
+    """Если соединение закрылось до получения проверочного байта готовности, выбрасывается ошибка."""
     server_file = tmp_path / "scrcpy-server"
     server_file.write_bytes(b"DEX")
 
     device = make_device()
     stop = threading.Event()
 
-    mock_sock = MockStreamSocket(b"")  # Empty stream
+    mock_sock = MockStreamSocket(b"")  # Пустой поток
 
     def fake_subprocess_run(cmd, *args, **kwargs):
         mock_res = MagicMock()
@@ -603,12 +653,12 @@ def test_iter_h264_packets_dummy_byte_missing_fails(tmp_path: Path):
         patch("subprocess.Popen", return_value=mock_proc),
         patch("socket.socket", return_value=mock_sock),
     ):
-        with pytest.raises(ScrcpyVideoError, match="Failed to receive dummy readiness byte"):
+        with pytest.raises(ScrcpyVideoError, match="Не удалось получить проверочный байт готовности"):
             list(iter_h264_packets("adb", device, server_file, stop))
 
 
 def test_iter_h264_packets_already_stopped(tmp_path: Path):
-    """If stop is set before starting, generator exits immediately without running commands."""
+    """Если событие stop выставлено до запуска, генератор мгновенно завершается."""
     server_file = tmp_path / "scrcpy-server"
     server_file.write_bytes(b"DEX")
 
@@ -623,19 +673,19 @@ def test_iter_h264_packets_already_stopped(tmp_path: Path):
 
 
 def test_iter_h264_packets_invalid_args(tmp_path: Path):
-    """Checks argument validation for adb_path and server_path."""
+    """Проверка валидации входных аргументов пути adb и файла сервера."""
     device = make_device()
     stop = threading.Event()
 
-    with pytest.raises(ScrcpyVideoError, match="Invalid adb_path"):
+    with pytest.raises(ScrcpyVideoError, match="Некорректный путь к adb"):
         list(iter_h264_packets("", device, tmp_path / "server", stop))
 
-    with pytest.raises(ScrcpyVideoError, match="Scrcpy server file does not exist"):
+    with pytest.raises(ScrcpyVideoError, match="Файл сервера scrcpy не найден"):
         list(iter_h264_packets("adb", device, tmp_path / "non_existent_server", stop))
 
 
 def test_iter_h264_packets_bad_forward_port(tmp_path: Path):
-    """If adb forward returns non-integer or out-of-range port, raises error."""
+    """Если вывод adb forward содержит некорректный номер порта, выбрасывается ошибка."""
     server_file = tmp_path / "scrcpy-server"
     server_file.write_bytes(b"DEX")
 
@@ -650,12 +700,12 @@ def test_iter_h264_packets_bad_forward_port(tmp_path: Path):
         return mock_res
 
     with patch("subprocess.run", side_effect=fake_subprocess_run):
-        with pytest.raises(ScrcpyVideoError, match="Could not parse allocated ADB forward port"):
+        with pytest.raises(ScrcpyVideoError, match="Не удалось разобрать выделенный порт"):
             list(iter_h264_packets("adb", device, server_file, stop))
 
 
 def test_iter_h264_packets_server_crashes_on_startup(tmp_path: Path):
-    """If server process exits prematurely before socket connection, raises error."""
+    """Если процесс сервера упал до успешного подключения к сокету, выбрасывается понятная ошибка."""
     server_file = tmp_path / "scrcpy-server"
     server_file.write_bytes(b"DEX")
 
@@ -671,27 +721,46 @@ def test_iter_h264_packets_server_crashes_on_startup(tmp_path: Path):
     mock_proc = MagicMock()
     mock_proc.poll.return_value = 1
     mock_proc.returncode = 1
+    mock_proc.stdout = None
     mock_proc.stderr = io.BytesIO(b"Incompatible version 5.0.1")
 
     with (
         patch("subprocess.run", side_effect=fake_subprocess_run),
         patch("subprocess.Popen", return_value=mock_proc),
     ):
-        with pytest.raises(ScrcpyVideoError, match="Scrcpy server process exited unexpectedly"):
+        with pytest.raises(ScrcpyVideoError, match="Процесс сервера scrcpy неожиданно завершился"):
             list(iter_h264_packets("adb", device, server_file, stop))
 
 
 def test_recv_exact_edge_cases():
-    """Checks bounds and edge cases of _recv_exact."""
+    """Проверка граничных условий вспомогательной функции _recv_exact."""
     stop = threading.Event()
     sock = MockStreamSocket(b"12345")
 
     assert _recv_exact(sock, 0, stop) == b""
 
-    with pytest.raises(ScrcpyVideoError, match="Negative byte count"):
+    with pytest.raises(ScrcpyVideoError, match="Запрошено отрицательное количество байт"):
         _recv_exact(sock, -1, stop)
 
-    # Partial EOF
+    # Частичный EOF
     sock2 = MockStreamSocket(b"12")
     assert _recv_exact(sock2, 5, stop) is None
 
+
+def test_peek_exact_edge_cases():
+    """Проверка граничных условий вспомогательной функции _peek_exact."""
+    stop = threading.Event()
+    sock = MockStreamSocket(b"12345")
+
+    assert _peek_exact(sock, 0, stop) == b""
+    assert _peek_exact(sock, -1, stop) == b""
+
+    # Просмотр без извлечения
+    peeked = _peek_exact(sock, 4, stop)
+    assert peeked == b"1234"
+    # Данные не должны быть удалены из буфера сокета
+    assert _recv_exact(sock, 5, stop) == b"12345"
+
+    # Сокет без данных
+    empty_sock = MockStreamSocket(b"")
+    assert _peek_exact(empty_sock, 4, stop, timeout=0.05) is None
