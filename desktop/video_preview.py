@@ -12,20 +12,11 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 import io
-import sys
 import threading
 import time
 from typing import Any
 
-try:
-    from PIL import Image
-except ImportError:
-    from pathlib import Path
-
-    _site = Path("/home/pool/.local/lib/python3.12/site-packages")
-    if _site.exists() and str(_site) not in sys.path:
-        sys.path.insert(0, str(_site))
-    from PIL import Image
+from PIL import Image
 
 try:
     import av
@@ -83,8 +74,7 @@ def _device_connection_key(device: DeviceInfo) -> tuple[str, str | None, str | N
     serial = str(getattr(device, "serial", "")).strip()
     usb_info = getattr(device, "usb_info", None)
     usb_info_str = str(usb_info).strip() if usb_info is not None else None
-    tid = getattr(device, "transport_id", None)
-    tid_str = str(tid).strip() if tid is not None and not isinstance(tid, bool) else None
+    tid_str = _get_valid_positive_transport_id(device)
     return (serial, usb_info_str, tid_str)
 
 
@@ -163,7 +153,7 @@ class VideoPreviewWorker:
             if self._closed or self._active_connections.get(serial) != conn_key:
                 return
             prev_status = self._status.get(serial)
-            if prev_status != "failed" or serial not in self._pending:
+            if prev_status != "failed":
                 self._status[serial] = "failed"
                 self._pending[serial] = None
                 self._frame_event.set()
@@ -260,7 +250,11 @@ class VideoPreviewWorker:
                     except Exception:
                         pass
 
-                    stream_iter = self._packet_source(device, stop_event)
+                    with self._lock:
+                        stream = self._streams.get(serial)
+                        current_device = stream.device if stream is not None else device
+
+                    stream_iter = self._packet_source(current_device, stop_event)
                     if stream_iter is None:
                         raise RuntimeError("packet_source returned None")
 

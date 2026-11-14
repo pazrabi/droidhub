@@ -24,22 +24,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 import io
-import sys
 import threading
 import time
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-try:
-    from PIL import Image
-except ImportError:
-    from pathlib import Path
-
-    _site = Path("/home/pool/.local/lib/python3.12/site-packages")
-    if _site.exists() and str(_site) not in sys.path:
-        sys.path.insert(0, str(_site))
-    from PIL import Image
-
+from PIL import Image
 import pytest
 
 from desktop.adb_client import DeviceInfo
@@ -737,6 +727,108 @@ class TestFailureHandlingAndRetry:
         finally:
             worker.close()
 
+    def test_consecutive_retry_failures_report_none_only_once_on_transition(self) -> None:
+        """При нескольких сбоях ретрая подряд drain() возвращает None только 1 раз при переходе."""
+        dev = make_test_device("DEV_FAIL_MULTI")
+        mock_av = MockAvModule()
+        attempts = 0
+        lock = threading.Lock()
+        should_succeed = False
+
+        def source(d: DeviceInfo, stop: threading.Event) -> Iterator[bytes]:
+            nonlocal attempts
+            with lock:
+                attempts += 1
+                succeed = should_succeed
+            if not succeed:
+                raise RuntimeError("Persistent source error")
+            yield b"recovered_frame"
+            while not stop.is_set():
+                stop.wait(0.01)
+
+        worker = VideoPreviewWorker(
+            source,
+            av_module=mock_av,
+            initial_backoff=0.01,
+            max_backoff=0.02,
+        )
+        try:
+            worker.update_devices([dev])
+
+            # 1. Первая ошибка переводит состояние в failed -> drain() возвращает None
+            res1 = wait_for_drain(worker, timeout=1.0)
+            assert res1 == {"DEV_FAIL_MULTI": None}
+
+            # 2. Ждем, пока воркер сделает еще несколько ретраев (attempts >= 3)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                with lock:
+                    if attempts >= 3:
+                        break
+                time.sleep(0.01)
+
+            with lock:
+                assert attempts >= 3
+
+            # 3. Последующие вызовы drain() должны возвращать пустой словарь,
+            # так как повторные сбои без промежуточного успеха НЕ вызывают повторный transition
+            res2 = worker.drain()
+            assert res2 == {}
+            assert not worker._frame_event.is_set()
+
+            # 4. Переход в успех -> drain возвращает кадр
+            with lock:
+                should_succeed = True
+            res3 = wait_for_drain(worker, timeout=1.0)
+            assert "DEV_FAIL_MULTI" in res3
+            assert res3["DEV_FAIL_MULTI"] is not None
+            assert res3["DEV_FAIL_MULTI"].startswith(PNG_SIGNATURE)
+        finally:
+            worker.close()
+
+    def test_retry_uses_updated_device_info(self) -> None:
+        """При ретрае после сбоя в packet_source передается актуализированный DeviceInfo."""
+        dev1 = make_test_device("DEV_UPDATE", model="InitialModel", usb_info="1-1")
+        dev2 = make_test_device("DEV_UPDATE", model="UpdatedModel", usb_info="1-1")
+        mock_av = MockAvModule()
+        passed_models: list[str | None] = []
+        lock = threading.Lock()
+
+        def source(d: DeviceInfo, stop: threading.Event) -> Iterator[bytes]:
+            with lock:
+                passed_models.append(d.model)
+                curr = len(passed_models)
+            if curr == 1:
+                raise RuntimeError("Initial failure")
+            yield b"frame"
+            while not stop.is_set():
+                stop.wait(0.01)
+
+        worker = VideoPreviewWorker(
+            source,
+            av_module=mock_av,
+            initial_backoff=0.02,
+            max_backoff=0.05,
+        )
+        try:
+            worker.update_devices([dev1])
+            res1 = wait_for_drain(worker, timeout=1.0)
+            assert res1 == {"DEV_UPDATE": None}
+
+            # Обновляем метаданные устройства (model изменилась, usb_info прежний -> тот же conn_key)
+            worker.update_devices([dev2])
+
+            res2 = wait_for_drain(worker, timeout=1.0)
+            assert "DEV_UPDATE" in res2
+            assert res2["DEV_UPDATE"] is not None
+
+            with lock:
+                assert len(passed_models) >= 2
+                assert passed_models[0] == "InitialModel"
+                assert passed_models[1] == "UpdatedModel"
+        finally:
+            worker.close()
+
 
 # ===========================================================================
 # 8. Тесты идентификации подключения и hotplug
@@ -855,6 +947,103 @@ class TestConnectionIdentityAndHotplug:
             worker.update_devices([])
             assert stopped.wait(timeout=1.0)
             assert worker.drain() == {}
+        finally:
+            worker.close()
+
+    @pytest.mark.parametrize(
+        "raw_tid, expected",
+        [
+            (1, "1"),
+            (42, "42"),
+            ("1", "1"),
+            ("  100  ", "100"),
+            (0, None),
+            ("0", None),
+            ("  0  ", None),
+            (-1, None),
+            ("-1", None),
+            ("-999", None),
+            ("", None),
+            ("   ", None),
+            ("abc", None),
+            ("12a", None),
+            (None, None),
+            (True, None),
+            (False, None),
+        ],
+    )
+    def test_get_valid_positive_transport_id(self, raw_tid: Any, expected: str | None) -> None:
+        """_get_valid_positive_transport_id возвращает строковый ID только для положительных чисел (> 0)."""
+        dev = make_test_device("DEV_TID", transport_id=None)
+        dev.transport_id = raw_tid
+        assert _get_valid_positive_transport_id(dev) == expected
+
+    def test_device_connection_key_normalizes_invalid_transport_ids_to_none(self) -> None:
+        """_device_connection_key нормализует 0, отрицательные числа и пустые строки transport_id в None."""
+        dev_none = make_test_device("DEV_KEY", usb_info="1-1.2", transport_id=None)
+        expected_key = ("DEV_KEY", "1-1.2", None)
+        assert _device_connection_key(dev_none) == expected_key
+
+        for invalid_tid in [0, "0", " 0 ", -1, "-1", "-100", "", "   ", "xyz", True, False]:
+            dev = make_test_device("DEV_KEY", usb_info="1-1.2", transport_id=None)
+            dev.transport_id = invalid_tid
+            assert _device_connection_key(dev) == expected_key, f"Failed for invalid transport_id: {invalid_tid!r}"
+
+    def test_device_connection_key_includes_valid_transport_id(self) -> None:
+        """_device_connection_key включает строковое значение валидного положительного transport_id."""
+        dev1 = make_test_device("DEV_KEY", usb_info="1-1.2", transport_id=None)
+        dev1.transport_id = 15
+        assert _device_connection_key(dev1) == ("DEV_KEY", "1-1.2", "15")
+
+        dev2 = make_test_device("DEV_KEY", usb_info="1-1.2", transport_id=None)
+        dev2.transport_id = " 100 "
+        assert _device_connection_key(dev2) == ("DEV_KEY", "1-1.2", "100")
+
+    def test_invalid_transport_id_transitions_do_not_restart_stream(self) -> None:
+        """Переход между невалидными значениями transport_id (None, 0, '', -1) не перезапускает поток."""
+        dev1 = make_test_device("DEV_TID_SAME", usb_info="1-1", transport_id=None)
+        stream_count = 0
+
+        def source(d: DeviceInfo, stop: threading.Event) -> Iterator[bytes]:
+            nonlocal stream_count
+            stream_count += 1
+            yield b"payload"
+            while not stop.is_set():
+                stop.wait(0.01)
+
+        worker = VideoPreviewWorker(source, av_module=MockAvModule())
+        try:
+            worker.update_devices([dev1])
+            wait_for_drain(worker)
+            assert stream_count == 1
+
+            # Смена transport_id на 0
+            dev2 = make_test_device("DEV_TID_SAME", usb_info="1-1", transport_id=None)
+            dev2.transport_id = 0
+            worker.update_devices([dev2])
+            time.sleep(0.05)
+            assert stream_count == 1
+
+            # Смена transport_id на пустую строку
+            dev3 = make_test_device("DEV_TID_SAME", usb_info="1-1", transport_id=None)
+            dev3.transport_id = ""
+            worker.update_devices([dev3])
+            time.sleep(0.05)
+            assert stream_count == 1
+
+            # Смена transport_id на отрицательное число
+            dev4 = make_test_device("DEV_TID_SAME", usb_info="1-1", transport_id=None)
+            dev4.transport_id = -5
+            worker.update_devices([dev4])
+            time.sleep(0.05)
+            assert stream_count == 1
+
+            # Теперь обновляем на валидный положительный transport_id=42 -> должен произойти перезапуск
+            dev5 = make_test_device("DEV_TID_SAME", usb_info="1-1", transport_id=None)
+            dev5.transport_id = 42
+            worker.update_devices([dev5])
+            wait_for_drain(worker)
+            assert stream_count == 2
         finally:
             worker.close()
 
