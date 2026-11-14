@@ -26,11 +26,6 @@ class USBPresence:
     device_id: str = ""
     generation: int = 1
 
-    def __iter__(self):
-        """Поддержка распаковки кортежа (bridge_id, session_id)."""
-        yield self.bridge_id
-        yield self.session_id
-
 
 @dataclass
 class _DeviceRecord:
@@ -83,10 +78,6 @@ class USBPresenceRegistry:
         self._bridge_to_session: dict[str, str] = {}
         # bridge_id -> последнее поколение (int)
         self._bridge_generations: dict[str, int] = {}
-        # session_id -> поколение
-        self._session_generations: dict[str, int] = {}
-        # Множество явно отозванных session_id
-        self._revoked_sessions: set[str] = set()
 
     @property
     def ttl(self) -> float:
@@ -116,13 +107,22 @@ class USBPresenceRegistry:
         if session_id is None:
             session_id = uuid.uuid4().hex
 
+        # Если session_id уже использовался другим мостом, освобождаем его
+        existing_sess = self._sessions.get(session_id)
+        if existing_sess is not None and existing_sess.bridge_id != bridge_id:
+            self._free_session_devices(session_id)
+            if self._bridge_to_session.get(existing_sess.bridge_id) == session_id:
+                self._bridge_to_session.pop(existing_sess.bridge_id, None)
+            existing_sess.revoked = True
+            self._sessions.pop(session_id, None)
+
         old_session_id = self._bridge_to_session.get(bridge_id)
         if old_session_id is not None and old_session_id != session_id:
             # Отзываем старую сессию и освобождаем её устройства
-            self._revoked_sessions.add(old_session_id)
             old_sess = self._sessions.get(old_session_id)
             if old_sess is not None:
                 old_sess.revoked = True
+                self._sessions.pop(old_session_id, None)
             self._free_session_devices(old_session_id)
 
         current_gen = self._bridge_generations.get(bridge_id, 0)
@@ -131,7 +131,6 @@ class USBPresenceRegistry:
             current_gen += 1
             self._bridge_generations[bridge_id] = current_gen
 
-        self._session_generations[session_id] = current_gen
         self._bridge_to_session[bridge_id] = session_id
         self._sessions[session_id] = _SessionRecord(
             bridge_id=bridge_id,
@@ -144,9 +143,9 @@ class USBPresenceRegistry:
 
     def apply_snapshot(
         self,
-        bridge_id_or_session: str,
-        session_id_or_devices: str | Iterable[str],
-        device_ids: Iterable[str] | None = None,
+        bridge_id: str,
+        session_id: str,
+        device_ids: Iterable[str],
     ) -> bool:
         """
         Атомарно применяет полный снимок активных устройств сессии.
@@ -155,51 +154,25 @@ class USBPresenceRegistry:
         возникает конфликт и весь снимок атомарно отвергается (возвращает False).
         Пустой снимок освобождает все устройства сессии.
         Запоздалый снимок устаревшей сессии отклоняется.
+        Сессия должна быть предварительно авторизована через open_session.
         """
         now = self._clock()
         self.cleanup_expired()
 
-        if device_ids is not None:
-            bridge_id = bridge_id_or_session
-            session_id = str(session_id_or_devices)
-            raw_devices = device_ids
-        else:
-            session_id = bridge_id_or_session
-            raw_devices = session_id_or_devices  # type: ignore[assignment]
-            bridge_id_lookup = self._session_to_bridge_id(session_id)
-            if bridge_id_lookup is None:
-                return False
-            bridge_id = bridge_id_lookup
-
-        # Проверка отзыва сессии
-        if session_id in self._revoked_sessions:
+        session = self._sessions.get(session_id)
+        if session is None or session.revoked or session.bridge_id != bridge_id:
             return False
 
-        # Проверка актуальности сессии для моста
         active_session = self._bridge_to_session.get(bridge_id)
-        if active_session is not None and active_session != session_id:
+        if active_session != session_id:
             # Запоздалый снимок старой сессии: мост уже открыл другую сессию
             return False
 
-        # Проверка поколения сессии
-        last_gen = self._bridge_generations.get(bridge_id, 0)
-        sess_gen = self._session_generations.get(session_id)
-        if sess_gen is not None and sess_gen < last_gen:
+        if session.generation < self._bridge_generations.get(bridge_id, 0):
             return False
 
-        session = self._sessions.get(session_id)
-        if session is not None and session.revoked:
-            return False
-
-        # Если сессия ещё не была зарегистрирована через open_session, регистрируем её
-        if active_session is None:
-            self.open_session(bridge_id, session_id)
-            session = self._sessions[session_id]
-
-        assert session is not None
-
-        # Фильтруем устройства: сохраняются только зарегистрированные в allowlist
-        target_ids = {d for d in raw_devices if d in self._allowed_device_ids}
+        # Фильтруем устройства: сохраняются только входящие в allowlist
+        target_ids = {d for d in device_ids if d in self._allowed_device_ids}
 
         # Проверка конфликтов с другими активными сессиями
         for dev_id in target_ids:
@@ -231,15 +204,7 @@ class USBPresenceRegistry:
         session.expires_at = new_expires_at
         return True
 
-    # Псевдонимы для удобства
-    snapshot = apply_snapshot
-    update_snapshot = apply_snapshot
-
-    def heartbeat(
-        self,
-        bridge_id_or_session: str,
-        session_id: str | None = None,
-    ) -> bool:
+    def heartbeat(self, bridge_id: str, session_id: str) -> bool:
         """
         Продлевает TTL сессии и всех её зарегистрированных устройств.
 
@@ -249,38 +214,22 @@ class USBPresenceRegistry:
         now = self._clock()
         self.cleanup_expired()
 
-        bridge_id, sess_id = self._normalize_bridge_and_session(
-            bridge_id_or_session, session_id
-        )
-
-        if sess_id in self._revoked_sessions:
+        session = self._sessions.get(session_id)
+        if session is None or session.revoked or session.bridge_id != bridge_id:
             return False
 
-        if bridge_id is not None:
-            if self._bridge_to_session.get(bridge_id) != sess_id:
-                return False
-
-        session = self._sessions.get(sess_id)
-        if session is None or session.revoked:
-            return False
-
-        if now >= session.expires_at:
-            self._free_session_devices(sess_id)
+        if self._bridge_to_session.get(bridge_id) != session_id:
             return False
 
         new_expires_at = now + self._ttl
         session.expires_at = new_expires_at
         for rec in self._devices.values():
-            if rec.session_id == sess_id:
+            if rec.session_id == session_id:
                 rec.expires_at = new_expires_at
 
         return True
 
-    def close_session(
-        self,
-        bridge_id_or_session: str,
-        session_id: str | None = None,
-    ) -> bool:
+    def close_session(self, bridge_id: str, session_id: str) -> bool:
         """
         Закрывает сессию моста и освобождает все её устройства.
 
@@ -288,35 +237,23 @@ class USBPresenceRegistry:
         """
         self.cleanup_expired()
 
-        bridge_id, sess_id = self._normalize_bridge_and_session(
-            bridge_id_or_session, session_id
-        )
-
-        if sess_id in self._revoked_sessions:
+        session = self._sessions.get(session_id)
+        if session is None or session.revoked or session.bridge_id != bridge_id:
             return False
 
-        if bridge_id is not None:
-            active_sess = self._bridge_to_session.get(bridge_id)
-            if active_sess != sess_id:
-                # Запоздалое закрытие устаревшей сессии: не трогаем текущие записи
-                return False
-            self._bridge_to_session.pop(bridge_id, None)
-
-        self._revoked_sessions.add(sess_id)
-        session = self._sessions.get(sess_id)
-        if session is None or session.revoked:
+        if self._bridge_to_session.get(bridge_id) != session_id:
+            # Запоздалое закрытие устаревшей сессии: не трогаем текущие записи
             return False
 
+        self._bridge_to_session.pop(bridge_id, None)
         session.revoked = True
-        self._free_session_devices(sess_id)
+        self._sessions.pop(session_id, None)
+        self._free_session_devices(session_id)
         return True
-
-    close = close_session
 
     def revoke_session(self, session_id: str) -> bool:
         """Явно отзывает сессию по её session_id и освобождает устройства."""
         self.cleanup_expired()
-        self._revoked_sessions.add(session_id)
         session = self._sessions.get(session_id)
         if session is None or session.revoked:
             return False
@@ -325,6 +262,7 @@ class USBPresenceRegistry:
         if self._bridge_to_session.get(session.bridge_id) == session_id:
             self._bridge_to_session.pop(session.bridge_id, None)
 
+        self._sessions.pop(session_id, None)
         self._free_session_devices(session_id)
         return True
 
@@ -346,10 +284,6 @@ class USBPresenceRegistry:
             del self._devices[device_id]
             return None
 
-        if rec.session_id in self._revoked_sessions:
-            del self._devices[device_id]
-            return None
-
         session = self._sessions.get(rec.session_id)
         if session is None or session.revoked or now >= session.expires_at:
             del self._devices[device_id]
@@ -362,8 +296,6 @@ class USBPresenceRegistry:
             generation=rec.generation,
         )
 
-    get = resolve
-
     def cleanup_expired(self) -> int:
         """
         Удаляет истекшие записи устройств и сессий, ограничивая хранение.
@@ -371,23 +303,25 @@ class USBPresenceRegistry:
         Возвращает количество удалённых просроченных привязок устройств.
         """
         now = self._clock()
-        expired_devices = [
-            d for d, r in self._devices.items() if now >= r.expires_at
-        ]
-        for d in expired_devices:
-            del self._devices[d]
 
-        # Очистка истекших сессий
+        # Очистка истекших или отозванных сессий
         expired_sessions = [
             s_id for s_id, s in self._sessions.items()
             if now >= s.expires_at or s.revoked
         ]
         for s_id in expired_sessions:
             s = self._sessions[s_id]
-            if self._bridge_to_session.get(s.bridge_id) == s_id and now >= s.expires_at:
+            if self._bridge_to_session.get(s.bridge_id) == s_id:
                 self._bridge_to_session.pop(s.bridge_id, None)
-            if s.revoked or now >= s.expires_at:
-                self._sessions.pop(s_id, None)
+            self._sessions.pop(s_id, None)
+
+        # Очистка истекших или осиротевших устройств
+        expired_devices = [
+            d for d, r in self._devices.items()
+            if now >= r.expires_at or r.session_id not in self._sessions
+        ]
+        for d in expired_devices:
+            del self._devices[d]
 
         return len(expired_devices)
 
@@ -397,9 +331,9 @@ class USBPresenceRegistry:
         now = self._clock()
         result = set()
         for d, rec in list(self._devices.items()):
-            if rec.expires_at > now and rec.session_id not in self._revoked_sessions:
+            if rec.expires_at > now:
                 sess = self._sessions.get(rec.session_id)
-                if sess and not sess.revoked and sess.expires_at > now:
+                if sess is not None and not sess.revoked and sess.expires_at > now:
                     result.add(d)
         return result
 
@@ -419,31 +353,3 @@ class USBPresenceRegistry:
         ]
         for d in to_delete:
             del self._devices[d]
-
-    def _session_to_bridge_id(self, session_id: str) -> str | None:
-        """Определяет bridge_id по session_id."""
-        sess = self._sessions.get(session_id)
-        if sess is not None:
-            return sess.bridge_id
-        for b_id, s_id in self._bridge_to_session.items():
-            if s_id == session_id:
-                return b_id
-        return None
-
-    def _normalize_bridge_and_session(
-        self,
-        bridge_id_or_session: str,
-        session_id: str | None,
-    ) -> tuple[str | None, str]:
-        """Нормализует передачу параметров (bridge_id, session_id) или только (session_id)."""
-        if session_id is not None:
-            return bridge_id_or_session, session_id
-
-        sess_id = bridge_id_or_session
-        bridge_id = self._session_to_bridge_id(sess_id)
-        if bridge_id is None and sess_id in self._bridge_to_session:
-            # Передан bridge_id вместо session_id
-            bridge_id = sess_id
-            sess_id = self._bridge_to_session[bridge_id]
-
-        return bridge_id, sess_id

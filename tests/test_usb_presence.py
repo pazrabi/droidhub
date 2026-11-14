@@ -25,6 +25,10 @@ def test_basic_registration_and_resolve():
 
     assert registry.resolve("phone1") is None
 
+    # Сессия моста должна быть предварительно авторизована через open_session
+    s_id = registry.open_session("bridge-a", "sess-1")
+    assert s_id == "sess-1"
+
     ok = registry.apply_snapshot("bridge-a", "sess-1", ["phone1"])
     assert ok is True
 
@@ -35,10 +39,9 @@ def test_basic_registration_and_resolve():
     assert presence.device_id == "phone1"
     assert presence.generation == 1
 
-    # Проверка распаковки в кортеж (bridge_id, session_id)
-    b_id, s_id = presence
-    assert b_id == "bridge-a"
-    assert s_id == "sess-1"
+    # Датакласс не является частичным итератором: обращение только через явные атрибуты
+    with pytest.raises(TypeError):
+        iter(presence)
 
 
 def test_ttl_expiration_with_fake_clock():
@@ -46,6 +49,7 @@ def test_ttl_expiration_with_fake_clock():
     clock = FakeClock(100.0)
     registry = USBPresenceRegistry(["phone1"], ttl=12.0, clock=clock)
 
+    registry.open_session("bridge-a", "sess-1")
     registry.apply_snapshot("bridge-a", "sess-1", ["phone1"])
     assert registry.resolve("phone1") is not None
 
@@ -65,6 +69,7 @@ def test_heartbeat_extends_ttl():
     clock = FakeClock(100.0)
     registry = USBPresenceRegistry(["phone1", "phone2"], ttl=12.0, clock=clock)
 
+    registry.open_session("bridge-a", "sess-1")
     registry.apply_snapshot("bridge-a", "sess-1", ["phone1", "phone2"])
 
     # Через 8 секунд шлём heartbeat
@@ -92,11 +97,15 @@ def test_conflict_atomically_rejects_entire_snapshot():
     registry = USBPresenceRegistry(["phone1", "phone2", "phone3"], ttl=12.0, clock=clock)
 
     # Сессия 1 захватывает phone1
+    registry.open_session("bridge-1", "sess-1")
     ok1 = registry.apply_snapshot("bridge-1", "sess-1", ["phone1"])
     assert ok1 is True
-    assert registry.resolve("phone1").session_id == "sess-1"
+    pres1 = registry.resolve("phone1")
+    assert pres1 is not None
+    assert pres1.session_id == "sess-1"
 
     # Сессия 2 пытается захватить phone2 и конфликтный phone1
+    registry.open_session("bridge-2", "sess-2")
     ok2 = registry.apply_snapshot("bridge-2", "sess-2", ["phone2", "phone1"])
     assert ok2 is False  # Весь снимок отвергнут!
 
@@ -113,17 +122,23 @@ def test_conflict_cleared_after_ttl_expires():
     clock = FakeClock(100.0)
     registry = USBPresenceRegistry(["phone1"], ttl=12.0, clock=clock)
 
+    registry.open_session("bridge-1", "sess-1")
     registry.apply_snapshot("bridge-1", "sess-1", ["phone1"])
-    assert registry.resolve("phone1").session_id == "sess-1"
+    pres1 = registry.resolve("phone1")
+    assert pres1 is not None
+    assert pres1.session_id == "sess-1"
 
     # Проходит 13 секунд (TTL sess-1 истёк)
     clock.advance(13.0)
     assert registry.resolve("phone1") is None
 
     # Теперь sess-2 может успешно захватить phone1
+    registry.open_session("bridge-2", "sess-2")
     ok = registry.apply_snapshot("bridge-2", "sess-2", ["phone1"])
     assert ok is True
-    assert registry.resolve("phone1").session_id == "sess-2"
+    pres2 = registry.resolve("phone1")
+    assert pres2 is not None
+    assert pres2.session_id == "sess-2"
 
 
 def test_disappearance_and_empty_snapshot():
@@ -131,6 +146,7 @@ def test_disappearance_and_empty_snapshot():
     clock = FakeClock(100.0)
     registry = USBPresenceRegistry(["phone1", "phone2"], ttl=12.0, clock=clock)
 
+    registry.open_session("bridge-a", "sess-1")
     registry.apply_snapshot("bridge-a", "sess-1", ["phone1", "phone2"])
     assert registry.resolve("phone1") is not None
     assert registry.resolve("phone2") is not None
@@ -151,6 +167,7 @@ def test_close_session_releases_devices():
     clock = FakeClock(100.0)
     registry = USBPresenceRegistry(["phone1", "phone2"], ttl=12.0, clock=clock)
 
+    registry.open_session("bridge-a", "sess-1")
     registry.apply_snapshot("bridge-a", "sess-1", ["phone1", "phone2"])
     assert registry.resolve("phone1") is not None
 
@@ -173,7 +190,9 @@ def test_reconnection_revokes_old_session_and_increments_generation():
     assert s1 == "sess-1"
     assert registry.get_generation("bridge-1") == 1
     registry.apply_snapshot("bridge-1", "sess-1", ["phone1"])
-    assert registry.resolve("phone1").session_id == "sess-1"
+    pres1 = registry.resolve("phone1")
+    assert pres1 is not None
+    assert pres1.session_id == "sess-1"
 
     # Переподключение того же моста с новой сессией
     s2 = registry.open_session("bridge-1", "sess-2")
@@ -211,6 +230,7 @@ def test_explicit_session_revocation():
     clock = FakeClock(100.0)
     registry = USBPresenceRegistry(["phone1"], ttl=12.0, clock=clock)
 
+    registry.open_session("bridge-1", "sess-1")
     registry.apply_snapshot("bridge-1", "sess-1", ["phone1"])
     assert registry.resolve("phone1") is not None
 
@@ -230,6 +250,7 @@ def test_allowlist_filters_unknown_devices():
     assert registry.is_allowed("phone1") is True
     assert registry.is_allowed("unknown_usb_gadget") is False
 
+    registry.open_session("bridge-1", "sess-1")
     # Снимок содержит разрешённое устройство и неизвестный гаджет
     ok = registry.apply_snapshot("bridge-1", "sess-1", ["phone1", "unknown_usb_gadget"])
     assert ok is True
@@ -245,6 +266,8 @@ def test_cleanup_expired_limits_storage():
     clock = FakeClock(100.0)
     registry = USBPresenceRegistry(["phone1", "phone2"], ttl=12.0, clock=clock)
 
+    registry.open_session("bridge-1", "sess-1")
+    registry.open_session("bridge-2", "sess-2")
     registry.apply_snapshot("bridge-1", "sess-1", ["phone1"])
     registry.apply_snapshot("bridge-2", "sess-2", ["phone2"])
 
@@ -261,6 +284,7 @@ def test_same_session_updates_without_conflict():
     clock = FakeClock(100.0)
     registry = USBPresenceRegistry(["phone1", "phone2"], ttl=12.0, clock=clock)
 
+    registry.open_session("bridge-1", "sess-1")
     registry.apply_snapshot("bridge-1", "sess-1", ["phone1"])
 
     clock.advance(6.0)
@@ -271,3 +295,62 @@ def test_same_session_updates_without_conflict():
     clock.advance(8.0)  # Прошло 14 с от старта, но только 8 с от второго снимка
     assert registry.resolve("phone1") is not None
     assert registry.resolve("phone2") is not None
+
+
+def test_apply_snapshot_without_open_session_rejected():
+    """Снимок от неизвестной или неоткрытой сессии отвергается и не создаёт сессию."""
+    clock = FakeClock(100.0)
+    registry = USBPresenceRegistry(["phone1"], ttl=12.0, clock=clock)
+
+    # Попытка отправить снимок без предварительного open_session
+    assert registry.apply_snapshot("bridge-1", "unopened-sess", ["phone1"]) is False
+    assert registry.resolve("phone1") is None
+    assert registry.get_active_session("bridge-1") is None
+
+    # Открытие сессии, отправка снимка, затем истечение TTL
+    registry.open_session("bridge-1", "sess-1")
+    assert registry.apply_snapshot("bridge-1", "sess-1", ["phone1"]) is True
+    assert registry.resolve("phone1") is not None
+
+    clock.advance(13.0)
+    # После истечения сессии повторный снимок не должен воскрешать сессию
+    assert registry.apply_snapshot("bridge-1", "sess-1", ["phone1"]) is False
+    assert registry.resolve("phone1") is None
+
+
+def test_cleanup_clears_bridge_to_session_on_revocation():
+    """cleanup_expired() корректно очищает active_session моста при отзыве сессии."""
+    clock = FakeClock(100.0)
+    registry = USBPresenceRegistry(["phone1"], ttl=12.0, clock=clock)
+
+    registry.open_session("bridge-1", "sess-1")
+    registry.apply_snapshot("bridge-1", "sess-1", ["phone1"])
+    assert registry.get_active_session("bridge-1") == "sess-1"
+
+    # Отзываем сессию до истечения TTL
+    registry.revoke_session("sess-1")
+    assert registry.get_active_session("bridge-1") is None
+
+
+def test_reconnect_memory_cleanup_no_leak():
+    """Повторные переподключения моста не приводят к утечке памяти."""
+    clock = FakeClock(100.0)
+    registry = USBPresenceRegistry(["phone1"], ttl=12.0, clock=clock)
+
+    for i in range(100):
+        registry.open_session("bridge-1", f"sess-{i}")
+
+    # В активных сессиях остаётся только последняя сессия
+    assert len(registry._sessions) == 1
+    assert registry.get_generation("bridge-1") == 100
+    assert registry.get_active_session("bridge-1") == "sess-99"
+
+
+def test_no_redundant_aliases_or_guessing():
+    """Проверка отсутствия избыточных псевдонимов и полиморфизма."""
+    registry = USBPresenceRegistry(["phone1"])
+    assert not hasattr(registry, "snapshot")
+    assert not hasattr(registry, "update_snapshot")
+    assert not hasattr(registry, "close")
+    assert not hasattr(registry, "get")
+    assert not hasattr(registry, "_normalize_bridge_and_session")
