@@ -6,8 +6,10 @@ import atexit
 import logging
 import os
 import subprocess
+import threading
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +23,8 @@ class ScrcpySession:
     start_time: float
     window_title: str
     last_error: str | None = None
+    stderr_lines: deque[str] = field(default_factory=lambda: deque(maxlen=50))
+    reader_thread: threading.Thread | None = None
 
     def is_running(self) -> bool:
         """Проверяет, работает ли процесс в данный момент."""
@@ -100,23 +104,58 @@ class ScrcpyManager:
             cmd.extend(extra_args)
 
         try:
-            # Запуск процесса без shell=True
+            # Запуск процесса без shell=True с UTF-8 кодировкой
             proc = subprocess.Popen(
                 cmd,
                 shell=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
+
+            stderr_lines: deque[str] = deque(maxlen=50)
+
+            def _drain_stderr() -> None:
+                try:
+                    pipe = proc.stderr
+                    if pipe:
+                        for line in pipe:
+                            if isinstance(line, str):
+                                stderr_lines.append(line.rstrip("\r\n"))
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        if proc.stderr and hasattr(proc.stderr, "close"):
+                            proc.stderr.close()
+                    except Exception:
+                        pass
+
+            reader_thread = threading.Thread(
+                target=_drain_stderr,
+                name=f"scrcpy-stderr-{serial}",
+                daemon=True,
+            )
+            reader_thread.start()
 
             # Короткая пауза для проверки немедленного падения (например, неверный флаг или устройство недоступно)
             time.sleep(0.3)
             exit_code = proc.poll()
             if exit_code is not None:
-                err_text = ""
+                reader_thread.join(timeout=0.2)
+                err_text = "\n".join(stderr_lines).strip()
+                if not err_text and proc.stderr:
+                    try:
+                        read_val = proc.stderr.read()
+                        if isinstance(read_val, str) and read_val.strip():
+                            err_text = read_val.strip()
+                    except Exception:
+                        pass
                 try:
-                    if proc.stderr:
-                        err_text = proc.stderr.read().strip()
+                    if proc.stderr and hasattr(proc.stderr, "close"):
+                        proc.stderr.close()
                 except Exception:
                     pass
                 msg = f"Ошибка запуска scrcpy (код {exit_code}): {err_text or 'Процесс завершился сразу после старта'}"
@@ -127,6 +166,8 @@ class ScrcpyManager:
                 process=proc,
                 start_time=time.time(),
                 window_title=window_title,
+                stderr_lines=stderr_lines,
+                reader_thread=reader_thread,
             )
             self._sessions[serial] = session
             return True, None
@@ -140,6 +181,31 @@ class ScrcpyManager:
         except Exception as exc:
             return False, f"Не удалось запустить scrcpy: {exc}"
 
+    def _cleanup_session(self, session: ScrcpySession) -> None:
+        """Закрывает дескриптор stderr и фиксирует last_error для завершенной сессии."""
+        if session.reader_thread and session.reader_thread.is_alive():
+            session.reader_thread.join(timeout=0.2)
+
+        try:
+            if session.process.stderr and hasattr(session.process.stderr, "close"):
+                session.process.stderr.close()
+        except Exception:
+            pass
+
+        if session.last_error is None:
+            if session.exit_code not in (None, 0):
+                err = "\n".join(session.stderr_lines).strip()
+                if not err and session.process.stderr:
+                    try:
+                        read_val = session.process.stderr.read()
+                        if isinstance(read_val, str) and read_val.strip():
+                            err = read_val.strip()
+                    except Exception:
+                        pass
+                session.last_error = err or f"Процесс завершился с кодом {session.exit_code}"
+            else:
+                session.last_error = ""
+
     def stop(self, serial: str) -> tuple[bool, str | None]:
         """Останавливает окно scrcpy для указанного устройства."""
         session = self._sessions.get(serial)
@@ -147,6 +213,7 @@ class ScrcpyManager:
             return False, f"Сессия scrcpy для '{serial}' не найдена."
 
         if not session.is_running():
+            self._cleanup_session(session)
             return True, None
 
         try:
@@ -158,8 +225,10 @@ class ScrcpyManager:
                 # Если не завершился вовремя — принудительно SIGKILL
                 session.process.kill()
                 session.process.wait(timeout=1.0)
+            self._cleanup_session(session)
             return True, None
         except Exception as exc:
+            self._cleanup_session(session)
             return False, f"Ошибка при остановке scrcpy: {exc}"
 
     def stop_all(self) -> int:
@@ -173,7 +242,7 @@ class ScrcpyManager:
                 except Exception:
                     pass
 
-        # Ожидание завершения
+        # Ожидание завершения и очистка ресурсов
         for serial, session in list(self._sessions.items()):
             if session.is_running():
                 try:
@@ -185,6 +254,7 @@ class ScrcpyManager:
                         pass
                 except Exception:
                     pass
+            self._cleanup_session(session)
         return stopped
 
     def poll_sessions(self) -> dict[str, bool]:
@@ -194,14 +264,7 @@ class ScrcpyManager:
             running = session.is_running()
             status[serial] = running
             if not running and session.last_error is None:
-                # Читаем возможный stderr при выходе
-                try:
-                    if session.process.stderr:
-                        err = session.process.stderr.read().strip()
-                        if err and session.exit_code != 0:
-                            session.last_error = err
-                except Exception:
-                    pass
+                self._cleanup_session(session)
         return status
 
     def handle_device_disconnection(self, current_connected_serials: set[str]) -> list[str]:

@@ -117,6 +117,31 @@ def test_parse_adb_devices_empty():
     assert devices == []
 
 
+def test_parse_adb_devices_with_version_mismatch_and_daemon_warnings():
+    """Проверка устойчивости парсера к предупреждениям adb до заголовка (issue #7)."""
+    output = """adb server version (41) doesn't match this client (39); killing...
+* daemon not running; starting it now at tcp:5037
+* daemon started successfully
+List of devices attached
+RFCT1234567            device usb:1-1 product:akita model:Pixel_8a device:akita transport_id:1
+"""
+    devices = parse_adb_devices_output(output)
+    # Строка 'adb server version...' не должна парситься как устройство с серийником 'adb'!
+    assert len(devices) == 1
+    assert devices[0].serial == "RFCT1234567"
+    assert devices[0].model == "Pixel_8a"
+    assert devices[0].is_ready is True
+
+
+def test_parse_adb_devices_without_header():
+    """Если заголовок 'List of devices attached' отсутствует, устройства не возвращаются."""
+    output = """adb: error: cannot connect to daemon at tcp:5037: Connection refused
+some random line
+"""
+    devices = parse_adb_devices_output(output)
+    assert devices == []
+
+
 def test_adb_client_forbidden_commands():
     """Проверка блокировки небезопасных команд (shell, root, connect, tcpip и др.)."""
     client = AdbClient("/mock/adb")
@@ -144,6 +169,8 @@ def test_adb_client_list_devices_success():
         args, kwargs = mock_run.call_args
         assert args[0] == ["/mock/adb", "devices", "-l"]
         assert kwargs.get("shell") is False
+        assert kwargs.get("encoding") == "utf-8"
+        assert kwargs.get("errors") == "replace"
 
 
 def test_adb_client_error_exit_code():

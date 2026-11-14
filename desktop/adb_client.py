@@ -113,20 +113,28 @@ def parse_adb_devices_output(output: str) -> list[DeviceInfo]:
     """Парсит вывод команды `adb devices -l`.
 
     Корректно обрабатывает:
-    - Заголовок 'List of devices attached'
-    - Сообщения запуска демона (* daemon not running...)
+    - Заголовок 'List of devices attached' (строки до него игнорируются)
+    - Сообщения запуска демона (* daemon not running...) и предупреждения о несоответствии версий
     - Устройства со статусами device, unauthorized, offline, no permissions
     - Ключи usb:, product:, model:, device:, transport_id:
     """
     devices: list[DeviceInfo] = []
     lines = output.splitlines()
 
+    header_found = False
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        # Пропуск строк демона и заголовка
-        if line.startswith("*") or line.startswith("List of devices attached"):
+
+        # Игнорируем любые сообщения и предупреждения до заголовка
+        if not header_found:
+            if line.startswith("List of devices attached"):
+                header_found = True
+            continue
+
+        # Пропуск строк демона после заголовка (если возникнут)
+        if line.startswith("*"):
             continue
 
         parts = line.split()
@@ -203,6 +211,8 @@ class AdbClient:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 shell=False,
                 check=False,

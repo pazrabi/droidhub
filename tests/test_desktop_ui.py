@@ -106,3 +106,122 @@ def test_ui_start_selected_usb_handling(tk_root):
             app.start_selected_usb()
             ctrl.start_selected_usb_devices.assert_called_once_with(["USB_PHONE_1"])
             app.on_close()
+
+
+def test_ui_start_selected_usb_fallback_selection_no_mutation(tk_root):
+    """Проверка, что fallback на выделенную строку не мутирует checked_serials (issue #3)."""
+    fake_adb = BinaryInfo(name="adb", found=True, path="/fake/adb")
+    fake_scrcpy = BinaryInfo(name="scrcpy", found=True, path="/fake/scrcpy")
+
+    with patch("desktop.controller.find_adb", return_value=fake_adb):
+        with patch("desktop.controller.find_scrcpy", return_value=fake_scrcpy):
+            ctrl = AppController()
+            ctrl.start_selected_usb_devices = MagicMock(return_value=(1, ["Запущено окно"]))
+
+            app = DesktopApp(tk_root, controller=ctrl)
+            dev = DeviceInfo(
+                serial="USB_SEL_ONLY",
+                state="device",
+                state_display="Готов к работе",
+                is_network=False,
+                connection_type="USB",
+                is_ready=True,
+            )
+            app._render_devices([dev])
+            items = app.tree.get_children()
+            assert len(items) == 1
+            app.tree.selection_set(items[0])
+
+            # Чекбоксы не отмечены
+            assert len(app.checked_serials) == 0
+
+            # Запуск для выделенного устройства
+            app.start_selected_usb()
+
+            # Контроллер получил серийник выделенной строки
+            ctrl.start_selected_usb_devices.assert_called_once_with(["USB_SEL_ONLY"])
+
+            # КРИТИЧНО: checked_serials НЕ должен мутировать!
+            assert len(app.checked_serials) == 0
+            assert app.tree.item(items[0], "text") == "[ ]"
+
+            app.on_close()
+
+
+def test_ui_double_click_heading_and_empty_space_ignored(tk_root):
+    """Проверка игнорирования двойных кликов по заголовку и пустой области (issue #4)."""
+    fake_adb = BinaryInfo(name="adb", found=True, path="/fake/adb")
+    fake_scrcpy = BinaryInfo(name="scrcpy", found=True, path="/fake/scrcpy")
+
+    with patch("desktop.controller.find_adb", return_value=fake_adb):
+        with patch("desktop.controller.find_scrcpy", return_value=fake_scrcpy):
+            ctrl = AppController()
+            ctrl.start_device_scrcpy = MagicMock(return_value=(True, None))
+            ctrl.stop_device_scrcpy = MagicMock(return_value=(True, None))
+
+            app = DesktopApp(tk_root, controller=ctrl)
+            dev = DeviceInfo(
+                serial="DEV_CLICK",
+                state="device",
+                state_display="Готов к работе",
+                is_network=False,
+                connection_type="USB",
+                is_ready=True,
+            )
+            app._render_devices([dev])
+            items = app.tree.get_children()
+            app.tree.selection_set(items[0])
+
+            # 1. Клик по заголовку
+            event_heading = MagicMock()
+            event_heading.x = 10
+            event_heading.y = 10
+            app.tree.identify_row = MagicMock(return_value="")
+            app.tree.identify_region = MagicMock(return_value="heading")
+
+            app._on_tree_double_click(event_heading)
+            ctrl.start_device_scrcpy.assert_not_called()
+            ctrl.stop_device_scrcpy.assert_not_called()
+
+            # 2. Клик по пустой области ниже строк
+            app.tree.identify_row = MagicMock(return_value="")
+            app.tree.identify_region = MagicMock(return_value="nothing")
+
+            app._on_tree_double_click(event_heading)
+            ctrl.start_device_scrcpy.assert_not_called()
+            ctrl.stop_device_scrcpy.assert_not_called()
+
+            # 3. Клик по строке устройства
+            app.tree.identify_row = MagicMock(return_value=items[0])
+            app.tree.identify_region = MagicMock(return_value="cell")
+
+            app._on_tree_double_click(event_heading)
+            ctrl.start_device_scrcpy.assert_called_once_with("DEV_CLICK")
+
+            app.on_close()
+
+
+def test_ui_guard_against_tcl_error_when_closing(tk_root):
+    """Проверка защиты от TclError при отрисовке закрывающегося окна (issue #5)."""
+    fake_adb = BinaryInfo(name="adb", found=True, path="/fake/adb")
+    fake_scrcpy = BinaryInfo(name="scrcpy", found=True, path="/fake/scrcpy")
+
+    with patch("desktop.controller.find_adb", return_value=fake_adb):
+        with patch("desktop.controller.find_scrcpy", return_value=fake_scrcpy):
+            ctrl = AppController()
+            app = DesktopApp(tk_root, controller=ctrl)
+
+            # Симулируем флаг закрытия
+            app._is_closing = True
+
+            # Вызовы должны безопасно прерываться без исключений
+            app._render_devices([])
+            app._show_refresh_error("test error")
+
+            # Симулируем уничтоженное окно
+            app._is_closing = False
+            app.root = MagicMock()
+            app.root.winfo_exists.return_value = False
+
+            app._render_devices([])
+            app._show_refresh_error("test error")

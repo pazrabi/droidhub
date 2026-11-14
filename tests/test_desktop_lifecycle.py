@@ -51,6 +51,8 @@ def test_scrcpy_manager_start_success():
             assert cmd[cmd.index("-s") + 1] == "RFCT999"
             assert "--window-title=DroidHub: Pixel 8" in cmd
             assert kwargs.get("shell") is False
+            assert kwargs.get("encoding") == "utf-8"
+            assert kwargs.get("errors") == "replace"
 
 
 def test_scrcpy_manager_prevent_duplicate_launch():
@@ -165,3 +167,56 @@ def test_scrcpy_manager_handle_device_disconnection():
     mock2.terminate.assert_called_once()
     # Для оставшегося terminate не вызывался
     mock1.terminate.assert_not_called()
+
+
+def test_scrcpy_manager_background_stderr_drain():
+    """Проверка фонового чтения stderr в отдельном daemon-потоке без deadlock (issue #1)."""
+    manager = ScrcpyManager("/mock/scrcpy")
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None
+    # Эмулируем построчный поток вывода в stderr
+    mock_proc.stderr = ["WARN: frame dropped\n", "INFO: connected\n"]
+
+    with patch("subprocess.Popen", return_value=mock_proc):
+        with patch("time.sleep"):
+            ok, err = manager.start("DEV_DRAIN")
+            assert ok is True
+            session = manager.get_session("DEV_DRAIN")
+            assert session is not None
+            assert session.reader_thread is not None
+            assert session.reader_thread.is_alive() is False  # список завершился быстро
+            assert "WARN: frame dropped" in session.stderr_lines
+            assert "INFO: connected" in session.stderr_lines
+
+
+def test_scrcpy_manager_poll_sessions_cleanup_fd_and_no_reread():
+    """Проверка закрытия stderr и защиты от повторных чтений завершенных процессов (issue #2)."""
+    manager = ScrcpyManager("/mock/scrcpy")
+    mock_proc = MagicMock()
+    mock_proc.poll.return_value = None  # Изначально запущен
+
+    with patch("subprocess.Popen", return_value=mock_proc):
+        with patch("time.sleep"):
+            manager.start("DEV_POLL")
+
+    session = manager.get_session("DEV_POLL")
+    assert session is not None
+
+    # Теперь процесс завершился штатно (код 0)
+    mock_proc.poll.return_value = 0
+    mock_proc.stderr = MagicMock()
+
+    # Первый опрос: должен закрыть дескриптор и зафиксировать last_error = ""
+    status1 = manager.poll_sessions()
+    assert status1["DEV_POLL"] is False
+    assert session.last_error == ""
+    mock_proc.stderr.close.assert_called_once()
+
+    # Сбрасываем счетчик вызовов
+    mock_proc.stderr.reset_mock()
+
+    # Второй опрос: повторных чтений или закрытий происходить НЕ должно!
+    status2 = manager.poll_sessions()
+    assert status2["DEV_POLL"] is False
+    mock_proc.stderr.read.assert_not_called()
+    mock_proc.stderr.close.assert_not_called()

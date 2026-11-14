@@ -118,6 +118,8 @@ def probe_version(cmd: list[str]) -> str | None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=3.0,
             check=False,
         )

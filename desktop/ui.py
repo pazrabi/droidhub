@@ -228,16 +228,30 @@ class DesktopApp:
 
         def on_success(devices: list[DeviceInfo]) -> None:
             if not self._is_closing:
-                self.root.after(0, self._render_devices, devices)
+                try:
+                    if self.root.winfo_exists():
+                        self.root.after(0, self._render_devices, devices)
+                except Exception:
+                    pass
 
         def on_error(err: str) -> None:
             if not self._is_closing:
-                self.root.after(0, self._show_refresh_error, err)
+                try:
+                    if self.root.winfo_exists():
+                        self.root.after(0, self._show_refresh_error, err)
+                except Exception:
+                    pass
 
         self.controller.refresh_devices_async(on_success=on_success, on_error=on_error)
 
     def _render_devices(self, devices: list[DeviceInfo]) -> None:
         """Отрисовывает полученный список устройств в таблице (вызывается в главном потоке)."""
+        try:
+            if self._is_closing or not self.root.winfo_exists():
+                return
+        except Exception:
+            return
+
         # Сохраняем текущее выделение
         selected_item = self.tree.selection()
         selected_serial = None
@@ -312,6 +326,11 @@ class DesktopApp:
 
     def _show_refresh_error(self, err_text: str) -> None:
         """Отображает ошибку обновления устройств."""
+        try:
+            if self._is_closing or not self.root.winfo_exists():
+                return
+        except Exception:
+            return
         self.status_msg_label.config(text=f"Ошибка: {err_text}", style="Warning.TLabel")
 
     def _schedule_auto_refresh(self) -> None:
@@ -351,10 +370,12 @@ class DesktopApp:
 
     def _on_tree_double_click(self, event: tk.Event) -> None:
         """Двойной клик запускает scrcpy (если не запущен) или закрывает его."""
-        selected = self.tree.selection()
-        if not selected:
+        item_id = self.tree.identify_row(event.y)
+        region = self.tree.identify_region(event.x, event.y)
+        if not item_id or region == "heading":
             return
-        values = self.tree.item(selected[0], "values")
+
+        values = self.tree.item(item_id, "values")
         if not values:
             return
         serial = str(values[0])
@@ -415,11 +436,14 @@ class DesktopApp:
 
     def start_selected_usb(self) -> None:
         """Запускает окна scrcpy для всех отмеченных галочками USB-устройств."""
-        if not self.checked_serials:
-            # Если ничего не отмечено галочкой, пробуем взять текущую выделенную строку
+        serials_to_start: list[str] = []
+        if self.checked_serials:
+            serials_to_start = list(self.checked_serials)
+        else:
+            # Если ничего не отмечено галочкой, пробуем взять текущую выделенную строку без изменения checked_serials
             sel = self._get_selected_serial()
             if sel:
-                self.checked_serials.add(sel)
+                serials_to_start = [sel]
             else:
                 messagebox.showinfo(
                     "Запуск scrcpy",
@@ -428,7 +452,7 @@ class DesktopApp:
                 )
                 return
 
-        started, msgs = self.controller.start_selected_usb_devices(list(self.checked_serials))
+        started, msgs = self.controller.start_selected_usb_devices(serials_to_start)
         msg_text = "\n".join(msgs)
         if started > 0:
             self.status_msg_label.config(text=f"Запущено окон scrcpy: {started}")
