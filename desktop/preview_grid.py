@@ -222,14 +222,19 @@ class PreviewGrid(tk.Frame):
         master: tk.Misc | None = None,
         *,
         open_devices: Callable[[list[str]], None],
+        close_devices: Callable[[list[str]], None] | None = None,
         **kwargs,
     ) -> None:
         if not callable(open_devices):
             raise TypeError("open_devices must be callable")
+        if close_devices is not None and not callable(close_devices):
+            raise TypeError("close_devices must be callable or None")
 
         super().__init__(master, bg=BG_PANEL, **kwargs)
 
         self._open_devices = open_devices
+        self._close_devices = close_devices
+        self._closeable_serials: set[str] = set()
         self._devices_by_serial: dict[str, DeviceInfo] = {}
         self._usb_devices: list[DeviceInfo] = []
         self._visible_devices: list[DeviceInfo] = []
@@ -295,8 +300,17 @@ class PreviewGrid(tk.Frame):
             text="Открыть выбранные",
             command=self._on_open_selected,
         )
-        self._open_btn.pack(fill=tk.X, padx=8, pady=(4, 10))
-        self._open_btn.bind("<Return>", lambda e: self._on_open_selected())
+        self._open_btn.pack(fill=tk.X, padx=8, pady=(4, 2))
+        self._open_btn.bind("<Return>", lambda e: (self._on_open_selected(), "break")[1])
+
+        self._close_btn = ttk.Button(
+            self._left_pane,
+            text="Закрыть выбранные",
+            command=self._on_close_selected,
+        )
+        self._close_btn.pack(fill=tk.X, padx=8, pady=(2, 10))
+        self._close_btn.bind("<Return>", self._on_close_return)
+        self._update_close_button_state()
 
         # Прокручиваемая сетка справа
         self._right_pane = tk.Frame(self, bg=BG_PANEL)
@@ -464,6 +478,7 @@ class PreviewGrid(tk.Frame):
             self._count_label.config(text=f"Показано: {len(self._visible_devices)} из {total}")
         else:
             self._count_label.config(text=f"Всего: {total}")
+        self._update_close_button_state()
 
     def select_visible(self) -> None:
         """Выбирает только текущие видимые готовые телефоны, сохраняя скрытый выбор."""
@@ -472,12 +487,14 @@ class PreviewGrid(tk.Frame):
         )
         self._sync_cards_selection()
         self._update_listbox()
+        self._update_close_button_state()
 
     def deselect_all(self) -> None:
         """Снимает выбор со всех устройств."""
         self._selected_serials.clear()
         self._sync_cards_selection()
         self._update_listbox()
+        self._update_close_button_state()
 
     def _sync_cards_selection(self) -> None:
         """Синхронизирует визуальное состояние чекбоксов карточек."""
@@ -619,6 +636,25 @@ class PreviewGrid(tk.Frame):
         if card is not None:
             card.set_photo(photo)
 
+    @property
+    def close_btn(self) -> ttk.Button:
+        return self._close_btn
+
+    def set_closeable_serials(self, serials: set[str]) -> None:
+        """Принимает снимок активных или ожидающих сессий из приложения."""
+        self._closeable_serials = set(serials) if serials else set()
+        self._update_close_button_state()
+
+    def _update_close_button_state(self) -> None:
+        """Обновляет доступность кнопки закрытия выбранных устройств."""
+        if not hasattr(self, "_close_btn"):
+            return
+        can_close = callable(self._close_devices) and any(
+            d.serial in self._selected_serials and d.serial in self._closeable_serials
+            for d in self._visible_devices
+        )
+        self._close_btn.config(state="normal" if can_close else "disabled")
+
     def selected_serials(self) -> list[str]:
         """Возвращает список серийных номеров выбранных USB-устройств."""
         return [d.serial for d in self._usb_devices if d.serial in self._selected_serials]
@@ -635,6 +671,7 @@ class PreviewGrid(tk.Frame):
             card.set_selected(serial in self._selected_serials)
 
         self._update_listbox()
+        self._update_close_button_state()
 
     def _on_open_selected(self) -> None:
         """Вызывает callback с выбранными готовыми видимыми USB serial."""
@@ -643,6 +680,23 @@ class PreviewGrid(tk.Frame):
             if d.serial in self._selected_serials and self._is_device_ready(d)
         ]
         self._open_devices(visible_ready_selected)
+
+    def _on_close_selected(self) -> None:
+        """Вызывает callback с выбранными видимыми закрываемыми USB serial."""
+        if not callable(self._close_devices):
+            return
+        serials_to_close = [
+            d.serial for d in self._visible_devices
+            if d.serial in self._selected_serials and d.serial in self._closeable_serials
+        ]
+        if not serials_to_close:
+            return
+        self._close_devices(serials_to_close)
+
+    def _on_close_return(self, event: tk.Event | None = None) -> str:
+        if str(self._close_btn.cget("state")) != "disabled":
+            self._on_close_selected()
+        return "break"
 
     def _on_card_double_click(self, serial: str) -> None:
         """Двойной клик открывает этот готовый телефон."""
