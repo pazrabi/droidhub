@@ -234,6 +234,7 @@ class PreviewGrid(tk.Frame):
         self._open_devices = open_devices
         self._devices_by_serial: dict[str, DeviceInfo] = {}
         self._usb_devices: list[DeviceInfo] = []
+        self._visible_devices: list[DeviceInfo] = []
         self._cards: dict[str, PreviewCard] = {}
         self._selected_serials: set[str] = set()
         self._previews: dict[str, tk.PhotoImage] = {}
@@ -314,6 +315,8 @@ class PreviewGrid(tk.Frame):
         self._right_pane = tk.Frame(self, bg=BG_PANEL)
         self._right_pane.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
+        self._create_toolbar()
+
         self._canvas = tk.Canvas(self._right_pane, bg=BG_PANEL, highlightthickness=0)
         self._canvas_scroll = ttk.Scrollbar(self._right_pane, orient="vertical", command=self._canvas.yview)
         self._canvas.configure(yscrollcommand=self._canvas_scroll.set)
@@ -372,6 +375,199 @@ class PreviewGrid(tk.Frame):
         if cols != self._columns:
             self._columns = cols
             self._relayout_cards()
+
+    def _create_toolbar(self) -> None:
+        """Создает компактную панель управления над сеткой карточек."""
+        self._toolbar = tk.Frame(self._right_pane, bg=BG_PANEL, padx=6, pady=4)
+        self._toolbar.pack(side=tk.TOP, fill=tk.X)
+
+        # 1. Поиск по модели/серийному номеру
+        search_lbl = tk.Label(
+            self._toolbar,
+            text="Поиск:",
+            font=("Helvetica", 9),
+            fg=FG_TEXT,
+            bg=BG_PANEL,
+        )
+        search_lbl.pack(side=tk.LEFT, padx=(2, 4))
+
+        self._search_var = tk.StringVar()
+        self._search_entry = tk.Entry(
+            self._toolbar,
+            textvariable=self._search_var,
+            bg="#2d2d2d",
+            fg=FG_TEXT,
+            insertbackground=FG_TEXT,
+            bd=1,
+            relief="solid",
+            highlightthickness=0,
+            font=("Helvetica", 9),
+            width=14,
+        )
+        self._search_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self._search_var.trace_add("write", lambda *_: self._on_filter_changed())
+        self._search_entry.bind("<KeyRelease>", lambda _: self._on_filter_changed())
+
+        # 2. Фильтр: Все / Готовы / Не готовы
+        filter_lbl = tk.Label(
+            self._toolbar,
+            text="Фильтр:",
+            font=("Helvetica", 9),
+            fg=FG_TEXT,
+            bg=BG_PANEL,
+        )
+        filter_lbl.pack(side=tk.LEFT, padx=(0, 4))
+
+        self._filter_var = tk.StringVar(value="Все")
+        self._filter_combo = ttk.Combobox(
+            self._toolbar,
+            textvariable=self._filter_var,
+            values=["Все", "Готовы", "Не готовы"],
+            state="readonly",
+            width=10,
+            font=("Helvetica", 9),
+        )
+        self._filter_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self._filter_combo.bind("<<ComboboxSelected>>", lambda _: self._on_filter_changed())
+        self._filter_var.trace_add("write", lambda *_: self._on_filter_changed())
+
+        # 3. Кнопки «Выбрать видимые» и «Снять выбор»
+        self._select_visible_btn = tk.Button(
+            self._toolbar,
+            text="Выбрать видимые",
+            font=("Helvetica", 8, "bold"),
+            bg=BG_BUTTON,
+            fg=FG_BUTTON,
+            activebackground=BG_BUTTON_ACTIVE,
+            activeforeground=FG_BUTTON,
+            relief="flat",
+            padx=6,
+            pady=2,
+            cursor="hand2",
+            command=self.select_visible,
+        )
+        self._select_visible_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self._deselect_btn = tk.Button(
+            self._toolbar,
+            text="Снять выбор",
+            font=("Helvetica", 8),
+            bg="#3c3c3c",
+            fg=FG_BUTTON,
+            activebackground="#4c4c4c",
+            activeforeground=FG_BUTTON,
+            relief="flat",
+            padx=6,
+            pady=2,
+            cursor="hand2",
+            command=self.deselect_all,
+        )
+        self._deselect_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        # 4. Осмысленный счетчик при фильтрации
+        self._count_label = tk.Label(
+            self._toolbar,
+            text="Всего: 0",
+            font=("Helvetica", 9),
+            fg=FG_MUTED,
+            bg=BG_PANEL,
+            anchor="e",
+        )
+        self._count_label.pack(side=tk.RIGHT, padx=(4, 4))
+
+    @property
+    def visible_devices(self) -> list[DeviceInfo]:
+        """Возвращает текущую проекцию видимых устройств."""
+        return list(self._visible_devices)
+
+    def _get_filter_mode(self) -> str:
+        val = self._filter_var.get().strip().lower()
+        if val in ("ready", "готовы", "готов", "готовые"):
+            return "ready"
+        if val in ("not_ready", "not ready", "не готовы", "не готов", "неготовы"):
+            return "not_ready"
+        return "all"
+
+    def set_filter(self, mode: str) -> None:
+        """Устанавливает фильтр по готовности ('all', 'ready', 'not_ready')."""
+        mode_lower = mode.strip().lower()
+        if mode_lower in ("ready", "готовы", "готов", "готовые"):
+            self._filter_var.set("Готовы")
+        elif mode_lower in ("not_ready", "not ready", "не готовы", "не готов", "неготовы"):
+            self._filter_var.set("Не готовы")
+        else:
+            self._filter_var.set("Все")
+
+    def set_search(self, query: str) -> None:
+        """Устанавливает строку поиска по модели или serial."""
+        self._search_var.set(query)
+
+    def _matches_filter(self, dev: DeviceInfo) -> bool:
+        # 1. Проверка готовности
+        mode = self._get_filter_mode()
+        is_ready = self._is_device_ready(dev)
+        if mode == "ready" and not is_ready:
+            return False
+        if mode == "not_ready" and is_ready:
+            return False
+
+        # 2. Поиск по модели / serial
+        query = self._search_var.get().strip().lower()
+        if query:
+            serial_text = (dev.serial or "").lower()
+            model_text = (getattr(dev, "model", "") or "").lower()
+            disp_attr = getattr(dev, "model_display", "")
+            model_disp = (disp_attr() if callable(disp_attr) else (disp_attr or "")).lower()
+            device_code = (getattr(dev, "device_code", "") or "").lower()
+            if (
+                query not in serial_text
+                and query not in model_text
+                and query not in model_disp
+                and query not in device_code
+            ):
+                return False
+
+        return True
+
+    def _apply_filters(self) -> None:
+        """Пересчитывает проекцию видимых устройств и обновляет отображение."""
+        self._visible_devices = [d for d in self._usb_devices if self._matches_filter(d)]
+        self._update_listbox()
+        self._relayout_cards()
+        self._update_count_label()
+
+    def _on_filter_changed(self) -> None:
+        self._apply_filters()
+
+    def _update_count_label(self) -> None:
+        total = len(self._usb_devices)
+        visible = len(self._visible_devices)
+        is_filtered = bool(self._search_var.get().strip()) or (self._get_filter_mode() != "all")
+        if is_filtered or visible < total:
+            self._count_label.config(text=f"Показано: {visible} из {total}")
+        else:
+            self._count_label.config(text=f"Всего: {total}")
+
+    def select_visible(self) -> None:
+        """Выбирает только текущие видимые готовые телефоны, сохраняя скрытый выбор."""
+        for dev in self._visible_devices:
+            if self._is_device_ready(dev):
+                self._selected_serials.add(dev.serial)
+            else:
+                self._selected_serials.discard(dev.serial)
+        self._sync_cards_selection()
+        self._update_listbox()
+
+    def deselect_all(self) -> None:
+        """Снимает выбор со всех устройств."""
+        self._selected_serials.clear()
+        self._sync_cards_selection()
+        self._update_listbox()
+
+    def _sync_cards_selection(self) -> None:
+        """Синхронизирует визуальное состояние чекбоксов карточек."""
+        for serial, card in self._cards.items():
+            card.set_selected(serial in self._selected_serials)
 
     @staticmethod
     def _is_usb_device(dev: DeviceInfo) -> bool:
@@ -458,11 +654,8 @@ class PreviewGrid(tk.Frame):
             # сохраняй выбор
             card.set_selected(serial in self._selected_serials)
 
-        # 3. Обновление списка слева
-        self._update_listbox()
-
-        # 4. Пересчет сетки
-        self._relayout_cards()
+        # 3. Применение фильтров, обновление списка и сетки
+        self._apply_filters()
 
     def set_preview(self, serial: str, png: bytes | None) -> None:
         """Устанавливает кадр предпросмотра для указанного serial.
@@ -528,9 +721,12 @@ class PreviewGrid(tk.Frame):
         self._update_listbox()
 
     def _on_open_selected(self) -> None:
-        """Вызывает callback с выбранными готовыми USB serial."""
-        ready_serials = [s for s in self.selected_serials() if self._is_device_ready(s)]
-        self._open_devices(ready_serials)
+        """Вызывает callback с выбранными готовыми видимыми USB serial."""
+        visible_ready_selected = [
+            d.serial for d in self._visible_devices
+            if d.serial in self._selected_serials and self._is_device_ready(d)
+        ]
+        self._open_devices(visible_ready_selected)
 
     def _on_card_double_click(self, serial: str) -> None:
         """Двойной клик открывает этот готовый телефон."""
@@ -540,15 +736,15 @@ class PreviewGrid(tk.Frame):
     def _on_listbox_space(self, event: tk.Event | None = None) -> str:
         sel = self._listbox.curselection()
         idx = sel[0] if sel else self._listbox.index(tk.ACTIVE)
-        if 0 <= idx < len(self._usb_devices):
-            self._toggle_selection(self._usb_devices[idx].serial)
+        if 0 <= idx < len(self._visible_devices):
+            self._toggle_selection(self._visible_devices[idx].serial)
         return "break"
 
     def _on_listbox_return(self, event: tk.Event | None = None) -> str:
         sel = self._listbox.curselection()
         idx = sel[0] if sel else self._listbox.index(tk.ACTIVE)
-        if 0 <= idx < len(self._usb_devices):
-            dev = self._usb_devices[idx]
+        if 0 <= idx < len(self._visible_devices):
+            dev = self._visible_devices[idx]
             if self._is_device_ready(dev):
                 self._open_devices([dev.serial])
         return "break"
@@ -557,15 +753,15 @@ class PreviewGrid(tk.Frame):
         idx = self._listbox.nearest(event.y)
         bbox = self._listbox.bbox(idx)
         if bbox and bbox[1] <= event.y <= bbox[1] + bbox[3]:
-            if 0 <= idx < len(self._usb_devices):
-                self._toggle_selection(self._usb_devices[idx].serial)
+            if 0 <= idx < len(self._visible_devices):
+                self._toggle_selection(self._visible_devices[idx].serial)
 
     def _update_listbox(self) -> None:
         cur_sel = self._listbox.curselection()
         active_idx = self._listbox.index(tk.ACTIVE) if self._listbox.size() > 0 else 0
 
         self._listbox.delete(0, tk.END)
-        for dev in self._usb_devices:
+        for dev in self._visible_devices:
             is_checked = dev.serial in self._selected_serials
             mark = "[✓]" if is_checked else "[ ]"
             state_str = "Готов" if dev.is_ready else dev.state_display
@@ -580,16 +776,27 @@ class PreviewGrid(tk.Frame):
                 self._listbox.activate(active_idx)
 
     def _relayout_cards(self) -> None:
-        if not self._usb_devices:
+        visible_serials = {d.serial for d in self._visible_devices}
+        for serial, card in self._cards.items():
+            if serial not in visible_serials:
+                card.grid_forget()
+
+        if not self._visible_devices:
+            if not self._usb_devices:
+                self._empty_label.config(text="Нет подключенных USB-устройств")
+            else:
+                self._empty_label.config(text="Нет устройств, соответствующих фильтру")
             self._empty_label.grid(row=0, column=0, padx=20, pady=40, sticky="nsew")
+            self._canvas.configure(scrollregion=self._canvas.bbox("all"))
             return
 
         self._empty_label.grid_forget()
         cols = max(1, self._columns)
 
-        for i, dev in enumerate(self._usb_devices):
+        for i, dev in enumerate(self._visible_devices):
             card = self._cards.get(dev.serial)
             if card is not None:
                 row = i // cols
                 col = i % cols
                 card.grid(row=row, column=col, padx=4, pady=4, sticky="n")
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))

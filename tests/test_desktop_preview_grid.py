@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import struct
 import tkinter as tk
+from tkinter import ttk
 from typing import Callable, Sequence
 from unittest.mock import MagicMock
 import zlib
@@ -512,3 +513,240 @@ def test_set_preview_subsample_error_handled(tk_root, monkeypatch):
 
     assert grid._previews.get("USB_1") is None
     assert grid._cards["USB_1"]._photo_ref is None
+
+
+# ============================================================================
+# Тесты для панели инструментов, поиска, фильтрации и согласованности
+# ============================================================================
+
+
+def test_toolbar_structure_and_widgets(tk_root):
+    """Панель инструментов содержит поиск, фильтр, кнопки выбора и счетчик."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+
+    assert hasattr(grid, "_toolbar")
+    assert isinstance(grid._search_entry, tk.Entry)
+    assert isinstance(grid._filter_combo, ttk.Combobox)
+    assert grid._select_visible_btn.cget("text") == "Выбрать видимые"
+    assert grid._deselect_btn.cget("text") == "Снять выбор"
+    assert "0" in grid._count_label.cget("text")
+
+
+def test_search_by_model_and_serial(tk_root):
+    """Поиск по модели и serial (регистронезависимо) фильтрует устройства и обновляет счетчик."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+
+    dev1 = make_device("USB_AAA", model="Pixel 7")
+    dev2 = make_device("USB_BBB", model="Galaxy S23")
+    dev3 = make_device("USB_CCC", model="Pixel 8")
+    grid.set_devices([dev1, dev2, dev3])
+
+    assert grid._count_label.cget("text") == "Всего: 3"
+    assert len(grid.visible_devices) == 3
+
+    # Поиск по подстроке модели
+    grid.set_search("pixel")
+    assert [d.serial for d in grid.visible_devices] == ["USB_AAA", "USB_CCC"]
+    assert "2 из 3" in grid._count_label.cget("text")
+
+    # Поиск по серийному номеру
+    grid.set_search("bbb")
+    assert [d.serial for d in grid.visible_devices] == ["USB_BBB"]
+    assert "1 из 3" in grid._count_label.cget("text")
+
+    # Сброс поиска
+    grid.set_search("")
+    assert len(grid.visible_devices) == 3
+    assert grid._count_label.cget("text") == "Всего: 3"
+
+
+def test_filter_by_readiness(tk_root):
+    """Фильтрация: Все / Готовы / Не готовы."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+
+    dev_ready1 = make_device("USB_R1", is_ready=True, state="device")
+    dev_ready2 = make_device("USB_R2", is_ready=True, state="device")
+    dev_unready = make_device("USB_U1", is_ready=False, state="unauthorized")
+    grid.set_devices([dev_ready1, dev_ready2, dev_unready])
+
+    # Фильтр только готовых
+    grid.set_filter("ready")
+    assert [d.serial for d in grid.visible_devices] == ["USB_R1", "USB_R2"]
+    assert "2 из 3" in grid._count_label.cget("text")
+
+    # Фильтр неготовых
+    grid.set_filter("not_ready")
+    assert [d.serial for d in grid.visible_devices] == ["USB_U1"]
+    assert "1 из 3" in grid._count_label.cget("text")
+
+    # Возврат ко всем
+    grid.set_filter("all")
+    assert len(grid.visible_devices) == 3
+    assert grid._count_label.cget("text") == "Всего: 3"
+
+
+def test_select_visible_only_ready_and_preserves_hidden(tk_root):
+    """«Выбрать видимые» выбирает только видимые готовые телефоны и сохраняет скрытый выбор."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+
+    dev1 = make_device("USB_R1", is_ready=True, model="Pixel 7")
+    dev2 = make_device("USB_U1", is_ready=False, model="Pixel 8")
+    dev3 = make_device("USB_R2", is_ready=True, model="Galaxy S23")
+    grid.set_devices([dev1, dev2, dev3])
+
+    # Предварительно выбираем скрываемый телефон
+    grid._toggle_selection("USB_R2")
+    assert grid.selected_serials() == ["USB_R2"]
+
+    # Фильтруем по "Pixel" (видны только USB_R1 и USB_U1, USB_R2 скрыт)
+    grid.set_search("Pixel")
+    assert [d.serial for d in grid.visible_devices] == ["USB_R1", "USB_U1"]
+
+    # Нажимаем «Выбрать видимые»
+    grid._select_visible_btn.invoke()
+
+    # USB_R1 (видимый и готовый) выбран
+    # USB_U1 (видимый, но НЕ готовый) НЕ выбран
+    # USB_R2 (скрытый готовый) сохранил выбор
+    assert grid.selected_serials() == ["USB_R1", "USB_R2"]
+    assert grid._cards["USB_R1"].is_selected is True
+    assert grid._cards["USB_U1"].is_selected is False
+    assert grid._cards["USB_R2"].is_selected is True
+
+
+def test_open_selected_launches_only_visible_ready_selected(tk_root):
+    """Групповое «Открыть выбранные» запускает ТОЛЬКО видимые готовые выбранные телефоны."""
+    opened = []
+    grid = PreviewGrid(tk_root, open_devices=lambda s: opened.append(s))
+
+    dev_r1 = make_device("USB_R1", is_ready=True, model="Pixel 8")
+    dev_r2 = make_device("USB_R2", is_ready=True, model="Galaxy S23")
+    dev_u1 = make_device("USB_U1", is_ready=False, model="Pixel 7")
+    grid.set_devices([dev_r1, dev_r2, dev_u1])
+
+    # Выбираем все 3 устройства
+    grid._toggle_selection("USB_R1")
+    grid._toggle_selection("USB_R2")
+    grid._toggle_selection("USB_U1")
+    assert grid.selected_serials() == ["USB_R1", "USB_R2", "USB_U1"]
+
+    # Отфильтровываем по "Pixel" -> USB_R2 скрывается
+    grid.set_search("Pixel")
+    assert [d.serial for d in grid.visible_devices] == ["USB_R1", "USB_U1"]
+
+    # Запуск «Открыть выбранные»:
+    # USB_R1: видимый, готовый, выбран -> запускается
+    # USB_R2: скрытый (отфильтрован) -> НЕ должен быть запущен!
+    # USB_U1: видимый, но не готовый -> НЕ должен быть запущен!
+    grid._open_btn.invoke()
+    assert opened == [["USB_R1"]]
+
+
+def test_deselect_button_clears_selection(tk_root):
+    """Кнопка «Снять выбор» сбрасывает все выбранные устройства."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+
+    dev1 = make_device("USB_1")
+    dev2 = make_device("USB_2")
+    grid.set_devices([dev1, dev2])
+
+    grid._toggle_selection("USB_1")
+    grid._toggle_selection("USB_2")
+    assert grid.selected_serials() == ["USB_1", "USB_2"]
+
+    grid._deselect_btn.invoke()
+    assert grid.selected_serials() == []
+    assert grid._cards["USB_1"].is_selected is False
+    assert grid._cards["USB_2"].is_selected is False
+
+
+def test_selection_preserved_across_filter_toggles(tk_root):
+    """Выбор сохраняется при переключении фильтров."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+
+    dev1 = make_device("USB_1", is_ready=True)
+    dev2 = make_device("USB_2", is_ready=False)
+    grid.set_devices([dev1, dev2])
+
+    grid._toggle_selection("USB_1")
+    assert grid.selected_serials() == ["USB_1"]
+
+    # Переключаем фильтр на неготовые (USB_1 скрыт)
+    grid.set_filter("not_ready")
+    assert [d.serial for d in grid.visible_devices] == ["USB_2"]
+    assert grid.selected_serials() == ["USB_1"]
+
+    # Возвращаем фильтр на все устройства
+    grid.set_filter("all")
+    assert [d.serial for d in grid.visible_devices] == ["USB_1", "USB_2"]
+    assert grid.selected_serials() == ["USB_1"]
+    assert grid._cards["USB_1"].is_selected is True
+
+
+def test_hidden_card_preview_preserved_and_reused(tk_root):
+    """Живой кадр предпросмотра сохраняется и обновляется для скрытой карточки без перерисовки сетки."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+
+    dev1 = make_device("USB_1", is_ready=True)
+    dev2 = make_device("USB_2", is_ready=True)
+    grid.set_devices([dev1, dev2])
+
+    png1 = make_png(100, 200, 0, 255, 0)
+    grid.set_preview("USB_1", png1)
+    assert grid._cards["USB_1"]._photo_ref is not None
+
+    # Скрываем карточку USB_1 через поиск
+    grid.set_search("USB_2")
+    assert [d.serial for d in grid.visible_devices] == ["USB_2"]
+
+    # Обновляем превью для скрытой карточки
+    png2 = make_png(100, 200, 255, 0, 0)
+    grid.set_preview("USB_1", png2)
+    assert grid._previews.get("USB_1") is not None
+    assert grid._cards["USB_1"]._photo_ref is not None
+
+    # Показываем обратно карточку USB_1
+    grid.set_search("")
+    assert [d.serial for d in grid.visible_devices] == ["USB_1", "USB_2"]
+    assert grid._cards["USB_1"]._photo_ref is not None
+
+
+def test_aligned_projection_listbox_and_cards(tk_root):
+    """Список слева и сетка карточек имеют единую проекцию при навигации и кликах."""
+    opened = []
+    grid = PreviewGrid(tk_root, open_devices=lambda s: opened.append(s))
+
+    dev1 = make_device("USB_1", is_ready=True, model="A1")
+    dev2 = make_device("USB_2", is_ready=True, model="B2")
+    dev3 = make_device("USB_3", is_ready=True, model="A3")
+    grid.set_devices([dev1, dev2, dev3])
+
+    # Фильтруем по "A" (остаются USB_1 и USB_3)
+    grid.set_search("A")
+    assert len(grid.visible_devices) == 2
+    assert grid._listbox.size() == 2
+
+    # Клавиша Space на втором элементе видимой проекции (индекс 1 -> USB_3)
+    grid._listbox.selection_set(1)
+    grid._listbox.activate(1)
+    grid._on_listbox_space()
+
+    assert grid.selected_serials() == ["USB_3"]
+    assert grid._cards["USB_3"].is_selected is True
+
+    # Клавиша Return на втором элементе видимой проекции открывает USB_3
+    grid._on_listbox_return()
+    assert opened == [["USB_3"]]
+
+
+def test_empty_state_when_filter_matches_no_devices(tk_root):
+    """При отсутствии подходящих устройств отображается корректный статус."""
+    grid = PreviewGrid(tk_root, open_devices=lambda s: None)
+
+    dev1 = make_device("USB_1", is_ready=True)
+    grid.set_devices([dev1])
+
+    grid.set_search("non_existent_model_xyz")
+    assert len(grid.visible_devices) == 0
+    assert grid._empty_label.cget("text") == "Нет устройств, соответствующих фильтру"
+    assert "0 из 1" in grid._count_label.cget("text")
