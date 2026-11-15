@@ -63,6 +63,10 @@ def validate_scrcpy_dir(scrcpy_dir: Path) -> dict[str, Path | list[Path]]:
         )
 
     dlls = sorted(scrcpy_dir.glob("*.dll"))
+    if not dlls:
+        raise FileNotFoundError(
+            f"scrcpy directory '{scrcpy_dir}' does not contain required companion DLLs (*.dll)"
+        )
     licenses = [
         p for p in scrcpy_dir.iterdir()
         if p.is_file() and ("license" in p.name.lower() or "notice" in p.name.lower())
@@ -80,6 +84,8 @@ def validate_scrcpy_dir(scrcpy_dir: Path) -> dict[str, Path | list[Path]]:
 def stage_tools(scrcpy_dir: Path, work_dir: Path) -> Path:
     """Stage scrcpy, adb, companion DLLs, and sidecars under work_dir/tools."""
     tools_staging = work_dir / "tools"
+    if tools_staging.exists():
+        shutil.rmtree(tools_staging)
     tools_staging.mkdir(parents=True, exist_ok=True)
 
     for item in scrcpy_dir.iterdir():
@@ -87,8 +93,6 @@ def stage_tools(scrcpy_dir: Path, work_dir: Path) -> Path:
         if item.is_file():
             shutil.copy2(item, dest)
         elif item.is_dir():
-            if dest.exists():
-                shutil.rmtree(dest)
             shutil.copytree(item, dest)
 
     return tools_staging
@@ -123,29 +127,6 @@ def build_windows_app(
     app_name: str = "DroidHub",
 ) -> int:
     """Build Windows x64 native onedir/windowed application with PyInstaller."""
-    scrcpy_dir = scrcpy_dir.resolve()
-    dist_dir = dist_dir.resolve()
-    work_dir = work_dir.resolve()
-
-    logger.info("Validating scrcpy directory: %s", scrcpy_dir)
-    validate_scrcpy_dir(scrcpy_dir)
-
-    work_dir.mkdir(parents=True, exist_ok=True)
-    dist_dir.mkdir(parents=True, exist_ok=True)
-
-    repo_root = Path(__file__).resolve().parent.parent
-    entry_point = repo_root / "desktop" / "main.py"
-    runtime_hook = repo_root / "desktop" / "packaging" / "windows_runtime.py"
-
-    if not entry_point.is_file():
-        raise FileNotFoundError(f"Entry point not found: {entry_point}")
-    if not runtime_hook.is_file():
-        raise FileNotFoundError(f"Runtime hook not found: {runtime_hook}")
-
-    logger.info("Staging tools under %s", work_dir / "tools")
-    tools_staging = stage_tools(scrcpy_dir, work_dir)
-    binaries, datas = classify_tools(tools_staging)
-
     # Strict Windows x64 host check
     if not is_windows_x64() and not os.environ.get("DROIDHUB_FORCE_BUILD"):
         logger.error(
@@ -164,6 +145,29 @@ def build_windows_app(
         )
         return 1
 
+    scrcpy_dir = scrcpy_dir.resolve()
+    dist_dir = dist_dir.resolve()
+    work_dir = work_dir.resolve()
+
+    logger.info("Validating scrcpy directory: %s", scrcpy_dir)
+    validate_scrcpy_dir(scrcpy_dir)
+
+    repo_root = Path(__file__).resolve().parent.parent
+    entry_point = repo_root / "desktop" / "main.py"
+    runtime_hook = repo_root / "desktop" / "packaging" / "windows_runtime.py"
+
+    if not entry_point.is_file():
+        raise FileNotFoundError(f"Entry point not found: {entry_point}")
+    if not runtime_hook.is_file():
+        raise FileNotFoundError(f"Runtime hook not found: {runtime_hook}")
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    dist_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Staging tools under %s", work_dir / "tools")
+    tools_staging = stage_tools(scrcpy_dir, work_dir)
+    binaries, datas = classify_tools(tools_staging)
+
     build_dir = work_dir / "build"
     sep = ";" if platform.system() == "Windows" else os.pathsep
 
@@ -174,6 +178,8 @@ def build_windows_app(
         "--noconfirm",
         "--onedir",
         "--windowed",
+        "--contents-directory",
+        ".",
         "--name",
         app_name,
         "--distpath",
@@ -203,9 +209,11 @@ def build_windows_app(
     ]
 
     for b in binaries:
-        cmd.extend(["--add-binary", f"{b.resolve()}{sep}tools"])
+        dest = f"tools/{b.name}" if b.is_dir() else "tools"
+        cmd.extend(["--add-binary", f"{b.resolve()}{sep}{dest}"])
     for d in datas:
-        cmd.extend(["--add-data", f"{d.resolve()}{sep}tools"])
+        dest = f"tools/{d.name}" if d.is_dir() else "tools"
+        cmd.extend(["--add-data", f"{d.resolve()}{sep}{dest}"])
 
     cmd.append(str(entry_point))
 
@@ -215,20 +223,7 @@ def build_windows_app(
         logger.error("PyInstaller failed with return code %d", proc.returncode)
         return proc.returncode
 
-    # Ensure adjacent tools directory next to executable in dist folder
     app_dir = dist_dir / app_name
-    adjacent_tools = app_dir / "tools"
-    if not adjacent_tools.exists() and tools_staging.is_dir():
-        shutil.copytree(tools_staging, adjacent_tools)
-    elif adjacent_tools.is_dir() and tools_staging.is_dir():
-        for item in tools_staging.iterdir():
-            dest = adjacent_tools / item.name
-            if not dest.exists():
-                if item.is_file():
-                    shutil.copy2(item, dest)
-                elif item.is_dir():
-                    shutil.copytree(item, dest)
-
     logger.info("Windows native application successfully built at %s", app_dir)
     return 0
 

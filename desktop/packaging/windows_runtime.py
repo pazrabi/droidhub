@@ -22,6 +22,11 @@ def find_tools_dir(base_dir: Path | None = None) -> Path | None:
     if base_dir:
         candidates.append(base_dir / "tools")
 
+    exe = getattr(sys, "executable", None)
+    if exe:
+        exe_path = Path(exe)
+        candidates.append(exe_path.parent / "tools")
+
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
         m_path = Path(meipass)
@@ -30,13 +35,8 @@ def find_tools_dir(base_dir: Path | None = None) -> Path | None:
             m_path.parent / "tools",
         ])
 
-    exe = getattr(sys, "executable", None)
     if exe:
-        exe_path = Path(exe)
-        candidates.extend([
-            exe_path.parent / "tools",
-            exe_path.parent / "_internal" / "tools",
-        ])
+        candidates.append(exe_path.parent / "_internal" / "tools")
 
     # First pass: find candidate directory containing adb.exe or scrcpy.exe
     for cand in candidates:
