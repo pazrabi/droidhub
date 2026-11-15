@@ -184,7 +184,15 @@ class DesktopApp:
         self.link_panel = DeviceLinkPanel(self.notebook)
         self.notebook.add(self.link_panel, text="Привязки")
         self._update_link_panel()
-        self.preview_grid = PreviewGrid(self.notebook, open_devices=self._open_preview_devices)
+        try:
+            self.preview_grid = PreviewGrid(
+                self.notebook,
+                open_devices=self._open_preview_devices,
+                close_devices=self._close_preview_devices,
+            )
+        except (TypeError, tk.TclError):
+            self.preview_grid = PreviewGrid(self.notebook, open_devices=self._open_preview_devices)
+            self.preview_grid.close_devices = self._close_preview_devices
         self.notebook.add(self.preview_grid, text="Экраны USB")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_preview_tab_changed, add="+")
 
@@ -597,11 +605,78 @@ class DesktopApp:
     def _open_preview_devices(self, serials: list[str]) -> None:
         self._launch_scrcpy(serials)
 
+    def _close_preview_devices(self, serials: list[str]) -> None:
+        if getattr(self, "_is_closing", False):
+            return
+        if not serials:
+            return
+
+        requested = list(dict.fromkeys(s for s in serials if s and s.strip()))
+        if not requested:
+            return
+
+        requested_set = set(requested)
+        # 1. Удаляем ТОЛЬКО запрошенные серийные номера из ожидающих запуска до остановки активных
+        self._pending_scrcpy = [s for s in self._pending_scrcpy if s not in requested_set]
+
+        # 2. Игнорируем устаревшие серийные номера и останавливаем только активные
+        active_serials: set[str] = set()
+        if hasattr(self, "controller") and hasattr(self.controller, "scrcpy_manager"):
+            if hasattr(self.controller.scrcpy_manager, "get_active_serials"):
+                active_serials = set(self.controller.scrcpy_manager.get_active_serials())
+            elif hasattr(self.controller.scrcpy_manager, "is_running"):
+                active_serials = {s for s in requested if self.controller.scrcpy_manager.is_running(s)}
+        elif hasattr(self, "controller") and hasattr(self.controller, "stop_device_scrcpy"):
+            active_serials = requested_set
+
+        to_stop = [s for s in requested if s in active_serials]
+
+        stopped = 0
+        failures: list[str] = []
+        for s in to_stop:
+            try:
+                ok, msg = self.controller.stop_device_scrcpy(s)
+                if ok:
+                    stopped += 1
+                else:
+                    failures.append(msg)
+            except Exception as exc:
+                failures.append(str(exc))
+
+        # 3. Обратная связь по состоянию без потери сообщений об ошибках
+        if hasattr(self, "status_msg_label") and hasattr(self.status_msg_label, "config"):
+            if failures:
+                err_text = "; ".join(failures)
+                if stopped > 0:
+                    self.status_msg_label.config(
+                        text=f"Остановлено окон scrcpy: {stopped}. Ошибка: {err_text}",
+                        style="Warning.TLabel",
+                    )
+                else:
+                    self.status_msg_label.config(
+                        text=f"Ошибка: {err_text}",
+                        style="Warning.TLabel",
+                    )
+            else:
+                self.status_msg_label.config(
+                    text=f"Остановлено окон scrcpy: {stopped}",
+                    style="Status.TLabel",
+                )
+
+        # 4. Возобновление предпросмотра через существующую синхронизацию
+        self._sync_preview_scrcpy_windows()
+        if hasattr(self, "trigger_refresh"):
+            self.trigger_refresh()
+
     def _sync_preview_scrcpy_windows(self) -> None:
+        serials = set(self._pending_scrcpy)
+        if hasattr(self, "controller") and hasattr(self.controller, "scrcpy_manager"):
+            if hasattr(self.controller.scrcpy_manager, "get_active_serials"):
+                serials.update(self.controller.scrcpy_manager.get_active_serials())
         if self._preview_worker is not None:
-            serials = set(self._pending_scrcpy)
-            serials.update(self.controller.scrcpy_manager.get_active_serials())
             self._preview_worker.set_scrcpy_windows(serials)
+        if hasattr(self, "preview_grid") and hasattr(self.preview_grid, "set_closeable_serials"):
+            self.preview_grid.set_closeable_serials(serials)
 
     def _poll_preview(self) -> None:
         if self._pending_scrcpy:
@@ -609,8 +684,8 @@ class DesktopApp:
             if self._preview_worker is None or not self._preview_worker.has_video_for(serials):
                 pending, self._pending_scrcpy = self._pending_scrcpy, []
                 self._start_scrcpy_windows(pending)
+        self._sync_preview_scrcpy_windows()
         if self._preview_worker is not None:
-            self._sync_preview_scrcpy_windows()
             for serial, png in self._preview_worker.drain().items():
                 self.preview_grid.set_preview(serial, png)
 
@@ -772,6 +847,7 @@ class DesktopApp:
         self._pending_scrcpy.clear()
         stopped = self.controller.stop_all_scrcpy()
         self.status_msg_label.config(text=f"Остановлено окон scrcpy: {stopped}")
+        self._sync_preview_scrcpy_windows()
         self.trigger_refresh()
 
     def _on_dialog_destroy(self, event: tk.Event, dialog: tk.Toplevel) -> None:
