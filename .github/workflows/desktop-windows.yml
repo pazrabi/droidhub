@@ -1,0 +1,56 @@
+name: DroidHub Desktop Windows
+
+on:
+  push:
+    branches: [codex/desktop-windows]
+    paths:
+      - 'desktop/**'
+      - 'tests/test_desktop_adb.py'
+      - 'tests/test_desktop_windows_adb.py'
+      - '.github/workflows/desktop-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install build dependencies
+        run: python -m pip install Pillow "av>=16,<20" "pyinstaller>=6.16,<7" certifi pytest
+      - name: Test USB transport classification
+        run: python -m pytest -q tests/test_desktop_adb.py tests/test_desktop_windows_adb.py
+      - name: Build portable application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'scrcpy-win64-v5.0.1.zip'
+          $source = Join-Path $env:RUNNER_TEMP 'scrcpy-source'
+          $url = 'https://github.com/Genymobile/scrcpy/releases/download/v5.0.1/scrcpy-win64-v5.0.1.zip'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $sha = 'b12a2c4ee8be317422451fc7dcf8ee20a71b5ea7ef9ad73ddd825a25316227a5'
+          if ((Get-FileHash -Algorithm SHA256 $archive).Hash -ne $sha) {
+            throw 'Official scrcpy archive SHA-256 did not match'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $source
+          python -m desktop.package_windows --scrcpy-dir (Join-Path $source 'scrcpy-win64-v5.0.1') --dist-dir dist --work-dir build
+          if ($LASTEXITCODE -ne 0) { throw "Build exited with $LASTEXITCODE" }
+          $portable = Join-Path $env:RUNNER_TEMP 'DroidHub portable'
+          Move-Item -LiteralPath dist/DroidHub -Destination $portable
+          ./desktop/packaging/windows_smoke.ps1 -AppDir $portable
+          Compress-Archive -Path (Join-Path $portable '*') -DestinationPath DroidHub-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DroidHub-Windows-x64
+          path: DroidHub-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
