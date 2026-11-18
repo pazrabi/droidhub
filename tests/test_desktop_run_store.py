@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+import threading
 
 import pytest
 
@@ -249,6 +250,12 @@ class TestRecordTarget:
         with pytest.raises(ValueError, match="status must be one of"):
             store.record_target(rid, "d1", {"status": "running"})
 
+    def test_non_string_status_raises(self, store):
+        """status must be a string, not an int or None."""
+        rid = store.create_run(scenario="s", request_id="r6b", targets=["d1"], params={})
+        with pytest.raises(ValueError, match="status must be one of"):
+            store.record_target(rid, "d1", {"status": 1})
+
     def test_non_target_device_raises(self, store):
         rid = store.create_run(scenario="s", request_id="r7", targets=["d1"], params={})
         with pytest.raises(ValueError, match="not a target"):
@@ -267,6 +274,20 @@ class TestRecordTarget:
         store.record_target(rid, "d1", self._make_result("succeeded"))
         with pytest.raises(ValueError, match="already has a terminal result"):
             store.record_target(rid, "d1", self._make_result("failed"))
+
+    def test_mismatched_device_id_in_result_raises(self, store):
+        """result.device_id that differs from the target device must be rejected."""
+        rid = store.create_run(scenario="s", request_id="r-devid", targets=["d1"], params={})
+        result = self._make_result("succeeded", device_id="d-other")
+        with pytest.raises(ValueError, match="does not match target device_id"):
+            store.record_target(rid, "d1", result)
+
+    def test_matching_device_id_in_result_accepted(self, store):
+        """result.device_id equal to target device is fine."""
+        rid = store.create_run(scenario="s", request_id="r-devid2", targets=["d1"], params={})
+        result = self._make_result("succeeded", device_id="d1")
+        store.record_target(rid, "d1", result)  # must not raise
+        assert store.get_run(rid)["status"] == "succeeded"
 
 
 # ---------------------------------------------------------------------------
@@ -289,15 +310,25 @@ class TestMixedResults:
         store.record_target(rid, "d3", self._result("cancelled"))
         assert store.get_run(rid)["status"] == "partial"
 
-    def test_partial_when_some_succeed_some_queued(self, store):
+    def test_running_when_some_succeed_some_queued(self, store):
+        """When at least one is terminal and at least one is still queued → running."""
         rid = store.create_run(
             scenario="s", request_id="mix2",
             targets=["d1", "d2"], params={}
         )
         store.record_target(rid, "d1", self._result("succeeded"))
         run = store.get_run(rid)
-        # One done, one queued → partial
-        assert run["status"] == "partial"
+        # One done, one queued → running (not partial)
+        assert run["status"] == "running"
+
+    def test_running_when_some_fail_some_queued(self, store):
+        """Failed + queued is still running (in progress)."""
+        rid = store.create_run(
+            scenario="s", request_id="mix2b",
+            targets=["d1", "d2"], params={}
+        )
+        store.record_target(rid, "d1", self._result("failed"))
+        assert store.get_run(rid)["status"] == "running"
 
     def test_failed_when_all_fail(self, store):
         rid = store.create_run(
@@ -316,6 +347,16 @@ class TestMixedResults:
         store.record_target(rid, "d1", self._result("succeeded"))
         store.record_target(rid, "d2", self._result("succeeded"))
         assert store.get_run(rid)["status"] == "succeeded"
+
+    def test_failed_when_all_terminal_no_success(self, store):
+        """All terminal but none succeeded → failed."""
+        rid = store.create_run(
+            scenario="s", request_id="mix5",
+            targets=["d1", "d2"], params={}
+        )
+        store.record_target(rid, "d1", self._result("failed"))
+        store.record_target(rid, "d2", self._result("cancelled"))
+        assert store.get_run(rid)["status"] == "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +385,8 @@ class TestPersistence:
             assert run is not None
             assert run["scenario"] == "persist-test"
             assert run["params"] == {"min_battery": 20}
-            assert run["status"] == "partial"
+            # one succeeded, two still queued → running
+            assert run["status"] == "running"
             order = [t["device_id"] for t in run["targets"]]
             assert order == ["alpha", "beta", "gamma"]
             assert run["targets"][0]["status"] == "succeeded"
@@ -401,3 +443,147 @@ class TestPersistence:
                     targets=["d1"],
                     params={},
                 )
+
+
+# ---------------------------------------------------------------------------
+# Concurrency regressions
+# ---------------------------------------------------------------------------
+
+class TestConcurrency:
+    """Regression tests for concurrent access from multiple threads / instances."""
+
+    def _result(self, status="succeeded"):
+        return {"status": status, "step": "done", "code": 0,
+                "last_ok_step": "boot", "safe_retry": False,
+                "route": "main", "steps": 2, "battery": 75}
+
+    def test_two_threads_same_request_key_converge(self, db_path):
+        """Two threads racing create_run with identical args must both get the same run_id."""
+        store = RunStore(db_path)
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                rid = store.create_run(
+                    scenario="race",
+                    request_id="race-req-1",
+                    targets=["d1", "d2"],
+                    params={"parallel": 2},
+                )
+                results.append(rid)
+            except Exception as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        store.close()
+
+        assert not errors, f"Unexpected errors: {errors}"
+        assert len(results) == 2
+        assert results[0] == results[1], (
+            f"Two threads got different run_ids: {results[0]} vs {results[1]}"
+        )
+
+    def test_two_distinct_stores_same_request_key_converge(self, db_path):
+        """Two RunStore instances opening the same DB and racing create_run converge."""
+        run_ids = []
+        errors = []
+
+        def worker():
+            with RunStore(db_path) as s:
+                try:
+                    rid = s.create_run(
+                        scenario="race2",
+                        request_id="race-req-2",
+                        targets=["d1"],
+                        params={},
+                    )
+                    run_ids.append(rid)
+                except Exception as exc:
+                    errors.append(exc)
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert not errors, f"Unexpected errors: {errors}"
+        assert len(run_ids) == 2
+        assert run_ids[0] == run_ids[1], (
+            f"Distinct stores got different run_ids: {run_ids[0]} vs {run_ids[1]}"
+        )
+
+    def test_two_threads_identical_terminal_results_noop(self, db_path):
+        """Two threads recording identical terminal results for the same target → no error."""
+        store = RunStore(db_path)
+        rid = store.create_run(
+            scenario="s", request_id="race-rec-1", targets=["d1"], params={}
+        )
+        result = self._result("succeeded")
+        errors = []
+
+        def worker():
+            try:
+                store.record_target(rid, "d1", result)
+            except Exception as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        store.close()
+
+        # Identical result → at most one succeeds; the second is a no-op.
+        # Neither should raise.
+        assert not errors, f"Unexpected errors: {errors}"
+
+    def test_two_threads_different_terminal_results_one_wins(self, db_path):
+        """Two threads recording *different* terminal results: exactly one succeeds,
+        the other raises ValueError (conflicting update)."""
+        store = RunStore(db_path)
+        rid = store.create_run(
+            scenario="s", request_id="race-rec-2", targets=["d1"], params={}
+        )
+        successes = []
+        conflicts = []
+
+        def worker(status):
+            try:
+                store.record_target(rid, "d1", self._result(status))
+                successes.append(status)
+            except ValueError as exc:
+                conflicts.append(str(exc))
+
+        t1 = threading.Thread(target=worker, args=("succeeded",))
+        t2 = threading.Thread(target=worker, args=("failed",))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        store.close()
+
+        # Exactly one thread must have won
+        assert len(successes) == 1, f"Expected 1 success, got {successes}"
+        assert len(conflicts) == 1, f"Expected 1 conflict error, got {conflicts}"
+        assert "already has a terminal result" in conflicts[0]
+
+    def test_schema_init_two_instances_no_duplicate_metadata(self, db_path):
+        """Two RunStore instances opening the same DB sequentially must not duplicate
+        schema_meta rows or raise on second open."""
+        with RunStore(db_path):
+            pass  # first init
+        with RunStore(db_path) as s2:
+            cur = s2._conn.execute(
+                "SELECT COUNT(*) AS cnt FROM schema_meta WHERE key='schema_version'"
+            )
+            assert cur.fetchone()["cnt"] == 1
