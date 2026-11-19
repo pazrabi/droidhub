@@ -75,26 +75,18 @@ def _verify_executable_file(file_path: Path, bundle_root: Path) -> tuple[bool, P
             return False, None
 
         bundle_real = bundle_root.resolve()
+        resolved = file_path.resolve()
+        try:
+            resolved.relative_to(bundle_real)
+        except ValueError:
+            # Resolves outside bundle
+            return False, None
 
-        if file_path.is_symlink():
-            resolved = file_path.resolve()
-            try:
-                resolved.relative_to(bundle_real)
-            except ValueError:
-                # Symlink escapes bundle
-                return False, None
-
-            if not resolved.is_file():
-                return False, None
-            if not os.access(resolved, os.X_OK):
-                return False, None
-            return True, resolved
-        else:
-            if not file_path.is_file():
-                return False, None
-            if not os.access(file_path, os.X_OK):
-                return False, None
-            return True, file_path.resolve()
+        if not resolved.is_file():
+            return False, None
+        if not os.access(resolved, os.X_OK):
+            return False, None
+        return True, resolved
     except (OSError, ValueError):
         return False, None
 
@@ -186,7 +178,7 @@ def check_desktop_pid(
         if comm_real == expected_real:
             return "ok"
     except (OSError, ValueError):
-        pass
+        return "incomplete"
 
     return "fail"
 
@@ -291,13 +283,19 @@ def parse_adb_devices_output(stdout: str, target_serials: Sequence[str]) -> AdbC
 
     usb_detected = sum(1 for d in valid_devices.values() if d["state"] == "device")
 
-    targets_matched = 0
-    for target in target_serials:
-        if target in valid_devices and valid_devices[target]["state"] == "device":
-            targets_matched += 1
+    matched_targets = {
+        target
+        for target in target_serials
+        if target in valid_devices and valid_devices[target]["state"] == "device"
+    }
+    targets_matched = len(matched_targets)
 
-    # Both targets must be matched
-    status = "ok" if (targets_matched == len(target_serials) and len(target_serials) == 2) else "fail"
+    # Both targets must be unique and matched
+    status = (
+        "ok"
+        if (len(set(target_serials)) == 2 and targets_matched == 2)
+        else "fail"
+    )
 
     return AdbCheckResult(
         status=status,
@@ -421,11 +419,11 @@ def run_preflight(
         "devices": adb_res.status,
     }
 
-    # Incomplete if any check could not be completed cleanly; fail if any check definitively failed; else ok
-    if any(s == "incomplete" for s in checks.values()):
-        overall_status = "incomplete"
-    elif any(s == "fail" for s in checks.values()):
+    # Fail if any check definitively failed; incomplete if any check could not be completed cleanly; else ok
+    if any(s == "fail" for s in checks.values()):
         overall_status = "fail"
+    elif any(s == "incomplete" for s in checks.values()):
+        overall_status = "incomplete"
     else:
         overall_status = "ok"
 

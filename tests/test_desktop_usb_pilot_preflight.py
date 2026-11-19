@@ -170,6 +170,29 @@ class TestAppBundleCheck(unittest.TestCase):
         status, dh, adb = check_app_bundle(app_dir)
         self.assertEqual(status, "fail")
 
+    def test_intermediate_dir_symlink_escaping_bundle(self) -> None:
+        app_dir = Path(self.test_dir) / "EscapeDirApp.app"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        contents = app_dir / "Contents"
+        contents.mkdir(parents=True, exist_ok=True)
+
+        outside_macos = Path(self.test_dir) / "outside_macos"
+        outside_macos.mkdir(parents=True, exist_ok=True)
+        outside_dh = outside_macos / "DroidHub"
+        outside_dh.write_text("#!/bin/sh\nexit 0\n")
+        outside_dh.chmod(0o755)
+
+        # Contents/MacOS is a symlink pointing outside the bundle
+        (contents / "MacOS").symlink_to(outside_macos)
+
+        adb_bin = contents / "Resources" / "tools" / "adb"
+        adb_bin.parent.mkdir(parents=True, exist_ok=True)
+        adb_bin.write_text("#!/bin/sh\nexit 0\n")
+        adb_bin.chmod(0o755)
+
+        status, dh, adb = check_app_bundle(app_dir)
+        self.assertEqual(status, "fail")
+
 
 class TestPathsWithSpaces(unittest.TestCase):
     def setUp(self) -> None:
@@ -279,6 +302,30 @@ class TestDesktopPidCheck(unittest.TestCase):
         pid = 4321
         with patch("subprocess.run", side_effect=OSError("Command not found")):
             self.assertEqual(check_desktop_pid(pid, self.expected_bin), "incomplete")
+
+    def test_comm_resolve_oserror(self) -> None:
+        pid = 4321
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=f"{pid} /some/comm/path\n",
+                stderr="",
+            )
+            with patch.object(Path, "resolve", side_effect=PermissionError("Permission denied")):
+                self.assertEqual(check_desktop_pid(pid, self.expected_bin), "incomplete")
+
+    def test_comm_resolve_valueerror(self) -> None:
+        pid = 4321
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=f"{pid} /some/comm/path\n",
+                stderr="",
+            )
+            with patch.object(Path, "resolve", side_effect=ValueError("Invalid path")):
+                self.assertEqual(check_desktop_pid(pid, self.expected_bin), "incomplete")
 
 
 class TestWorkspaceCheck(unittest.TestCase):
@@ -431,6 +478,26 @@ class TestAdbDevicesCheck(unittest.TestCase):
         self.assertEqual(res.status, "fail")
         self.assertEqual(res.targets_matched, 1)
         self.assertGreater(res.duplicate_filtered, 0)
+
+    def test_duplicate_target_serials_in_targets_input(self) -> None:
+        # Case 1: single device attached, duplicate target requested -> must fail, matched=1
+        stdout_one = (
+            "List of devices attached\n"
+            "SERIAL_A               device usb:1-1 transport_id:1\n"
+        )
+        res_one = parse_adb_devices_output(stdout_one, ["SERIAL_A", "SERIAL_A"])
+        self.assertEqual(res_one.status, "fail")
+        self.assertEqual(res_one.targets_matched, 1)
+
+        # Case 2: two distinct devices attached, duplicate target requested -> must fail
+        stdout_two = (
+            "List of devices attached\n"
+            "SERIAL_A               device usb:1-1 transport_id:1\n"
+            "SERIAL_B               device usb:1-2 transport_id:2\n"
+        )
+        res_two = parse_adb_devices_output(stdout_two, ["SERIAL_A", "SERIAL_A"])
+        self.assertEqual(res_two.status, "fail")
+        self.assertEqual(res_two.targets_matched, 1)
 
     def test_daemon_restart_detected(self) -> None:
         adb_path = Path("/mock/adb")
@@ -689,6 +756,90 @@ class TestCliAndHelp(unittest.TestCase):
             data = json.loads(mock_stdout.getvalue())
             self.assertEqual(data["status"], "incomplete")
             self.assertEqual(data["checks"]["devices"], "incomplete")
+
+
+class TestRunPreflightAggregation(unittest.TestCase):
+    def test_fail_takes_precedence_over_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = Path(td) / "DroidHub.app"
+            dh = app_dir / "Contents" / "MacOS" / "DroidHub"
+            adb = app_dir / "Contents" / "Resources" / "tools" / "adb"
+            dh.parent.mkdir(parents=True, exist_ok=True)
+            adb.parent.mkdir(parents=True, exist_ok=True)
+            dh.write_text("#!/bin/sh\nexit 0\n")
+            dh.chmod(0o755)
+            adb.write_text("#!/bin/sh\nexit 0\n")
+            adb.chmod(0o755)
+
+            ws_dir = Path(td) / "workspace"
+            ws_dir.mkdir()
+
+            # ps returns returncode 1 -> desktop_pid: incomplete
+            # platform_system="Linux" -> platform: fail
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value = subprocess.CompletedProcess(
+                    args=[],
+                    returncode=1,
+                    stdout="",
+                    stderr="process not found",
+                )
+                report = run_preflight(
+                    app=app_dir,
+                    workspace=ws_dir,
+                    desktop_pid=123,
+                    devices=["DEV1", "DEV2"],
+                    platform_system="Linux",
+                    platform_machine="x86_64",
+                )
+                self.assertEqual(report["checks"]["platform"], "fail")
+                self.assertEqual(report["checks"]["app"], "ok")
+                self.assertEqual(report["checks"]["desktop_pid"], "incomplete")
+                self.assertEqual(report["status"], "fail")
+                self.assertEqual(report["overall_status"], "fail")
+
+    def test_incomplete_overall_when_no_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            app_dir = Path(td) / "DroidHub.app"
+            dh = app_dir / "Contents" / "MacOS" / "DroidHub"
+            adb = app_dir / "Contents" / "Resources" / "tools" / "adb"
+            dh.parent.mkdir(parents=True, exist_ok=True)
+            adb.parent.mkdir(parents=True, exist_ok=True)
+            dh.write_text("#!/bin/sh\nexit 0\n")
+            dh.chmod(0o755)
+            adb.write_text("#!/bin/sh\nexit 0\n")
+            adb.chmod(0o755)
+
+            ws_dir = Path(td) / "workspace"
+            ws_dir.mkdir()
+
+            pid = 999
+            def mock_run(cmd, *args, **kwargs):
+                if cmd[0] == "ps":
+                    return subprocess.CompletedProcess(
+                        args=cmd,
+                        returncode=0,
+                        stdout=f"{pid} {dh.resolve()}\n",
+                        stderr="",
+                    )
+                # adb timeout -> incomplete
+                raise subprocess.TimeoutExpired(cmd="adb", timeout=5.0)
+
+            with patch("subprocess.run", side_effect=mock_run):
+                report = run_preflight(
+                    app=app_dir,
+                    workspace=ws_dir,
+                    desktop_pid=pid,
+                    devices=["DEV1", "DEV2"],
+                    platform_system="Darwin",
+                    platform_machine="arm64",
+                )
+                self.assertEqual(report["checks"]["platform"], "ok")
+                self.assertEqual(report["checks"]["app"], "ok")
+                self.assertEqual(report["checks"]["desktop_pid"], "ok")
+                self.assertEqual(report["checks"]["workspace"], "ok")
+                self.assertEqual(report["checks"]["devices"], "incomplete")
+                self.assertEqual(report["status"], "incomplete")
+                self.assertEqual(report["overall_status"], "incomplete")
 
 
 if __name__ == "__main__":
