@@ -186,6 +186,10 @@ class TestMacOSHubTransportConstruction:
         with pytest.raises(ValueError):
             MacOSHubTransport(LIBRARY_PATH, "not-a-sha1")
 
+    def test_construction_rejects_relative_library_path(self) -> None:
+        with pytest.raises(ValueError):
+            MacOSHubTransport(pathlib.Path("relative/libdroidhub-helper.dylib"), VALID_SHA1)
+
     def test_construction_does_not_load_ctypes_on_non_macos(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -481,3 +485,43 @@ class TestErrorKindValues:
 
     def test_invalid_value(self) -> None:
         assert ErrorKind.invalid.value == "invalid"
+
+
+# ===========================================================================
+# _get_lib error handling – missing dylib and missing symbol
+# ===========================================================================
+
+
+class TestGetLibErrorHandling:
+    def test_missing_dylib_raises_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OSError from ctypes.CDLL must become ErrorKind.unavailable with no chained cause."""
+        _force_darwin(monkeypatch)
+
+        def _raise_oserror(path: str) -> None:
+            raise OSError("image not found")
+
+        monkeypatch.setattr(ctypes, "CDLL", _raise_oserror)
+        t = _make_transport()
+        with pytest.raises(MacOSHubTransportError) as exc_info:
+            t.list_devices_payload()
+        err = exc_info.value
+        assert err.kind == ErrorKind.unavailable
+        assert err.__cause__ is None
+
+    def test_missing_symbol_raises_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AttributeError for a missing symbol must become ErrorKind.unavailable with no chained cause."""
+        _force_darwin(monkeypatch)
+
+        class _CDLLNoSymbol:
+            """CDLL stub whose attribute access raises AttributeError."""
+            @property
+            def dh_hub_list_devices(self) -> None:  # type: ignore[override]
+                raise AttributeError("dh_hub_list_devices not found")
+
+        monkeypatch.setattr(ctypes, "CDLL", lambda path: _CDLLNoSymbol())
+        t = _make_transport()
+        with pytest.raises(MacOSHubTransportError) as exc_info:
+            t.list_devices_payload()
+        err = exc_info.value
+        assert err.kind == ErrorKind.unavailable
+        assert err.__cause__ is None

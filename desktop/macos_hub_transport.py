@@ -17,10 +17,6 @@ import ctypes
 import pathlib
 import sys
 from enum import Enum
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass  # kept for future type-only imports
 
 __all__ = ["MacOSHubTransport", "MacOSHubTransportError"]
 
@@ -187,7 +183,7 @@ class _HubLibrary:
             if srv == _SRV_TRUST:
                 raise MacOSHubTransportError(
                     ErrorKind.trust,
-                    "Hub helper service rejected the code-signing requirement.",
+                    "Hub helper service reported a TLS certificate trust error.",
                 )
             if srv == _SRV_INVALID:
                 raise MacOSHubTransportError(
@@ -241,6 +237,8 @@ class MacOSHubTransport:
     """
 
     def __init__(self, library_path: pathlib.Path, signing_cert_sha1: str) -> None:
+        if not pathlib.Path(library_path).is_absolute():
+            raise ValueError("library_path must be an absolute path")
         self._library_path: pathlib.Path = library_path
         self._sha1: str = _validate_sha1_hex(signing_cert_sha1)
         self._requirement: str = _make_requirement(self._sha1)
@@ -260,7 +258,18 @@ class MacOSHubTransport:
                 "MacOSHubTransport is only supported on macOS.",
             )
         if self._lib is None:
-            self._lib = _HubLibrary(self._library_path)
+            try:
+                self._lib = _HubLibrary(self._library_path)
+            except OSError:
+                raise MacOSHubTransportError(
+                    ErrorKind.unavailable,
+                    "Hub helper library could not be loaded.",
+                ) from None
+            except AttributeError:
+                raise MacOSHubTransportError(
+                    ErrorKind.unavailable,
+                    "Hub helper library is missing a required symbol.",
+                ) from None
         return self._lib
 
     # ------------------------------------------------------------------
