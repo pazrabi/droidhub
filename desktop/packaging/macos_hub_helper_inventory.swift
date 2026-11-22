@@ -2,19 +2,29 @@
 // Swift 5 / macOS 12+ — standalone helper-process file, no main, no installer.
 //
 // Exports: dh_hub_read_inventory (C ABI, @_cdecl)
-// Declares: dh_hub_read_keychain_token (@_silgen_name, private to this process)
+// Declares: dh_hub_read_keychain_token — external C symbol supplied by the
+//           C object file; declared here with @_silgen_name (no body) so the
+//           Swift compiler uses the C ABI symbol at link time.
+//
+//   Bridging-header alternative: if the build system provides a bridging
+//   header (e.g. hub_helper_bridge.h), add:
+//       int32_t dh_hub_read_keychain_token(void *out, size_t cap, size_t *written);
+//   and remove the @_silgen_name declaration below; the compiler will resolve
+//   the symbol through the header.  Current choice: @_silgen_name, no body.
 //
 // Design constraints honoured:
-//   • No token logs, no ambient config, no UI.
+//   • No Security/Keychain framework — all keychain access is in the C object.
+//   • No ambient mutable globals; injectable seams are function parameters.
 //   • Borrowed caller buffers: never captured from async closures.
-//   • XPC calls only on the dedicated worker queue.
+//   • Native worker thread (XPC provider is already off main); no extra queue.
+//   • NSLock-protected completion result box with exactly-once result.
 //   • DispatchSemaphore timeout 8 s — above the 6 s network timeout,
 //     below the XPC connection timeout of 10 s.
 //   • No partial output: written is set only on full success.
-//   • Strict UTF-8 decoding on both keychain token and inventory payload.
-//   • Maximum keychain token output: 4096 bytes.
+//   • Strict UTF-8 decoding on inventory payload.
+//   • Token validated: length 1…4096, printable ASCII (0x21–0x7E header-safe).
 //   • Maximum inventory payload: 2 MiB (from HubInventoryFetcher.maxBodyBytes).
-//   • Injectable seams (_readKeychainToken / _performFetch) for mock testing.
+//   • Injectable seams (_keychainFn / _fetchFn) are function parameters.
 //   • Does not modify HubInventoryFetcher or any other supplied file.
 
 import Foundation
@@ -28,22 +38,11 @@ import Foundation
 // 3  TLS / certificate failure
 // 4  invalid / unexpected response
 
-private let kDHSuccess:   Int32 = 0
-private let kDHAuth:      Int32 = 1
-private let kDHTempFail:  Int32 = 2
-private let kDHTLS:       Int32 = 3
-private let kDHInvalid:   Int32 = 4
-
-// ---------------------------------------------------------------------------
-// MARK: - Worker queue
-// ---------------------------------------------------------------------------
-// All outbound XPC calls are dispatched on this serial queue so they never
-// execute on arbitrary threads (required by the XPC provider ABI contract).
-
-private let _workerQueue = DispatchQueue(
-    label: "com.molokohub.hub-helper-inventory.worker",
-    qos: .userInitiated
-)
+private let kDHSuccess:  Int32 = 0
+private let kDHAuth:     Int32 = 1
+private let kDHTempFail: Int32 = 2
+private let kDHTLS:      Int32 = 3
+private let kDHInvalid:  Int32 = 4
 
 // ---------------------------------------------------------------------------
 // MARK: - Semaphore timeout
@@ -51,183 +50,185 @@ private let _workerQueue = DispatchQueue(
 // 8 s: comfortably above the 6 s network timeout in HubInventoryFetcher,
 // and safely below the XPC connection-idle timeout of 10 s.
 
-private let _semaphoreTimeoutNs: Int64 = 8_000_000_000  // 8 s in nanoseconds
+private let kSemaphoreTimeoutNs: Int64 = 8_000_000_000
 
 // ---------------------------------------------------------------------------
-// MARK: - Maximum keychain token size
+// MARK: - Token limits
 // ---------------------------------------------------------------------------
 
-private let kMaxKeychainTokenBytes = 4096
+private let kMaxTokenBytes: UInt = 4096
+private let kMaxInventoryBytes: Int = HubInventoryFetcher.maxBodyBytes  // 2 MiB
 
 // ---------------------------------------------------------------------------
-// MARK: - Keychain token loader (private to this process)
+// MARK: - External C symbol: keychain token reader
 // ---------------------------------------------------------------------------
-// @_silgen_name causes the Swift compiler to emit the symbol with the given
-// C name without mangling.  The symbol has internal linkage (private) and is
-// not visible outside this translation unit.
+// @_silgen_name with no body → external declaration only.
+// The C object file (compiled separately) provides the symbol
+// dh_hub_read_keychain_token with the matching C signature:
+//   int32_t dh_hub_read_keychain_token(void *out, size_t capacity, size_t *written);
 //
-// Signature: int32_t dh_hub_read_keychain_token(void *out, size_t capacity, size_t *written)
+// UInt maps to size_t at the ABI level on all Apple 64-bit targets (arm64,
+// x86_64), satisfying the "require size_t Swift UInt at ABI" constraint.
 //
-// Returns:
-//   0  — token written to *out, byte count in *written
-//   1  — keychain item absent or value is not valid UTF-8 / is empty
-//   4  — output buffer too small to hold the token
+// Pointer parameters are optional (nullable) so callers that pass NULL are
+// caught by nil checks before any dereference.
 
 @_silgen_name("dh_hub_read_keychain_token")
-private func _keychainTokenEntry(
-    _ out: UnsafeMutableRawPointer,
-    _ capacity: Int,          // Swift Int == size_t on arm64
-    _ written: UnsafeMutablePointer<Int>
-) -> Int32 {
-    // Forward to the injectable seam so tests can substitute a mock.
-    return _readKeychainToken(out: out, capacity: capacity, written: written)
-}
+private func dh_hub_read_keychain_token(
+    _ out: UnsafeMutableRawPointer?,  // nullable — nil check before use
+    _ capacity: UInt,                  // size_t at ABI: UInt
+    _ written: UnsafeMutablePointer<UInt>?  // nullable — nil check before use
+) -> Int32
 
 // ---------------------------------------------------------------------------
-// MARK: - Injectable seam: keychain read
+// MARK: - Default injectable keychain closure
 // ---------------------------------------------------------------------------
-// Tests replace this closure with a mock that writes a synthetic token into
-// the caller-supplied buffer without touching the real Keychain.
-// Never capture the caller's raw output pointers in a stored closure.
+// Wraps the external C symbol so it can be passed as a closure value.
+// This is the default injected into _readInventorySync.
 
-internal var _readKeychainToken: (
-    _ out: UnsafeMutableRawPointer,
-    _ capacity: Int,
-    _ written: UnsafeMutablePointer<Int>
-) -> Int32 = _keychainTokenImpl
-
-private func _keychainTokenImpl(
+private func defaultKeychainFn(
     out: UnsafeMutableRawPointer,
-    capacity: Int,
-    written: UnsafeMutablePointer<Int>
+    capacity: UInt,
+    written: UnsafeMutablePointer<UInt>
 ) -> Int32 {
-    // Service name and account key that the helper's entitlement grants access to.
-    let service = "com.molokohub.hub-helper"
-    let account = "api-token"
-
-    let query: [CFString: Any] = [
-        kSecClass:            kSecClassGenericPassword,
-        kSecAttrService:      service as CFString,
-        kSecAttrAccount:      account as CFString,
-        kSecReturnData:       kCFBooleanTrue!,
-        kSecMatchLimit:       kSecMatchLimitOne,
-    ]
-
-    var result: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-    guard status == errSecSuccess, let data = result as? Data, !data.isEmpty else {
-        // Item absent or inaccessible → auth error.
-        return kDHAuth
-    }
-
-    // Enforce 4096-byte cap before anything else.
-    guard data.count <= kMaxKeychainTokenBytes else {
-        return kDHInvalid
-    }
-
-    // Strict UTF-8 validation — the token must round-trip through String.
-    guard String(data: data, encoding: .utf8) != nil else {
-        return kDHAuth
-    }
-
-    // Buffer check.
-    guard data.count <= capacity else {
-        return kDHInvalid
-    }
-
-    // Copy bytes into caller's buffer (borrowed, not captured).
-    data.withUnsafeBytes { src in
-        out.copyMemory(from: src.baseAddress!, byteCount: data.count)
-    }
-    written.pointee = data.count
-    return kDHSuccess
+    dh_hub_read_keychain_token(out, capacity, written)
 }
 
 // ---------------------------------------------------------------------------
-// MARK: - Injectable seam: async fetch
+// MARK: - Default injectable fetch closure
 // ---------------------------------------------------------------------------
-// Tests replace this closure with a synchronous mock completion without
-// touching the real network.  Never capture the caller's raw output pointers
-// from within the async completion block.
 
-internal var _performFetch: (
-    _ token: String,
-    _ completion: @escaping (HubInventoryResult) -> Void
-) -> Void = { token, completion in
+private func defaultFetchFn(
+    token: String,
+    completion: @escaping (HubInventoryResult) -> Void
+) {
     HubInventoryFetcher.fetch(token: token, completion: completion)
+}
+
+// ---------------------------------------------------------------------------
+// MARK: - Completion result box (NSLock-protected, exactly-once)
+// ---------------------------------------------------------------------------
+// Wraps the async fetch result so the semaphore-wait path never shares
+// unprotected mutable state and never accesses caller pointers after return.
+
+private final class ResultBox {
+    private let lock = NSLock()
+    private var _result: HubInventoryResult?
+
+    /// Store the result exactly once; subsequent calls are silently ignored.
+    func store(_ result: HubInventoryResult) {
+        lock.lock()
+        defer { lock.unlock() }
+        if _result == nil { _result = result }
+    }
+
+    /// Retrieve the stored result (nil if none stored yet).
+    func load() -> HubInventoryResult? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _result
+    }
 }
 
 // ---------------------------------------------------------------------------
 // MARK: - Synchronous inventory read (internal helper, fully testable)
 // ---------------------------------------------------------------------------
 // All logic lives here.  The @_cdecl entry point is a thin trampoline.
-// outBuffer and capacityBytes are Swift-local copies; the raw caller pointer
-// is used only for a final, one-shot copy after all validation succeeds.
+//
+// Parameters
+//   callerOut   – borrowed caller buffer; never passed into async closures.
+//   capacity    – UInt (size_t at ABI); rejects values > kMaxInventoryBytes.
+//   written     – receives byte count on success; zero on any failure.
+//   keychainFn  – injectable keychain reader (default: defaultKeychainFn).
+//   fetchFn     – injectable fetch driver (default: defaultFetchFn).
+//
+// The XPC provider already calls this on a worker thread; no extra dispatch.
 
 internal func _readInventorySync(
     callerOut: UnsafeMutableRawPointer,
-    capacity: Int,
-    written: UnsafeMutablePointer<Int>
+    capacity: UInt,
+    written: UnsafeMutablePointer<UInt>,
+    keychainFn: (
+        _ out: UnsafeMutableRawPointer,
+        _ capacity: UInt,
+        _ written: UnsafeMutablePointer<UInt>
+    ) -> Int32 = defaultKeychainFn,
+    fetchFn: (
+        _ token: String,
+        _ completion: @escaping (HubInventoryResult) -> Void
+    ) -> Void = defaultFetchFn
 ) -> Int32 {
 
     // ---- 1. Zero output length unconditionally ----
     written.pointee = 0
 
-    // ---- 2. Read keychain token into a local buffer ----
-    // We use a local Swift array so the token is never stored in heap objects
-    // accessible from async closures, and never reaches any log.
-    var tokenBytes = [UInt8](repeating: 0, count: kMaxKeychainTokenBytes)
-    var tokenLen = 0
-    let tokenStatus: Int32 = tokenBytes.withUnsafeMutableBytes { raw in
-        _readKeychainToken(
-            out: raw.baseAddress!,
-            capacity: kMaxKeychainTokenBytes,
-            written: &tokenLen
-        )
+    // ---- 2. Validate caller capacity (defensive: reject negative-equivalent) ----
+    // UInt rules out negative at the type level; still reject zero or
+    // values beyond the 2 MiB inventory ceiling to enforce "no partial copy".
+    guard capacity > 0, capacity <= UInt(kMaxInventoryBytes) else {
+        return kDHInvalid
+    }
+
+    // ---- 3. Read keychain token into a local buffer ----
+    // Stack-allocated scratch buffer; never captured by any async closure.
+    var tokenBytes = [UInt8](repeating: 0, count: Int(kMaxTokenBytes))
+    var tokenLen: UInt = 0
+
+    let tokenStatus: Int32 = tokenBytes.withUnsafeMutableBytes { raw -> Int32 in
+        guard let baseAddress = raw.baseAddress else { return kDHAuth }
+        return keychainFn(baseAddress, kMaxTokenBytes, &tokenLen)
+    }
+
+    // Wipe scratch on any early-exit path.
+    defer {
+        // Void result intentionally discarded — wipe only.
+        _ = tokenBytes.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> Void in
+            raw.baseAddress?.initializeMemory(
+                as: UInt8.self, repeating: 0, count: Int(kMaxTokenBytes))
+        }
     }
 
     guard tokenStatus == kDHSuccess, tokenLen > 0 else {
-        // Wipe the scratch buffer even if the read failed.
-        tokenBytes.withUnsafeMutableBytes { $0.baseAddress!.initializeMemory(as: UInt8.self, repeating: 0, count: kMaxKeychainTokenBytes) }
         return kDHAuth
     }
 
-    // Decode token to String for the fetcher.  Must be valid UTF-8.
-    guard let token = String(bytes: tokenBytes.prefix(tokenLen), encoding: .utf8),
-          !token.isEmpty
+    // ---- 4. Validate token: length 1…4096, printable ASCII (header-safe) ----
+    let tokenCount = Int(tokenLen)
+    guard (1...Int(kMaxTokenBytes)).contains(tokenCount) else {
+        return kDHAuth
+    }
+
+    guard let token = String(bytes: tokenBytes.prefix(tokenCount), encoding: .utf8),
+          !token.isEmpty,
+          token.unicodeScalars.allSatisfy({ $0.value >= 0x21 && $0.value <= 0x7E })
     else {
-        tokenBytes.withUnsafeMutableBytes { $0.baseAddress!.initializeMemory(as: UInt8.self, repeating: 0, count: kMaxKeychainTokenBytes) }
         return kDHAuth
     }
 
-    // Wipe stack copy now that we have the Swift String.
-    tokenBytes.withUnsafeMutableBytes { $0.baseAddress!.initializeMemory(as: UInt8.self, repeating: 0, count: kMaxKeychainTokenBytes) }
-
-    // ---- 3. Drive the async fetch synchronously via semaphore ----
-    // Result is captured by value into a local Swift enum; the caller's raw
+    // ---- 5. Drive the async fetch synchronously via semaphore ----
+    // Result is captured into an NSLock-protected box; the caller's raw
     // buffer pointer (callerOut) is never passed into the closure.
     let semaphore = DispatchSemaphore(value: 0)
-    var fetchResult: HubInventoryResult = .invalidResponse
+    let box = ResultBox()
 
-    // All XPC/network dispatch happens on the worker queue.
-    _workerQueue.async {
-        _performFetch(token) { result in
-            // Store into an owned local — no raw pointer involved.
-            fetchResult = result
-            semaphore.signal()
-        }
+    fetchFn(token) { result in
+        box.store(result)
+        semaphore.signal()
     }
 
     // Wait up to 8 s.  This is a synchronous XPC provider thread; blocking is
     // expected by the XPC ABI.
-    let waitDeadline = DispatchTime.now() + .nanoseconds(Int(_semaphoreTimeoutNs))
-    guard semaphore.wait(timeout: waitDeadline) == .success else {
-        // Timeout: treat as temporary failure.
+    let deadline = DispatchTime.now() + .nanoseconds(Int(kSemaphoreTimeoutNs))
+    guard semaphore.wait(timeout: deadline) == .success else {
         return kDHTempFail
     }
 
-    // ---- 4. Map HubInventoryResult → C status code ----
+    // ---- 6. Map HubInventoryResult → C status code ----
+    guard let fetchResult = box.load() else {
+        // Semaphore was signalled but box is empty — treat as invalid.
+        return kDHInvalid
+    }
+
     switch fetchResult {
     case .needsAuthorization:
         return kDHAuth
@@ -238,23 +239,27 @@ internal func _readInventorySync(
     case .invalidResponse:
         return kDHInvalid
     case .success(let body):
-        // ---- 5. Validate body ----
-        // Must be non-empty (already enforced by HubInventoryFetcher, but
+        // ---- 7. Validate body ----
+        // Must be non-empty (HubInventoryFetcher already enforces this, but
         // double-check at ABI boundary).
         guard !body.isEmpty else { return kDHInvalid }
 
         // Must be valid UTF-8.
         guard String(data: body, encoding: .utf8) != nil else { return kDHInvalid }
 
-        // Must fit in the caller's buffer.
-        guard body.count <= capacity else { return kDHInvalid }
-
-        // ---- 6. Write to caller buffer — single, atomic copy ----
-        // No partial output: written is set only here on the success path.
-        body.withUnsafeBytes { src in
-            callerOut.copyMemory(from: src.baseAddress!, byteCount: body.count)
+        // Enforce 2 MiB limit plus caller capacity; reject with no partial copy.
+        guard body.count <= kMaxInventoryBytes, body.count <= Int(capacity) else {
+            return kDHInvalid
         }
-        written.pointee = body.count
+
+        // ---- 8. Write to caller buffer — single, atomic copy ----
+        // No partial output: written is set only here on the success path.
+        // Void result discarded explicitly — no compiler warning.
+        body.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Void in
+            guard let srcBase = src.baseAddress else { return }
+            callerOut.copyMemory(from: srcBase, byteCount: body.count)
+        }
+        written.pointee = UInt(body.count)
         return kDHSuccess
     }
 }
@@ -262,21 +267,37 @@ internal func _readInventorySync(
 // ---------------------------------------------------------------------------
 // MARK: - C ABI entry point
 // ---------------------------------------------------------------------------
-// Signature: int32_t dh_hub_read_inventory(void *context, void *out, size_t capacity, size_t *written)
+// Signature (C):
+//   int32_t dh_hub_read_inventory(void *context,
+//                                  void *out,
+//                                  size_t capacity,
+//                                  size_t *written);
 //
-// context — reserved for future XPC connection context; ignored for now.
-// out     — borrowed caller buffer; must remain valid until this function returns.
-// capacity — byte length of *out.
+// context  — reserved for future XPC connection context; ignored for now.
+//            Declared optional (nullable) to match C void*.
+// out      — borrowed caller buffer; must remain valid until this returns.
+//            Optional (nullable); nil → return kDHInvalid immediately.
+// capacity — size_t mapped to UInt; zero or overflow → kDHInvalid.
 // written  — receives byte count written on success; zero on failure.
+//            Optional (nullable); nil → return kDHInvalid immediately.
 //
 // Returns one of the kDH* constants defined at the top of this file.
 
 @_cdecl("dh_hub_read_inventory")
 public func dh_hub_read_inventory(
-    _ context: UnsafeMutableRawPointer?,
-    _ out: UnsafeMutableRawPointer,
-    _ capacity: Int,          // Swift Int == size_t on arm64
-    _ written: UnsafeMutablePointer<Int>
+    _ context: UnsafeMutableRawPointer?,   // nullable (reserved)
+    _ out: UnsafeMutableRawPointer?,       // nullable — nil check
+    _ capacity: UInt,                       // size_t at ABI: UInt
+    _ written: UnsafeMutablePointer<UInt>? // nullable — nil check
 ) -> Int32 {
-    return _readInventorySync(callerOut: out, capacity: capacity, written: written)
+    // Nil checks before any dereference.
+    guard let out = out, let written = written else {
+        return kDHInvalid
+    }
+    // Dispatch to the testable helper with default injectable seams.
+    return _readInventorySync(
+        callerOut: out,
+        capacity: capacity,
+        written: written
+    )
 }
