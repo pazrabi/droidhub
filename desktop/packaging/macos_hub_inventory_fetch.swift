@@ -288,7 +288,7 @@ private final class FetchOperation: NSObject, URLSessionDataDelegate, URLSession
 
         let hasDevices: Bool
         if let obj = json as? [String: Any] {
-            hasDevices = obj["devices"] != nil
+            hasDevices = (obj["devices"] as? [Any]) != nil
         } else if json is [[String: Any]] || json is [Any] {
             hasDevices = true
         } else {
