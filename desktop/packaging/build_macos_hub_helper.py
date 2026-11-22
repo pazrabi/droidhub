@@ -181,6 +181,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="KEYCHAIN",
         help="Optional path to a .keychain-db to search for the signing identity.",
     )
+    p.add_argument(
+        "--sdk-path",
+        default=None,
+        metavar="SDK_DIR",
+        help="Optional filesystem path to the macOS SDK directory (must be an existing directory). "
+             "Overrides the default xcrun --show-sdk-path lookup.",
+    )
     return p.parse_args(argv)
 
 
@@ -199,7 +206,7 @@ def _validate(ns: argparse.Namespace, src_dir: Path) -> None:
 
     # -- output dir must not exist
     out = Path(ns.output_dir)
-    if out.exists():
+    if os.path.lexists(out):
         _die(
             f"--output-dir already exists; refusing to overwrite: {out}\n"
             "  Remove it first or choose a different path."
@@ -210,6 +217,12 @@ def _validate(ns: argparse.Namespace, src_dir: Path) -> None:
         kc = Path(ns.signing_keychain)
         if not kc.exists():
             _die(f"--signing-keychain path does not exist: {kc}")
+
+    # -- sdk path (if given) must be an existing directory
+    if ns.sdk_path is not None:
+        sdk_p = Path(ns.sdk_path)
+        if not sdk_p.is_dir():
+            _die(f"--sdk-path is not an existing directory: {sdk_p}")
 
     # -- ALL six sources must be present as regular files before we start.
     missing = [
@@ -248,11 +261,11 @@ def _codesign_cmd(
     return cmd
 
 
-def _verify_cmd(path: Path, identifier: str) -> list[str]:
+def _verify_cmd(path: Path, identifier: str, signing_id: str) -> list[str]:
     # Verify --strict with an exact requirement: designated identifier equals
-    # the known ID, and the signing leaf certificate is the codesigning anchor.
+    # the known ID, and the signing leaf certificate matches the SHA-1 fingerprint.
     requirement = (
-        f'identifier "{identifier}" and certificate leaf[subject.CN] exists'
+        f'identifier "{identifier}" and certificate leaf = H"{signing_id}"'
     )
     return [
         _CODESIGN,
@@ -264,11 +277,14 @@ def _verify_cmd(path: Path, identifier: str) -> list[str]:
 
 
 def build(ns: argparse.Namespace, src_dir: Path) -> None:
-    out_dir = Path(ns.output_dir).resolve()
+    out_dir = Path(os.path.abspath(ns.output_dir))
     signing_id = ns.signing_identity.upper()
 
-    # Resolve SDK once: filesystem path → pass as -isysroot / -sdk.
-    sdk = _sdk_path()
+    # Resolve SDK once: use --sdk-path if provided, else xcrun --show-sdk-path.
+    if ns.sdk_path is not None:
+        sdk = str(Path(ns.sdk_path).resolve())
+    else:
+        sdk = _sdk_path()
     print(f"[sdk] {sdk}")
 
     # Create a unique temporary directory as a sibling of out_dir so that
@@ -378,36 +394,12 @@ def _build_in(
     c_objects.append(compile_c(src(_C_KEYCHAIN)))
 
     # -----------------------------------------------------------------------
-    # Compile both Swift sources as a single -emit-executable invocation.
-    # Swift linker driver: use clang (ld-based) via -use-ld or just rely on
-    # swiftc's default linker; for object-only compilation we use -c then link
-    # via swiftc with explicit C objects to get the Swift runtime linked in.
+    # Compile + link both Swift sources and C objects in one swiftc invocation.
+    # Using -parse-as-library -emit-executable with multiple .swift sources and
+    # C objects avoids the multi-file -c with single -o failure (whole-module).
     # -----------------------------------------------------------------------
 
     swift_srcs = [src(_SWIFT_INVENTORY), src(_SWIFT_FETCH)]
-
-    # Compile Swift sources to a single object file.
-    swift_obj = cache_dir / "swift_combined.o"
-    swift_compile_cmd = (
-        swiftc_prefix
-        + swift_base_flags
-        + target_flag
-        + [
-            "-c",
-            "-parse-as-library",
-            "-module-name", "HubHelper",
-        ]
-        + [str(s) for s in swift_srcs]
-        + ["-o", str(swift_obj)]
-    )
-    print(f"[swiftc] {' '.join(s.name for s in swift_srcs)}")
-    _run(swift_compile_cmd)
-
-    # -----------------------------------------------------------------------
-    # Link the helper executable via swiftc (brings in Swift runtime libs).
-    # Pass compiled C objects so they are included.  Use -use-ld=lld or leave
-    # swiftc to choose; pass frameworks via -Xlinker.
-    # -----------------------------------------------------------------------
 
     helper_path = staging / _HELPER_OUT
 
@@ -419,13 +411,17 @@ def _build_in(
         swiftc_prefix
         + swift_base_flags
         + target_flag
-        + ["-emit-executable"]
-        + [str(swift_obj)]
+        + [
+            "-parse-as-library",
+            "-emit-executable",
+            "-module-name", "HubHelper",
+        ]
+        + [str(s) for s in swift_srcs]
         + [str(o) for o in c_objects]
         + link_fw
         + ["-o", str(helper_path)]
     )
-    print(f"[link] {_HELPER_OUT}")
+    print(f"[swiftc+link] {' '.join(s.name for s in swift_srcs)}")
     _run(swift_link_cmd)
 
     # -----------------------------------------------------------------------
@@ -485,10 +481,10 @@ def _build_in(
     # -----------------------------------------------------------------------
 
     print(f"[verify] {_HELPER_OUT}")
-    _run(_verify_cmd(helper_path, _HELPER_ID))
+    _run(_verify_cmd(helper_path, _HELPER_ID, signing_id))
 
     print(f"[verify] {_DYLIB_OUT}")
-    _run(_verify_cmd(dylib_path, _DYLIB_ID))
+    _run(_verify_cmd(dylib_path, _DYLIB_ID, signing_id))
 
 
 # ---------------------------------------------------------------------------
