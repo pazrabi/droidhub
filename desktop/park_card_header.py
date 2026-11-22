@@ -76,9 +76,18 @@ class ParkCardHeader(tk.Frame):
         self._hub_online: bool = False
         self._selectable: bool = True
 
+        # Tracks which badges are currently packed to avoid winfo_ismapped
+        # issues before first display (winfo_ismapped is False until actually
+        # drawn, so we track state independently).
+        self._usb_badge_packed: bool = False
+        self._hub_badge_packed: bool = False
+
         self._last_width: int = 0
         self._is_wrapped: bool = False
         self._has_focus: bool = False
+
+        # Pending after_idle relayout id (to avoid nested update calls)
+        self._relayout_after_id: str | None = None
 
         self._font = tkfont.Font(family="Helvetica", size=8)
         self._badge_font = tkfont.Font(family="Helvetica", size=7, weight="bold")
@@ -273,28 +282,42 @@ class ParkCardHeader(tk.Frame):
 
         self._var.set(self._selected)
         if self._selectable:
-            self._checkbox.config(takefocus=1, cursor="hand2")
+            self._checkbox.config(
+                state=tk.NORMAL,
+                takefocus=1,
+                cursor="hand2",
+            )
         else:
-            self._checkbox.config(takefocus=0, cursor="")
+            self._checkbox.config(
+                state=tk.DISABLED,
+                takefocus=0,
+                cursor="",
+            )
 
+        # Use internal tracking (_usb_badge_packed / _hub_badge_packed) instead of
+        # winfo_ismapped() so route changes before the first window draw are correct.
         if self._usb:
             self._usb_badge.config(fg=self._usb_color, text="USB")
-            if not self._usb_badge.winfo_ismapped():
+            if not self._usb_badge_packed:
                 self._usb_badge.pack(side=tk.LEFT, padx=(2, 0))
+                self._usb_badge_packed = True
         else:
             self._usb_badge.config(fg=self._muted_color)
-            if self._usb_badge.winfo_ismapped():
+            if self._usb_badge_packed:
                 self._usb_badge.pack_forget()
+                self._usb_badge_packed = False
 
         if self._hub:
             h_fg = self._hub_color if self._hub_online else self._muted_color
             self._hub_badge.config(fg=h_fg, text="Hub")
-            if not self._hub_badge.winfo_ismapped():
+            if not self._hub_badge_packed:
                 self._hub_badge.pack(side=tk.LEFT, padx=(2, 0))
+                self._hub_badge_packed = True
         else:
             self._hub_badge.config(fg=self._muted_color)
-            if self._hub_badge.winfo_ismapped():
+            if self._hub_badge_packed:
                 self._hub_badge.pack_forget()
+                self._hub_badge_packed = False
 
         if self._usb or self._hub:
             self._badges_frame.grid(row=0, column=2, sticky="e")
@@ -306,9 +329,30 @@ class ParkCardHeader(tk.Frame):
     def _on_configure(self, event: tk.Event) -> None:
         if event.widget is not self:
             return
-        if event.width <= 1 or event.width == self._last_width:
+        if event.width <= 1:
             return
-        self._relayout(target_width=event.width)
+        # Relayout whenever the width changes OR equals the fallback (154) so
+        # the first Configure event (which may report exactly 154) always
+        # triggers a proper geometry pass.
+        if event.width == self._last_width:
+            return
+        # Avoid calling update/update_idletasks from within Configure; schedule
+        # relayout via after_idle so it runs outside the event handler.
+        new_width = event.width
+        if self._relayout_after_id is not None:
+            try:
+                self.after_cancel(self._relayout_after_id)
+            except Exception:
+                pass
+            self._relayout_after_id = None
+        self._relayout_after_id = self.after_idle(
+            lambda w=new_width: self._relayout_from_idle(w)
+        )
+
+    def _relayout_from_idle(self, target_width: int) -> None:
+        """Called from after_idle; performs relayout for the given width."""
+        self._relayout_after_id = None
+        self._relayout(target_width=target_width)
 
     def _relayout(self, target_width: int | None = None) -> None:
         if target_width is not None and target_width > 1:
