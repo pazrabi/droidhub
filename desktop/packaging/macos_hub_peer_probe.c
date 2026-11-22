@@ -227,10 +227,16 @@ static void run_ping(const char *label, const char *peer_requirement)
      * Heap-allocate the shared atomics so both the calling scope and the
      * blocks hold a plain pointer (not a const-captured stack address).
      */
-    _Atomic int *result    = malloc(sizeof(_Atomic int));
-    _Atomic int *signalled = malloc(sizeof(_Atomic int));
-    if (result == NULL || signalled == NULL) {
+    _Atomic int *result = malloc(sizeof(_Atomic int));
+    if (result == NULL) {
         fprintf(stderr, "ping: malloc failed.\n");
+        xpc_release(conn);
+        exit(EXIT_XPC_SETUP);
+    }
+    _Atomic int *signalled = malloc(sizeof(_Atomic int));
+    if (signalled == NULL) {
+        fprintf(stderr, "ping: malloc failed.\n");
+        free(result);
         xpc_release(conn);
         exit(EXIT_XPC_SETUP);
     }
@@ -312,9 +318,11 @@ static void run_ping(const char *label, const char *peer_requirement)
         code = atomic_load(result);
     }
 
-    free(result);
-    free(signalled);
-
+    /*
+     * Do NOT free(result) / free(signalled) here: xpc_connection_cancel is
+     * asynchronous and inflight blocks may still hold those pointers.  The
+     * process exits immediately via exit(), which reclaims all memory safely.
+     */
     exit(code);
 }
 
