@@ -181,22 +181,19 @@ internal func _readInventorySync(
 
     // Wipe scratch on any early-exit path.
     defer {
-        // Void result intentionally discarded — wipe only.
-        _ = tokenBytes.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> Void in
+        // Wipe only — closure returns Void, no discard needed.
+        tokenBytes.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> Void in
             raw.baseAddress?.initializeMemory(
                 as: UInt8.self, repeating: 0, count: Int(kMaxTokenBytes))
         }
     }
 
-    guard tokenStatus == kDHSuccess, tokenLen > 0 else {
+    guard tokenStatus == kDHSuccess, tokenLen > 0, tokenLen <= kMaxTokenBytes else {
         return kDHAuth
     }
 
     // ---- 4. Validate token: length 1…4096, printable ASCII (header-safe) ----
     let tokenCount = Int(tokenLen)
-    guard (1...Int(kMaxTokenBytes)).contains(tokenCount) else {
-        return kDHAuth
-    }
 
     guard let token = String(bytes: tokenBytes.prefix(tokenCount), encoding: .utf8),
           !token.isEmpty,
