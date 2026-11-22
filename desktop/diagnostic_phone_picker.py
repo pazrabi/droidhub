@@ -168,7 +168,7 @@ class DiagnosticPhonePicker(ttk.Frame):
         if theme is None:
             return
 
-        for method_name in ("apply_theme", "apply", "setup_theme", "configure_styles", "init_theme"):
+        for method_name in ("apply_theme", "setup_theme"):
             fn = getattr(theme, method_name, None)
             if callable(fn):
                 try:
@@ -207,11 +207,11 @@ class DiagnosticPhonePicker(ttk.Frame):
 
         # Применяем цвета из theme.py, если они определены
         if theme is not None:
-            bg = getattr(theme, "BG_PANEL", getattr(theme, "BG_SIDEBAR", getattr(theme, "BG_COLOR", None)))
-            fg = getattr(theme, "FG_PANEL", getattr(theme, "FG_TEXT", getattr(theme, "FG_COLOR", None)))
-            sel_bg = getattr(theme, "SELECT_BG", getattr(theme, "ACCENT_COLOR", None))
-            sel_fg = getattr(theme, "SELECT_FG", getattr(theme, "ACCENT_FG", None))
-            font = getattr(theme, "FONT_REGULAR", getattr(theme, "FONT", None))
+            bg = getattr(theme, "RECESS", getattr(theme, "SURFACE", getattr(theme, "BG_PANEL", getattr(theme, "BG_SIDEBAR", getattr(theme, "BG_COLOR", None)))))
+            fg = getattr(theme, "TEXT", getattr(theme, "FG_PANEL", getattr(theme, "FG_TEXT", getattr(theme, "FG_COLOR", None))))
+            sel_bg = getattr(theme, "SELECTED", getattr(theme, "SELECT_BG", getattr(theme, "ACCENT_COLOR", None)))
+            sel_fg = getattr(theme, "ACCENT", getattr(theme, "SELECT_FG", getattr(theme, "ACCENT_FG", None)))
+            font = getattr(theme, "BODY_FONT", getattr(theme, "FONT_REGULAR", getattr(theme, "FONT", None)))
 
             if bg:
                 listbox_kwargs["bg"] = bg
@@ -312,6 +312,10 @@ class DiagnosticPhonePicker(ttk.Frame):
                 self._listbox.bind("<space>", self._on_space)
             except Exception:
                 pass
+            try:
+                self._listbox.bind("<<ListboxSelect>>", self._sync_model_from_listbox)
+            except Exception:
+                pass
 
         # На кнопках
         for btn in (
@@ -325,16 +329,23 @@ class DiagnosticPhonePicker(ttk.Frame):
                 except Exception:
                     pass
 
-        # Привязка Escape к Toplevel-окну хоста (если родитель в Toplevel)
-        try:
-            top = self.winfo_toplevel()
-            if top is not None and top is not self:
-                top.bind("<Escape>", lambda _e: self.cancel(), add="+")
-        except Exception:
-            pass
+    def _sync_model_from_listbox(self, _event: tk.Event | None = None) -> None:
+        """Синхронизирует внутреннюю модель выбора с выделением в Listbox."""
+        if hasattr(self, "_listbox") and self._listbox is not None:
+            try:
+                if self._listbox.winfo_exists():
+                    selected_indices = {int(i) for i in self._listbox.curselection()}
+                    current_ids = [
+                        self._phones[i][0]
+                        for i in range(len(self._phones))
+                        if i in selected_indices
+                    ]
+                    self._model.set_selected_ids(current_ids)
+            except Exception:
+                pass
 
     def _on_space(self, _event: tk.Event | None = None) -> str:
-        """Переключает выбор элемента по клавише Пробел."""
+        """Переключает выбор элемента по клавише Пробел и синхронизирует модель."""
         try:
             active_idx = self._listbox.index(tk.ACTIVE)
             if active_idx is not None and 0 <= active_idx < len(self._phones):
@@ -342,6 +353,11 @@ class DiagnosticPhonePicker(ttk.Frame):
                     self._listbox.selection_clear(active_idx)
                 else:
                     self._listbox.selection_set(active_idx)
+                self._sync_model_from_listbox()
+                try:
+                    self._listbox.event_generate("<<ListboxSelect>>")
+                except Exception:
+                    pass
         except Exception:
             pass
         return "break"
@@ -405,7 +421,7 @@ class DiagnosticPhonePicker(ttk.Frame):
         if hasattr(self, "_listbox") and self._listbox is not None:
             try:
                 if self._listbox.winfo_exists():
-                    self._listbox.select_clear(0, tk.END)
+                    self._listbox.selection_clear(0, tk.END)
             except Exception:
                 pass
 
@@ -423,7 +439,7 @@ class DiagnosticPhonePicker(ttk.Frame):
         if hasattr(self, "_listbox") and self._listbox is not None:
             try:
                 if self._listbox.winfo_exists():
-                    self._listbox.select_clear(0, tk.END)
+                    self._listbox.selection_clear(0, tk.END)
                     selected_set = set(self._model.get_selected_ids())
                     for idx, (serial, _) in enumerate(self._phones):
                         if serial in selected_set:

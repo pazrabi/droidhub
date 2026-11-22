@@ -255,6 +255,36 @@ class TestDiagnosticPhonePickerMockedHeadless(unittest.TestCase):
         picker.apply()
         self.assertEqual(applied, [[]])
 
+    @patch("tkinter.ttk.Label")
+    @patch("tkinter.ttk.Button")
+    @patch("tkinter.ttk.Scrollbar")
+    @patch("tkinter.Listbox")
+    @patch("tkinter.ttk.Frame")
+    def test_sync_model_from_listbox_mocked(
+        self,
+        mock_frame_cls: MagicMock,
+        mock_listbox_cls: MagicMock,
+        mock_scrollbar_cls: MagicMock,
+        mock_button_cls: MagicMock,
+        mock_label_cls: MagicMock,
+    ) -> None:
+        mock_parent = MagicMock()
+        mock_listbox = MagicMock()
+        mock_listbox.winfo_exists.return_value = True
+        mock_listbox.curselection.return_value = (1,)
+        mock_listbox_cls.return_value = mock_listbox
+
+        picker = DiagnosticPhonePicker(
+            mock_parent,
+            [("dev1", "Label 1"), ("dev2", "Label 2")],
+            selected_ids=(),
+            on_apply=lambda ids: None,
+            on_cancel=lambda: None,
+        )
+        self.assertEqual(picker._model.get_selected_ids(), [])
+        picker._sync_model_from_listbox()
+        self.assertEqual(picker._model.get_selected_ids(), ["dev2"])
+
 
 @unittest.skipUnless(HAS_DISPLAY, "Tk-тесты требуют активного дисплея X11/Wayland")
 class TestDiagnosticPhonePickerTk(unittest.TestCase):
@@ -431,6 +461,67 @@ class TestDiagnosticPhonePickerTk(unittest.TestCase):
         # Повторный пробел снимает выбор
         picker._on_space(None)
         self.assertEqual(picker.get_selected_ids(), [])
+
+        top.destroy()
+
+    def test_tk_frame_does_not_bind_escape_to_parent_toplevel(self) -> None:
+        import tkinter as tk
+        top = tk.Toplevel(self.root)
+        top.bind("<Escape>", lambda _e: None)
+        bindings_before = top.bind("<Escape>")
+
+        picker = DiagnosticPhonePicker(
+            top,
+            [("p1", "Phone 1")],
+            on_apply=lambda ids: None,
+            on_cancel=lambda: None,
+        )
+        picker.pack()
+        top.update()
+
+        bindings_after = top.bind("<Escape>")
+        self.assertEqual(bindings_before, bindings_after)
+        top.destroy()
+
+    def test_tk_space_and_listbox_select_synchronizes_model(self) -> None:
+        import tkinter as tk
+        top = tk.Toplevel(self.root)
+        picker = DiagnosticPhonePicker(
+            top,
+            [("p1", "Phone 1"), ("p2", "Phone 2")],
+            selected_ids=(),
+            on_apply=lambda ids: None,
+            on_cancel=lambda: None,
+        )
+        picker.pack()
+        top.update()
+
+        self.assertEqual(picker._model.get_selected_ids(), [])
+
+        # Переключение пробелом должно обновлять не только listbox, но и модель
+        picker.listbox.focus_set()
+        picker.listbox.activate(0)
+        picker._on_space(None)
+        top.update()
+
+        self.assertEqual(picker.get_selected_ids(), ["p1"])
+        self.assertEqual(picker._model.get_selected_ids(), ["p1"])
+        self.assertTrue(picker._model.is_selected("p1"))
+
+        # Выделение напрямую через ListboxSelect также обновляет модель
+        picker.listbox.selection_set(1)
+        picker.listbox.event_generate("<<ListboxSelect>>")
+        top.update()
+
+        self.assertEqual(picker.get_selected_ids(), ["p1", "p2"])
+        self.assertEqual(picker._model.get_selected_ids(), ["p1", "p2"])
+        self.assertTrue(picker._model.all_selected)
+
+        # Проверяем, что toggle_all теперь корректно сработает с синхронизированной моделью
+        picker.toggle_all()
+        top.update()
+        self.assertEqual(picker.get_selected_ids(), [])
+        self.assertEqual(picker._model.get_selected_ids(), [])
 
         top.destroy()
 
