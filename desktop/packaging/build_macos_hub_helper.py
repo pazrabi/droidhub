@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
+import hashlib
 import os
 import re
 import subprocess
@@ -261,19 +262,103 @@ def _codesign_cmd(
     return cmd
 
 
-def _verify_cmd(path: Path, identifier: str, signing_id: str) -> list[str]:
-    # Verify --strict with an exact requirement: designated identifier equals
-    # the known ID, and the signing leaf certificate matches the SHA-1 fingerprint.
-    requirement = (
-        f'identifier "{identifier}" and certificate leaf = H"{signing_id}"'
-    )
-    return [
-        _CODESIGN,
-        "--verify",
-        "--strict",
-        "-R", requirement,
-        str(path),
-    ]
+def _verify_signature(
+    path: Path,
+    identifier: str,
+    signing_id: str,
+    cert_cache_dir: Path,
+    artifact_tag: str,
+) -> None:
+    """Three-step post-build verification for a locally self-signed artifact.
+
+    Step 1: ``codesign --verify --strict <path>`` — structural integrity.
+    Step 2: ``codesign -d --verbose=2 <path>`` — confirm Identifier= line.
+    Step 3: Extract authenticated leaf DER, hash with SHA-1, compare digest.
+
+    Raises SystemExit (via _die) on any mismatch; never returns partial success.
+    Does NOT publish output on mismatch.
+    """
+    path_str = str(path)
+    expected_id_upper = signing_id.upper()
+
+    # ------------------------------------------------------------------
+    # Step 1: structural verify
+    # ------------------------------------------------------------------
+    try:
+        subprocess.run(
+            [_CODESIGN, "--verify", "--strict", path_str],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        _die(
+            f"codesign --verify --strict failed for {path.name} "
+            f"(exit {exc.returncode})"
+        )
+    except FileNotFoundError:
+        _die(f"executable not found: {_CODESIGN!r}")
+
+    # ------------------------------------------------------------------
+    # Step 2: confirm Identifier= in verbose display output
+    # ------------------------------------------------------------------
+    try:
+        result = subprocess.run(
+            [_CODESIGN, "-d", "--verbose=2", path_str],
+            capture_output=True,
+            text=True,
+        )
+        # codesign -d writes display info to stderr regardless of exit code.
+        stderr_lines = result.stderr.splitlines()
+    except FileNotFoundError:
+        _die(f"executable not found: {_CODESIGN!r}")
+
+    expected_id_line = f"Identifier={identifier}"
+    if expected_id_line not in stderr_lines:
+        _die(
+            f"codesign -d --verbose=2 did not contain exact line "
+            f"{expected_id_line!r} for {path.name}"
+        )
+
+    # ------------------------------------------------------------------
+    # Step 3: extract authenticated leaf DER, hash, compare
+    # ------------------------------------------------------------------
+    # Use a unique subdirectory per artifact to avoid collisions.
+    cert_subdir = cert_cache_dir / artifact_tag
+    cert_subdir.mkdir(parents=False, exist_ok=False)
+    # cert_prefix must be an absolute path; codesign appends "0" for the leaf.
+    cert_prefix = str(cert_subdir.resolve() / "leaf")
+
+    try:
+        subprocess.run(
+            [_CODESIGN, "-d", f"--extract-certificates={cert_prefix}", path_str],
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        _die(
+            f"codesign --extract-certificates failed for {path.name} "
+            f"(exit {exc.returncode})"
+        )
+    except FileNotFoundError:
+        _die(f"executable not found: {_CODESIGN!r}")
+
+    leaf_der = Path(cert_prefix + "0")
+    if not leaf_der.is_file():
+        _die(
+            f"leaf certificate file not found after extraction: {leaf_der}"
+        )
+
+    try:
+        raw = leaf_der.read_bytes()
+    except OSError as exc:
+        _die(f"cannot read extracted leaf certificate: {exc}")
+
+    actual_digest = hashlib.sha1(raw).hexdigest().upper()
+    if actual_digest != expected_id_upper:
+        _die(
+            f"leaf certificate SHA-1 mismatch for {path.name}: "
+            f"expected {expected_id_upper}, got {actual_digest}"
+        )
 
 
 def build(ns: argparse.Namespace, src_dir: Path) -> None:
@@ -339,6 +424,9 @@ def _build_in(
     cache_dir.mkdir()
     module_cache = tmp_root / "module-cache"
     module_cache.mkdir()
+    # Dedicated cache for extracted leaf DER files; unique subdir per artifact.
+    cert_cache_dir = tmp_root / "cert-cache"
+    cert_cache_dir.mkdir()
 
     def src(name: str) -> Path:
         return src_dir / name
@@ -477,14 +565,26 @@ def _build_in(
     )
 
     # -----------------------------------------------------------------------
-    # Verify — strict, exact identifier + leaf requirement, both artifacts.
+    # Verify — strict, exact identifier + leaf SHA-1, both artifacts.
     # -----------------------------------------------------------------------
 
     print(f"[verify] {_HELPER_OUT}")
-    _run(_verify_cmd(helper_path, _HELPER_ID, signing_id))
+    _verify_signature(
+        helper_path,
+        identifier=_HELPER_ID,
+        signing_id=signing_id,
+        cert_cache_dir=cert_cache_dir,
+        artifact_tag="helper",
+    )
 
     print(f"[verify] {_DYLIB_OUT}")
-    _run(_verify_cmd(dylib_path, _DYLIB_ID, signing_id))
+    _verify_signature(
+        dylib_path,
+        identifier=_DYLIB_ID,
+        signing_id=signing_id,
+        cert_cache_dir=cert_cache_dir,
+        artifact_tag="dylib",
+    )
 
 
 # ---------------------------------------------------------------------------
