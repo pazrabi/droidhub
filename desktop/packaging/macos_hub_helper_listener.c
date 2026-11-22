@@ -11,9 +11,20 @@
  *   );
  *
  * Linker flags (macOS):
- *   -framework Security
+ *   -framework Security -framework CoreFoundation
  *
  * Note: libxpc and libdispatch are part of libSystem, linked by default on macOS.
+ *
+ * Security framework usage:
+ *   SecRequirementCreateWithString  - validates the requirement expression string
+ *     kSecCSDefaultFlags (0)        - no special options; performs standard parse + validation
+ *   The resulting SecRequirementRef is used only for validation and immediately released;
+ *   the raw requirement string is owned by hub_listener_state_t for XPC use.
+ *
+ * CoreFoundation usage:
+ *   CFStringCreateWithCString       - wraps the requirement C string for Security API ingestion
+ *     kCFStringEncodingUTF8         - requirement strings are always UTF-8 on this path
+ *   CFRelease                       - balances the Create rule (caller owns the returned ref)
  */
 
 #include <stddef.h>
@@ -30,7 +41,8 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 
-#define MAX_BODY_BYTES (2 * 1024 * 1024) /* 2 MiB */
+#define MAX_BODY_BYTES          (2 * 1024 * 1024) /* 2 MiB */
+#define MAX_REQUIREMENT_BYTES   4096              /* max UTF-8 bytes for requirement string */
 
 static const char *const VALID_LABEL_PREFIX_TEST = "site.molokohub.droidhub.xpc-test.";
 static const char *const VALID_LABEL_PRODUCTION  = "site.molokohub.droidhub.hub-helper.v1";
@@ -38,9 +50,9 @@ static const char *const VALID_LABEL_PRODUCTION  = "site.molokohub.droidhub.hub-
 typedef struct {
     int (*read_inventory)(void *context, void *out, size_t capacity, size_t *written);
     void *context;
-    SecRequirementRef requirement;
+    char *req_text;         /* owned copy of the requirement string; passed to XPC */
     dispatch_queue_t worker_queue;
-    atomic_flag in_flight;
+    atomic_bool in_flight;  /* true while a provider call is executing */
 } hub_listener_state_t;
 
 typedef struct {
@@ -52,6 +64,7 @@ typedef struct {
     hub_listener_state_t *state;
     xpc_connection_t connection;
     xpc_object_t request;
+    xpc_object_t reply;     /* pre-created reply, retained until response is sent */
 } work_item_t;
 
 static bool is_valid_label(const char *label) {
@@ -70,12 +83,11 @@ static bool is_valid_label(const char *label) {
     return false;
 }
 
-static void send_reply(xpc_connection_t connection, xpc_object_t request, int64_t status, const void *body, size_t body_len) {
-    xpc_object_t reply = xpc_dictionary_create_reply(request);
-    if (!reply) {
-        return;
-    }
-
+/*
+ * send_reply_with_object: transmit a pre-created reply dictionary.
+ * The caller retains ownership of `reply`; this function does not release it.
+ */
+static void send_reply_with_object(xpc_connection_t connection, xpc_object_t reply, int64_t status, const void *body, size_t body_len) {
     xpc_dictionary_set_uint64(reply, "version", 1);
     xpc_dictionary_set_int64(reply, "status", status);
 
@@ -84,7 +96,23 @@ static void send_reply(xpc_connection_t connection, xpc_object_t request, int64_
     }
 
     xpc_connection_send_message(connection, reply);
+}
+
+/*
+ * send_reply: convenience wrapper that creates the reply on the spot.
+ * Used for early-rejection paths where no pre-created reply exists.
+ * Returns false if the request is one-way (no reply expected).
+ */
+static bool send_reply(xpc_connection_t connection, xpc_object_t request, int64_t status, const void *body, size_t body_len) {
+    xpc_object_t reply = xpc_dictionary_create_reply(request);
+    if (!reply) {
+        /* One-way message: no reply expected, nothing to send */
+        return false;
+    }
+
+    send_reply_with_object(connection, reply, status, body, body_len);
     xpc_release(reply);
+    return true;
 }
 
 static void handle_request_worker(void *context) {
@@ -92,11 +120,13 @@ static void handle_request_worker(void *context) {
     hub_listener_state_t *state = item->state;
     xpc_connection_t connection = item->connection;
     xpc_object_t request = item->request;
+    xpc_object_t reply = item->reply;   /* retained; we must release after send */
 
     void *buffer = malloc(MAX_BODY_BYTES);
     if (!buffer) {
-        atomic_flag_clear(&state->in_flight);
-        send_reply(connection, request, 2, NULL, 0);
+        atomic_store(&state->in_flight, false);
+        send_reply_with_object(connection, reply, 2, NULL, 0);
+        xpc_release(reply);
         xpc_release(connection);
         xpc_release(request);
         free(item);
@@ -106,23 +136,24 @@ static void handle_request_worker(void *context) {
     size_t written = 0;
     int rc = state->read_inventory(state->context, buffer, MAX_BODY_BYTES, &written);
 
-    atomic_flag_clear(&state->in_flight);
+    atomic_store(&state->in_flight, false);
 
     if (rc == 0) {
         if (written > 0 && written <= MAX_BODY_BYTES) {
-            send_reply(connection, request, 0, buffer, written);
+            send_reply_with_object(connection, reply, 0, buffer, written);
         } else {
             /* Require nonempty success, bound body 2 MiB */
-            send_reply(connection, request, 4, NULL, 0);
+            send_reply_with_object(connection, reply, 4, NULL, 0);
         }
     } else if (rc >= 1 && rc <= 4) {
-        send_reply(connection, request, (int64_t)rc, NULL, 0);
+        send_reply_with_object(connection, reply, (int64_t)rc, NULL, 0);
     } else {
         /* Any unexpected provider error mapped to 4 (invalid response/protocol) */
-        send_reply(connection, request, 4, NULL, 0);
+        send_reply_with_object(connection, reply, 4, NULL, 0);
     }
 
     free(buffer);
+    xpc_release(reply);
     xpc_release(connection);
     xpc_release(request);
     free(item);
@@ -166,30 +197,46 @@ static void peer_event_handler(xpc_object_t event, void *context) {
     }
 
     /*
-     * Concurrency limit: At most one provider call in flight across clients.
+     * Pre-create the reply object before any scheduling.
+     * xpc_dictionary_create_reply returns NULL for one-way (fire-and-forget)
+     * requests which carry no reply context; reject those explicitly.
+     */
+    xpc_object_t reply = xpc_dictionary_create_reply(event);
+    if (!reply) {
+        /* One-way request: no reply channel; drop silently */
+        return;
+    }
+
+    /*
+     * Concurrency limit: at most one provider call in flight across clients.
      * Return status 2 immediately if already running.
      */
-    if (atomic_flag_test_and_set(&state->in_flight)) {
-        send_reply(connection, event, 2, NULL, 0);
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&state->in_flight, &expected, true)) {
+        send_reply_with_object(connection, reply, 2, NULL, 0);
+        xpc_release(reply);
         return;
     }
 
     /* Retain connection and request before dispatching off the listener queue */
     xpc_retain(connection);
     xpc_retain(event);
+    /* reply is already retained by xpc_dictionary_create_reply; keep that ref for the worker */
 
     work_item_t *item = (work_item_t *)malloc(sizeof(work_item_t));
     if (!item) {
-        atomic_flag_clear(&state->in_flight);
+        atomic_store(&state->in_flight, false);
         xpc_release(connection);
         xpc_release(event);
-        send_reply(connection, event, 2, NULL, 0);
+        send_reply_with_object(connection, reply, 2, NULL, 0);
+        xpc_release(reply);
         return;
     }
 
     item->state = state;
     item->connection = connection;
     item->request = event;
+    item->reply = reply;
 
     dispatch_async_f(state->worker_queue, item, handle_request_worker);
 }
@@ -200,6 +247,7 @@ int dh_hub_serve(
     int (*read_inventory)(void *context, void *out, size_t capacity, size_t *written),
     void *context
 ) {
+    /* Label validation is a native (non-API) check; run it first */
     if (!is_valid_label(label)) {
         return -1;
     }
@@ -207,32 +255,75 @@ int dh_hub_serve(
         return -1;
     }
 
-    CFStringRef req_str = CFStringCreateWithCString(kCFAllocatorDefault, client_requirement, kCFStringEncodingUTF8);
-    if (!req_str) {
+    /*
+     * Bound the requirement string to MAX_REQUIREMENT_BYTES bytes of UTF-8.
+     * strnlen caps the scan; if the string reaches the limit without a NUL
+     * it is too long. The +1 on malloc leaves room for the NUL terminator.
+     */
+    size_t req_len = strnlen(client_requirement, MAX_REQUIREMENT_BYTES + 1);
+    if (req_len > MAX_REQUIREMENT_BYTES) {
         return -1;
     }
 
-    SecRequirementRef requirement = NULL;
-    OSStatus status = SecRequirementCreateWithString(req_str, kSecCSDefaultFlags, &requirement);
-    CFRelease(req_str);
-    if (status != errSecSuccess || !requirement) {
+    /*
+     * Validate the requirement expression via Security.framework before use.
+     *
+     * CFStringCreateWithCString / kCFStringEncodingUTF8:
+     *   Wraps the C string as a CFStringRef for the Security API.  The Create
+     *   rule means we own the returned object and must CFRelease it.
+     *
+     * SecRequirementCreateWithString / kSecCSDefaultFlags:
+     *   Parses and validates the requirement expression.  kSecCSDefaultFlags (0)
+     *   selects the standard (non-lenient) parser.  On success we own `req` and
+     *   must CFRelease it; we do so immediately after validation because XPC
+     *   takes the raw string, not a SecRequirementRef.
+     */
+    CFStringRef req_cfstr = CFStringCreateWithCString(kCFAllocatorDefault, client_requirement, kCFStringEncodingUTF8);
+    if (!req_cfstr) {
         return -1;
     }
+
+    SecRequirementRef req = NULL;
+    OSStatus status = SecRequirementCreateWithString(req_cfstr, kSecCSDefaultFlags, &req);
+    CFRelease(req_cfstr);
+    if (status != errSecSuccess || !req) {
+        return -1;
+    }
+    /* SecRequirementRef no longer needed; XPC takes the string directly */
+    CFRelease(req);
+
+    /*
+     * Own a copy of the requirement text for the lifetime of the listener.
+     * xpc_connection_set_peer_code_signing_requirement takes const char*, so
+     * we must keep the string alive as long as any peer connection may be
+     * established.
+     */
+    char *req_text = (char *)malloc(req_len + 1);
+    if (!req_text) {
+        return -1;
+    }
+    memcpy(req_text, client_requirement, req_len);
+    req_text[req_len] = '\0';
 
     hub_listener_state_t *state = (hub_listener_state_t *)malloc(sizeof(hub_listener_state_t));
     if (!state) {
-        CFRelease(requirement);
+        free(req_text);
         return -1;
     }
 
     state->read_inventory = read_inventory;
     state->context = context;
-    state->requirement = requirement;
-    atomic_flag_clear(&state->in_flight);
+    state->req_text = req_text;
+    /*
+     * atomic_bool must be initialized before first use.  Use ATOMIC_VAR_INIT
+     * for static-storage compatibility; the assignment form is equally valid
+     * for local/heap objects in C11.
+     */
+    atomic_init(&state->in_flight, false);
 
     state->worker_queue = dispatch_queue_create("site.molokohub.droidhub.worker", DISPATCH_QUEUE_SERIAL);
     if (!state->worker_queue) {
-        CFRelease(requirement);
+        free(req_text);
         free(state);
         return -1;
     }
@@ -244,7 +335,7 @@ int dh_hub_serve(
     );
     if (!listener) {
         dispatch_release(state->worker_queue);
-        CFRelease(requirement);
+        free(req_text);
         free(state);
         return -1;
     }
@@ -256,8 +347,13 @@ int dh_hub_serve(
 
         xpc_connection_t peer_conn = (xpc_connection_t)peer;
 
-        /* Enforce code signing requirement before activation */
-        int cs_err = xpc_connection_set_peer_code_signing_requirement(peer_conn, state->requirement);
+        /*
+         * xpc_connection_set_peer_code_signing_requirement(conn, const char *)
+         * Associates a code-signing requirement string with the connection;
+         * XPC enforces it before delivering any messages from this peer.
+         * We pass our owned copy, which outlives all peer connections.
+         */
+        int cs_err = xpc_connection_set_peer_code_signing_requirement(peer_conn, state->req_text);
         if (cs_err != 0) {
             xpc_connection_cancel(peer_conn);
             return;
