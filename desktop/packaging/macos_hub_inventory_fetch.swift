@@ -1,7 +1,7 @@
 // macos_hub_inventory_fetch.swift
 // Swift 5 / macOS 12+ — standalone, no main, no XPC, no Keychain, no installer.
 // Public contract: HubInventoryFetcher.fetch(token:completion:)
-// Tests use mocks only; no live network traffic in verification.
+// Tests use an in-process URLProtocol mock; no live network traffic in verification.
 
 import Foundation
 
@@ -21,32 +21,6 @@ public enum HubInventoryResult {
     case invalidResponse
 }
 
-// MARK: - URLSession abstraction (enables mock injection in tests)
-
-/// Minimal surface needed by the fetcher — mirrors the two URLSession methods it uses.
-public protocol HubURLSession: AnyObject {
-    func dataTask(
-        with request: URLRequest,
-        delegate: (URLSessionTaskDelegate & URLSessionDataDelegate)?
-    ) -> URLSessionDataTask
-    func finishTasksAndInvalidate()
-}
-
-extension URLSession: HubURLSession {
-    public func dataTask(
-        with request: URLRequest,
-        delegate: (URLSessionTaskDelegate & URLSessionDataDelegate)?
-    ) -> URLSessionDataTask {
-        // Route through the delegate-bearing variant added in macOS 12.
-        if #available(macOS 12.0, *) {
-            return dataTask(with: request, completionHandler: { _, _, _ in })
-                // ↑ placeholder; real traffic goes through the streaming delegate below.
-                // We override via the full initialiser on macOS 12.
-        }
-        return dataTask(with: request)
-    }
-}
-
 // MARK: - Fetcher
 
 /// Standalone Hub inventory fetcher.
@@ -59,7 +33,8 @@ public final class HubInventoryFetcher {
 
     // Hard limits
     private static let timeoutSeconds: TimeInterval = 6
-    private static let maxBodyBytes = 2 * 1024 * 1024  // 2 MiB
+    // Internal visibility so DEBUG tests can reference the limit.
+    static let maxBodyBytes = 2 * 1024 * 1024  // 2 MiB
 
     // -------------------------------------------------------------------------
     // MARK: Public entry point
@@ -69,11 +44,33 @@ public final class HubInventoryFetcher {
     /// - Parameters:
     ///   - token:      Non-empty, header-safe ASCII Bearer token.
     ///                 Never logged or included in any error payload.
-    ///   - sessionFactory: Injectable for testing; production callers omit it.
     ///   - completion: Called exactly once on an arbitrary queue.
     public static func fetch(
         token: String,
-        sessionFactory: ((URLSessionConfiguration) -> HubURLSession)? = nil,
+        completion: @escaping (HubInventoryResult) -> Void
+    ) {
+        _fetch(token: token, protocolClasses: nil, completion: completion)
+    }
+
+#if DEBUG
+    /// Testing-only entry point. Supplies URLProtocol subclasses into an
+    /// otherwise fixed ephemeral configuration so tests can intercept traffic
+    /// entirely in-process without any live network. Absent in production builds.
+    internal static func fetch(
+        token: String,
+        protocolClasses: [URLProtocol.Type],
+        completion: @escaping (HubInventoryResult) -> Void
+    ) {
+        _fetch(token: token, protocolClasses: protocolClasses, completion: completion)
+    }
+#endif
+
+    // -------------------------------------------------------------------------
+    // MARK: Shared implementation
+
+    private static func _fetch(
+        token: String,
+        protocolClasses: [AnyClass]?,
         completion: @escaping (HubInventoryResult) -> Void
     ) {
         // --- Validate token (non-empty, printable ASCII, no control chars) ---
@@ -95,7 +92,7 @@ public final class HubInventoryFetcher {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        // --- Session: ephemeral, no cookies/cache/credential/storage ---
+        // --- Session configuration: ephemeral, no cookies/cache/credential storage ---
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieAcceptPolicy = .never
         config.httpShouldSetCookies = false
@@ -104,14 +101,13 @@ public final class HubInventoryFetcher {
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.timeoutIntervalForRequest = timeoutSeconds
         config.timeoutIntervalForResource = timeoutSeconds
+        if let classes = protocolClasses {
+            config.protocolClasses = classes
+        }
 
-        // Create the streaming delegate operation (owns its own session).
-        let op = FetchOperation(
-            request: request,
-            sessionFactory: sessionFactory ?? { cfg in URLSession(configuration: cfg) },
-            config: config,
-            completion: completion
-        )
+        // FetchOperation is the delegate; URLSession retains it.
+        // start() creates the session and fires the task.
+        let op = FetchOperation(request: request, config: config, completion: completion)
         op.start()
     }
 }
@@ -119,56 +115,62 @@ public final class HubInventoryFetcher {
 // MARK: - Streaming delegate operation
 
 /// Encapsulates one fetch: session lifecycle, streaming accumulation, response
-/// parsing, and guaranteed single completion. Avoids strong cycles via weak
-/// self; invalidates the session when done.
-private final class FetchOperation: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
+/// parsing, and guaranteed single completion.
+///
+/// URLSession retains its delegate for the full session lifetime.  After
+/// `finishTasksAndInvalidate()` the session releases its delegate reference,
+/// breaking the retain cycle and allowing the graph to be collected.
+///
+/// All mutable state below is touched exclusively on the serial `delegateQueue`,
+/// so no secondary synchronisation is needed for them.  `completed` / `lock`
+/// guard the single-fire invariant across the two possible concurrent entry
+/// points (`didReceive response` cancel path and `didCompleteWithError`).
+///
+/// @unchecked Sendable: safe because all mutations are confined to the serial
+/// delegateQueue established at session creation time.
+private final class FetchOperation: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate,
+                                    @unchecked Sendable {
 
     private let request: URLRequest
-    private let sessionFactory: (URLSessionConfiguration) -> HubURLSession
     private let config: URLSessionConfiguration
     private let userCompletion: (HubInventoryResult) -> Void
 
-    private var session: HubURLSession?
+    // Set once in start(), never mutated again.
+    private var session: URLSession?
+
+    // Mutated only on the serial delegateQueue.
     private var buffer = Data()
     private var httpStatusCode: Int?
-    private var limitExceeded = false
+
+    // Guards the single-fire invariant; two delegate methods may concurrently
+    // attempt to call finish(with:) before a cancel propagates.
     private var completed = false
     private let lock = NSLock()
 
     init(
         request: URLRequest,
-        sessionFactory: @escaping (URLSessionConfiguration) -> HubURLSession,
         config: URLSessionConfiguration,
         completion: @escaping (HubInventoryResult) -> Void
     ) {
         self.request = request
-        self.sessionFactory = sessionFactory
         self.config = config
         self.userCompletion = completion
     }
 
     func start() {
-        // Session is created here; delegate is self so lifetime is managed.
-        let sess = sessionFactory(config)
-        self.session = sess
+        // Explicitly serial queue: all URLSession delegate callbacks arrive on
+        // exactly one thread, keeping delegate-state mutations race-free.
+        let q = OperationQueue()
+        q.maxConcurrentOperationCount = 1
+        q.name = "com.molokohub.hub-inventory-fetcher"
 
-        // Build task with streaming delegate.  For the production URLSession we
-        // use the delegate-on-task API available on macOS 12+; for mocks we call
-        // the protocol method directly.
-        let task: URLSessionDataTask
-        if let realSession = sess as? URLSession {
-            if #available(macOS 12.0, *) {
-                task = realSession.dataTask(with: request, delegate: self)
-            } else {
-                // Fallback: delegate set at session level (not injectable but
-                // macOS 12 is the deployment target so this branch is defensive).
-                task = realSession.dataTask(with: request)
-            }
-        } else {
-            // Mock path
-            task = sess.dataTask(with: request, delegate: self)
-        }
-        task.resume()
+        // URLSession(configuration:delegate:delegateQueue:) — the session retains
+        // `self` as delegate until invalidated.
+        let sess = URLSession(configuration: config, delegate: self, delegateQueue: q)
+        session = sess
+
+        // Plain dataTask — delegate callbacks drive all logic; no completion block.
+        sess.dataTask(with: request).resume()
     }
 
     // -------------------------------------------------------------------------
@@ -221,9 +223,8 @@ private final class FetchOperation: NSObject, URLSessionDataDelegate, URLSession
         dataTask: URLSessionDataTask,
         didReceive data: Data
     ) {
-        // Check size before appending — never buffer beyond limit.
+        // Enforce size limit before appending — never buffer beyond the ceiling.
         guard buffer.count + data.count <= HubInventoryFetcher.maxBodyBytes else {
-            limitExceeded = true
             dataTask.cancel()
             finish(with: .invalidResponse)
             return
@@ -274,7 +275,7 @@ private final class FetchOperation: NSObject, URLSessionDataDelegate, URLSession
         }
 
         // Must be valid UTF-8.
-        guard let _ = String(data: buffer, encoding: .utf8) else {
+        guard String(data: buffer, encoding: .utf8) != nil else {
             finish(with: .invalidResponse)
             return
         }
@@ -317,7 +318,8 @@ private final class FetchOperation: NSObject, URLSessionDataDelegate, URLSession
     // -------------------------------------------------------------------------
     // MARK: Helpers
 
-    /// Calls the user completion exactly once, then invalidates the session.
+    /// Calls the user completion exactly once, then invalidates the session so
+    /// URLSession releases its delegate reference (avoids a retain cycle).
     private func finish(with result: HubInventoryResult) {
         lock.lock()
         let alreadyDone = completed
@@ -328,102 +330,9 @@ private final class FetchOperation: NSObject, URLSessionDataDelegate, URLSession
 
         userCompletion(result)
 
-        // Invalidate so URLSession releases its delegate reference (avoids leak).
+        // finishTasksAndInvalidate lets any in-flight tasks drain before the
+        // session releases its strong reference to self (the delegate).
         session?.finishTasksAndInvalidate()
         session = nil
     }
 }
-
-// MARK: - Mock helpers (for tests only — not shipped to production)
-
-#if DEBUG
-
-/// Synchronous mock session for unit tests.  Calls delegate methods inline.
-public final class MockHubURLSession: HubURLSession {
-    public var stubbedStatusCode: Int
-    public var stubbedData: Data
-    public var stubbedError: Error?
-    public var invalidated = false
-
-    public init(statusCode: Int = 200, data: Data = Data(), error: Error? = nil) {
-        self.stubbedStatusCode = statusCode
-        self.stubbedData = data
-        self.stubbedError = error
-    }
-
-    public func dataTask(
-        with request: URLRequest,
-        delegate: (URLSessionTaskDelegate & URLSessionDataDelegate)?
-    ) -> URLSessionDataTask {
-        let task = MockURLSessionDataTask()
-        task.onResume = { [weak self] in
-            guard let self = self, let delegate = delegate else { return }
-
-            // Simulate the URLSession delegate call sequence synchronously.
-            if let error = self.stubbedError {
-                (delegate as? URLSessionTaskDelegate)?.urlSession?(
-                    URLSession.shared,
-                    task: task,
-                    didCompleteWithError: error
-                )
-                return
-            }
-
-            let response = HTTPURLResponse(
-                url: request.url!,
-                statusCode: self.stubbedStatusCode,
-                httpVersion: "HTTP/1.1",
-                headerFields: nil
-            )!
-
-            var allowBody = false
-            (delegate as? URLSessionDataDelegate)?.urlSession?(
-                URLSession.shared,
-                dataTask: task as! URLSessionDataTask,
-                didReceive: response,
-                completionHandler: { disposition in
-                    allowBody = disposition == .allow
-                }
-            )
-
-            if allowBody && !self.stubbedData.isEmpty {
-                (delegate as? URLSessionDataDelegate)?.urlSession?(
-                    URLSession.shared,
-                    dataTask: task as! URLSessionDataTask,
-                    didReceive: self.stubbedData
-                )
-            }
-
-            (delegate as? URLSessionTaskDelegate)?.urlSession?(
-                URLSession.shared,
-                task: task,
-                didCompleteWithError: nil
-            )
-        }
-        return task
-    }
-
-    public func finishTasksAndInvalidate() {
-        invalidated = true
-    }
-}
-
-/// Minimal URLSessionDataTask subclass the mock can vend.
-public final class MockURLSessionDataTask: URLSessionDataTask {
-    public var onResume: (() -> Void)?
-    private var _state: URLSessionTask.State = .suspended
-
-    public override var state: URLSessionTask.State { _state }
-
-    public override func resume() {
-        _state = .running
-        onResume?()
-        _state = .completed
-    }
-
-    public override func cancel() {
-        _state = .canceling
-    }
-}
-
-#endif
