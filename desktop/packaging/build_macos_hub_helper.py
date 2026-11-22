@@ -11,7 +11,7 @@ in desktop/packaging/ using xcrun-wrapped clang/swiftc.  It never installs
 anything, never touches launchd, never modifies an application bundle, and never
 accesses the keychain at build time.
 
-Outputs (placed atomically as a matched pair):
+Outputs (placed atomically as a matched pair via renamex_np RENAME_EXCL):
     droidhub-hub-helper          — signed Mach-O executable
     macos_hub_xpc_client.dylib   — shared dylib, install_name @rpath/…
 
@@ -21,9 +21,10 @@ stdlib only; no third-party dependencies.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,7 @@ from pathlib import Path
 
 _MIN_PYTHON = (3, 9)
 _ARCH = "arm64-apple-macosx12.0"
+_MACOS_TARGET = "arm64-apple-macosx12.0"
 _HELPER_ID = "site.molokohub.droidhub.hub-helper.v1"
 _DYLIB_ID = "site.molokohub.droidhub.hub-xpc-client.v1"
 _HELPER_OUT = "droidhub-hub-helper"
@@ -51,9 +53,55 @@ _C_XPC_CLIENT = "macos_hub_xpc_client.c"
 _SWIFT_INVENTORY = "macos_hub_helper_inventory.swift"
 _SWIFT_FETCH = "macos_hub_inventory_fetch.swift"
 
+# All six sources that must exist as regular files before building starts.
+_REQUIRED_SOURCES = (
+    _C_MAIN,
+    _C_LISTENER,
+    _C_KEYCHAIN,
+    _C_XPC_CLIENT,
+    _SWIFT_INVENTORY,
+    _SWIFT_FETCH,
+)
+
 _FRAMEWORKS = ["Security", "CoreFoundation"]
 
 _SHA1_RE = re.compile(r"^[0-9A-Fa-f]{40}$")
+
+# Absolute tool paths — do not rely on PATH for security-sensitive build tools.
+_XCRUN = "/usr/bin/xcrun"
+_CODESIGN = "/usr/bin/codesign"
+
+# macOS renamex_np flag: RENAME_EXCL — fail if destination already exists.
+_RENAME_EXCL = 0x00000004
+
+
+# ---------------------------------------------------------------------------
+# Atomic publish via renamex_np(2)
+# ---------------------------------------------------------------------------
+
+
+def _renamex_np(src: Path, dst: Path) -> None:
+    """Atomically rename src → dst with RENAME_EXCL.
+
+    Fails if *dst* already exists (including broken symlinks).  Uses
+    renamex_np(2) via ctypes so there is no TOCTOU race.
+    """
+    libc_name = ctypes.util.find_library("c")
+    if not libc_name:
+        raise OSError("Cannot locate libc for renamex_np")
+    libc = ctypes.CDLL(libc_name, use_errno=True)
+    renamex_np = libc.renamex_np
+    renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    renamex_np.restype = ctypes.c_int
+
+    rc = renamex_np(
+        str(src).encode(),
+        str(dst).encode(),
+        ctypes.c_uint(_RENAME_EXCL),
+    )
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), str(dst))
 
 
 # ---------------------------------------------------------------------------
@@ -79,11 +127,23 @@ def _run(args: list[str], *, cwd: Path | None = None) -> None:
         _die(f"executable not found: {args[0]!r}")
 
 
-def _xcrun(tool: str, sdk_path: str | None) -> list[str]:
-    """Return the prefix args to invoke a tool via xcrun (or bare tool)."""
-    if sdk_path:
-        return ["xcrun", "--sdk", sdk_path, tool]
-    return ["xcrun", tool]
+def _sdk_path() -> str:
+    """Return the macOS SDK filesystem path via xcrun --show-sdk-path."""
+    try:
+        result = subprocess.run(
+            [_XCRUN, "--sdk", "macosx", "--show-sdk-path"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        path = result.stdout.strip()
+        if not path:
+            _die("xcrun --show-sdk-path returned an empty string")
+        return path
+    except subprocess.CalledProcessError as exc:
+        _die(f"xcrun --show-sdk-path failed (exit {exc.returncode})")
+    except FileNotFoundError:
+        _die(f"executable not found: {_XCRUN!r}")
 
 
 def _framework_flags() -> list[str]:
@@ -121,12 +181,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="KEYCHAIN",
         help="Optional path to a .keychain-db to search for the signing identity.",
     )
-    p.add_argument(
-        "--sdk-path",
-        default=None,
-        metavar="SDK",
-        help="Optional SDK path passed to xcrun --sdk (e.g. macosx).",
-    )
     return p.parse_args(argv)
 
 
@@ -136,8 +190,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def _validate(ns: argparse.Namespace, src_dir: Path) -> None:
-    # -- signing identity
-    if not _SHA1_RE.match(ns.signing_identity):
+    # -- signing identity: must be exactly 40 hex chars (fullmatch).
+    if not _SHA1_RE.fullmatch(ns.signing_identity):
         _die(
             "--signing-identity must be exactly 40 hexadecimal characters "
             f"(got {ns.signing_identity!r})"
@@ -157,6 +211,18 @@ def _validate(ns: argparse.Namespace, src_dir: Path) -> None:
         if not kc.exists():
             _die(f"--signing-keychain path does not exist: {kc}")
 
+    # -- ALL six sources must be present as regular files before we start.
+    missing = [
+        name
+        for name in _REQUIRED_SOURCES
+        if not (src_dir / name).is_file()
+    ]
+    if missing:
+        _die(
+            "Missing required source file(s):\n"
+            + "\n".join(f"  {src_dir / name}" for name in missing)
+        )
+
 
 # ---------------------------------------------------------------------------
 # Build
@@ -170,12 +236,10 @@ def _codesign_cmd(
     signing_keychain: str | None,
 ) -> list[str]:
     cmd = [
-        "codesign",
+        _CODESIGN,
         "--sign", signing_identity,
         "--identifier", identifier,
-        "--options", "runtime",
-        "--strict",
-        "--timestamp",
+        "--timestamp=none",
         "--force",
     ]
     if signing_keychain:
@@ -184,36 +248,62 @@ def _codesign_cmd(
     return cmd
 
 
-def _verify_cmd(path: Path) -> list[str]:
-    return ["codesign", "--verify", "--strict", "--deep", str(path)]
+def _verify_cmd(path: Path, identifier: str) -> list[str]:
+    # Verify --strict with an exact requirement: designated identifier equals
+    # the known ID, and the signing leaf certificate is the codesigning anchor.
+    requirement = (
+        f'identifier "{identifier}" and certificate leaf[subject.CN] exists'
+    )
+    return [
+        _CODESIGN,
+        "--verify",
+        "--strict",
+        "-R", requirement,
+        str(path),
+    ]
 
 
 def build(ns: argparse.Namespace, src_dir: Path) -> None:
-    out_dir = Path(ns.output_dir)
+    out_dir = Path(ns.output_dir).resolve()
     signing_id = ns.signing_identity.upper()
-    sdk_path = ns.sdk_path
 
-    # Build inside a temporary sibling directory; rename atomically on success.
-    tmp_dir = out_dir.parent / (out_dir.name + ".tmp")
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir(parents=True)
+    # Resolve SDK once: filesystem path → pass as -isysroot / -sdk.
+    sdk = _sdk_path()
+    print(f"[sdk] {sdk}")
 
-    try:
-        _build_in(
-            tmp_dir=tmp_dir,
-            src_dir=src_dir,
-            signing_id=signing_id,
-            signing_keychain=ns.signing_keychain,
-            sdk_path=sdk_path,
-        )
-    except SystemExit:
-        # Clean up temp dir on failure before propagating.
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
+    # Create a unique temporary directory as a sibling of out_dir so that
+    # the final renamex_np rename is atomic (same filesystem).  We own this
+    # directory; clean it on any failure path.
+    with tempfile.TemporaryDirectory(
+        dir=out_dir.parent,
+        prefix=".build_tmp_",
+    ) as _tmp_root:
+        tmp_root = Path(_tmp_root)
 
-    # Atomic rename: publish only the complete, signed pair.
-    tmp_dir.rename(out_dir)
+        # Staging child: the directory we will atomically rename to out_dir.
+        staging = tmp_root / "staging"
+        staging.mkdir()
+
+        try:
+            _build_in(
+                staging=staging,
+                tmp_root=tmp_root,
+                src_dir=src_dir,
+                signing_id=signing_id,
+                signing_keychain=ns.signing_keychain,
+                sdk=sdk,
+            )
+        except SystemExit:
+            # TemporaryDirectory.__exit__ cleans up tmp_root on any exit.
+            raise
+
+        # Atomically publish: rename staging → out_dir.
+        # RENAME_EXCL fails if out_dir now exists (even as a broken symlink).
+        try:
+            _renamex_np(staging, out_dir)
+        except OSError as exc:
+            _die(f"atomic rename failed: {exc}\n  Destination: {out_dir}")
+
     print(f"Output written to: {out_dir}")
     print(f"  {out_dir / _HELPER_OUT}")
     print(f"  {out_dir / _DYLIB_OUT}")
@@ -221,150 +311,153 @@ def build(ns: argparse.Namespace, src_dir: Path) -> None:
 
 def _build_in(
     *,
-    tmp_dir: Path,
+    staging: Path,
+    tmp_root: Path,
     src_dir: Path,
     signing_id: str,
     signing_keychain: str | None,
-    sdk_path: str | None,
+    sdk: str,
 ) -> None:
-    # Intermediate object files live under a cache subdir.
-    cache_dir = tmp_dir / "cache"
+    # Intermediate object files and module cache live under tmp_root (not staging).
+    cache_dir = tmp_root / "obj"
     cache_dir.mkdir()
+    module_cache = tmp_root / "module-cache"
+    module_cache.mkdir()
 
-    # -----------------------------------------------------------------------
-    # Resolve source paths (may be absent on this branch; script is for the
-    # integrated worktree).  We build only what exists.
-    # -----------------------------------------------------------------------
     def src(name: str) -> Path:
         return src_dir / name
 
-    clang_prefix = _xcrun("clang", sdk_path)
-    swiftc_prefix = _xcrun("swiftc", sdk_path)
+    # /usr/bin/xcrun wraps clang/swiftc; pass tool name only (not sdk name).
+    clang_prefix = [_XCRUN, "clang"]
+    swiftc_prefix = [_XCRUN, "swiftc"]
 
-    target_flag = ["-target", _ARCH]
-    c_werror = ["-Werror"]
-    swift_werror = ["-warnings-as-errors"]
+    target_flag = ["-target", _MACOS_TARGET]
 
-    sdk_flags: list[str] = []
-    if sdk_path:
-        sdk_flags = ["-sdk", sdk_path]
+    # Clang: C17, Blocks, full warnings, errors.
+    c_compile_flags = [
+        "-std=c17",
+        "-fblocks",
+        "-Wall",
+        "-Wextra",
+        "-Wpedantic",
+        "-Werror",
+        "-isysroot", sdk,
+    ]
+
+    # swiftc: Swift 5, library parse, explicit SDK filesystem path.
+    swift_base_flags = [
+        "-swift-version", "5",
+        "-sdk", sdk,
+        "-module-cache-path", str(module_cache),
+        "-warnings-as-errors",
+    ]
 
     # -----------------------------------------------------------------------
-    # Compile C object files (only if the source is present)
+    # Compile C object files for the helper (main, listener, keychain)
     # -----------------------------------------------------------------------
 
     c_objects: list[Path] = []
 
-    def compile_c(c_src: Path, extra_defines: list[str] | None = None) -> Path:
+    def compile_c(c_src: Path, extra: list[str] | None = None) -> Path:
         obj = cache_dir / (c_src.stem + ".o")
         cmd = (
             clang_prefix
             + target_flag
-            + c_werror
+            + c_compile_flags
             + ["-c", str(c_src), "-o", str(obj)]
-            + (extra_defines or [])
+            + (extra or [])
         )
         print(f"[clang] {c_src.name}")
         _run(cmd)
         return obj
 
-    # macos_hub_helper_main.c — inject DH_HUB_SIGNING_CERT_SHA1 as a quoted
-    # C string containing the caller-supplied signing identity.
-    if src(_C_MAIN).exists():
-        cert_define = f'-DDH_HUB_SIGNING_CERT_SHA1="{signing_id}"'
-        c_objects.append(compile_c(src(_C_MAIN), [cert_define]))
-
-    if src(_C_LISTENER).exists():
-        c_objects.append(compile_c(src(_C_LISTENER)))
-
-    if src(_C_KEYCHAIN).exists():
-        c_objects.append(compile_c(src(_C_KEYCHAIN)))
+    # _C_MAIN: inject signing cert SHA1 as a quoted C string macro.
+    cert_define = f'-DDH_HUB_SIGNING_CERT_SHA1="{signing_id}"'
+    c_objects.append(compile_c(src(_C_MAIN), [cert_define]))
+    c_objects.append(compile_c(src(_C_LISTENER)))
+    c_objects.append(compile_c(src(_C_KEYCHAIN)))
 
     # -----------------------------------------------------------------------
-    # Compile Swift sources into object files
+    # Compile both Swift sources as a single -emit-executable invocation.
+    # Swift linker driver: use clang (ld-based) via -use-ld or just rely on
+    # swiftc's default linker; for object-only compilation we use -c then link
+    # via swiftc with explicit C objects to get the Swift runtime linked in.
     # -----------------------------------------------------------------------
 
-    swift_objects: list[Path] = []
+    swift_srcs = [src(_SWIFT_INVENTORY), src(_SWIFT_FETCH)]
 
-    swift_srcs = [
-        s for s in [src(_SWIFT_INVENTORY), src(_SWIFT_FETCH)] if s.exists()
-    ]
-
-    if swift_srcs:
-        # Compile all Swift sources together so they share the same module.
-        swift_obj = cache_dir / "swift_combined.o"
-        cmd = (
-            swiftc_prefix
-            + sdk_flags
-            + target_flag
-            + swift_werror
-            + ["-c", "-parse-as-library", "-module-name", "HubHelper"]
-            + [str(s) for s in swift_srcs]
-            + ["-o", str(swift_obj)]
-        )
-        print(f"[swiftc] {' '.join(s.name for s in swift_srcs)}")
-        _run(cmd)
-        swift_objects.append(swift_obj)
+    # Compile Swift sources to a single object file.
+    swift_obj = cache_dir / "swift_combined.o"
+    swift_compile_cmd = (
+        swiftc_prefix
+        + swift_base_flags
+        + target_flag
+        + [
+            "-c",
+            "-parse-as-library",
+            "-module-name", "HubHelper",
+        ]
+        + [str(s) for s in swift_srcs]
+        + ["-o", str(swift_obj)]
+    )
+    print(f"[swiftc] {' '.join(s.name for s in swift_srcs)}")
+    _run(swift_compile_cmd)
 
     # -----------------------------------------------------------------------
-    # Link the helper executable
+    # Link the helper executable via swiftc (brings in Swift runtime libs).
+    # Pass compiled C objects so they are included.  Use -use-ld=lld or leave
+    # swiftc to choose; pass frameworks via -Xlinker.
     # -----------------------------------------------------------------------
 
-    helper_path = tmp_dir / _HELPER_OUT
+    helper_path = staging / _HELPER_OUT
 
-    link_objects = c_objects + swift_objects
-    if link_objects:
-        cmd = (
-            clang_prefix
-            + target_flag
-            + [str(o) for o in link_objects]
-            + _framework_flags()
-            + ["-o", str(helper_path)]
-        )
-        print(f"[link] {_HELPER_OUT}")
-        _run(cmd)
-    else:
-        # No objects to link; create an empty placeholder so the script can
-        # still demonstrate the full flow on a branch without sources.
-        # (In production the integrated worktree will have all sources.)
-        _die("No source files found to build the helper; check the worktree.")
+    link_fw: list[str] = []
+    for fw in _FRAMEWORKS:
+        link_fw += ["-Xlinker", "-framework", "-Xlinker", fw]
 
-    # -----------------------------------------------------------------------
-    # Build the XPC client shared dylib
-    # -----------------------------------------------------------------------
-
-    dylib_path = tmp_dir / _DYLIB_OUT
-
-    if src(_C_XPC_CLIENT).exists():
-        dylib_obj = cache_dir / "macos_hub_xpc_client.o"
-        cmd = (
-            clang_prefix
-            + target_flag
-            + c_werror
-            + ["-c", str(src(_C_XPC_CLIENT)), "-o", str(dylib_obj)]
-        )
-        print(f"[clang] {_C_XPC_CLIENT}")
-        _run(cmd)
-
-        cmd = (
-            clang_prefix
-            + target_flag
-            + ["-dynamiclib"]
-            + ["-install_name", _DYLIB_INSTALL_NAME]
-            + _framework_flags()
-            + [str(dylib_obj)]
-            + ["-o", str(dylib_path)]
-        )
-        print(f"[link dylib] {_DYLIB_OUT}")
-        _run(cmd)
-    else:
-        _die(
-            f"Source file not found: {src(_C_XPC_CLIENT)}\n"
-            "  Build requires the integrated worktree with all source files."
-        )
+    swift_link_cmd = (
+        swiftc_prefix
+        + swift_base_flags
+        + target_flag
+        + ["-emit-executable"]
+        + [str(swift_obj)]
+        + [str(o) for o in c_objects]
+        + link_fw
+        + ["-o", str(helper_path)]
+    )
+    print(f"[link] {_HELPER_OUT}")
+    _run(swift_link_cmd)
 
     # -----------------------------------------------------------------------
-    # Sign both outputs
+    # Build the XPC client shared dylib (clang -dynamiclib).
+    # -----------------------------------------------------------------------
+
+    dylib_obj = cache_dir / "macos_hub_xpc_client.o"
+    cmd = (
+        clang_prefix
+        + target_flag
+        + c_compile_flags
+        + ["-c", str(src(_C_XPC_CLIENT)), "-o", str(dylib_obj)]
+    )
+    print(f"[clang] {_C_XPC_CLIENT}")
+    _run(cmd)
+
+    dylib_path = staging / _DYLIB_OUT
+    cmd = (
+        clang_prefix
+        + target_flag
+        + ["-dynamiclib"]
+        + ["-isysroot", sdk]
+        + ["-install_name", _DYLIB_INSTALL_NAME]
+        + _framework_flags()
+        + [str(dylib_obj)]
+        + ["-o", str(dylib_path)]
+    )
+    print(f"[link dylib] {_DYLIB_OUT}")
+    _run(cmd)
+
+    # -----------------------------------------------------------------------
+    # Sign both outputs — local cert, no timestamp, no hardened runtime.
     # -----------------------------------------------------------------------
 
     print(f"[codesign] {_HELPER_OUT}")
@@ -388,14 +481,14 @@ def _build_in(
     )
 
     # -----------------------------------------------------------------------
-    # Verify — strict, both artifacts
+    # Verify — strict, exact identifier + leaf requirement, both artifacts.
     # -----------------------------------------------------------------------
 
     print(f"[verify] {_HELPER_OUT}")
-    _run(_verify_cmd(helper_path))
+    _run(_verify_cmd(helper_path, _HELPER_ID))
 
     print(f"[verify] {_DYLIB_OUT}")
-    _run(_verify_cmd(dylib_path))
+    _run(_verify_cmd(dylib_path, _DYLIB_ID))
 
 
 # ---------------------------------------------------------------------------
