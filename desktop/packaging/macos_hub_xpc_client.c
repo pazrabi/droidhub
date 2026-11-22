@@ -40,6 +40,7 @@
  *   clang -std=c17 -Wall -Wextra -Wpedantic -Werror               \
  *         -fblocks -mmacosx-version-min=12.0                       \
  *         -dynamiclib -install_name @rpath/macos_hub_xpc_client.dylib \
+ *         -framework CoreFoundation -framework Security            \
  *         -o macos_hub_xpc_client.dylib                            \
  *         macos_hub_xpc_client.c
  *
@@ -52,6 +53,8 @@
  * ====================================================================== */
 #ifdef __APPLE__
 
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -75,6 +78,9 @@
 /** Maximum body the transport accepts from the server (2 MiB). */
 #define BODY_MAX_BYTES    ((size_t)(2u * 1024u * 1024u))
 
+/** Maximum byte length accepted for a code-signing requirement string. */
+#define REQ_MAX_BYTES     4096u
+
 /** Nanoseconds the client waits for a reply before returning code 2. */
 #define REPLY_TIMEOUT_NS  ((int64_t)10 * 1000000000LL)
 
@@ -90,6 +96,55 @@ enum dh_transport_code {
 };
 
 #define SERVER_STATUS_MAX 4
+
+/* -------------------------------------------------------------------------
+ * validate_requirement – pre-flight check before any XPC call.
+ *
+ * xpc_connection_set_peer_code_signing_requirement() may trap (abort/SIGILL)
+ * when handed a syntactically invalid requirement string even when the caller
+ * checks its return value, because the XPC framework can eagerly parse the
+ * string in a context that calls __builtin_trap() on failure.
+ *
+ * To guard against this we validate the string before touching XPC:
+ *   1. Bound byte length to REQ_MAX_BYTES (rejects absurdly long strings and
+ *      provides a finite CFString creation budget).
+ *   2. Create a CFString with kCFStringEncodingUTF8; failure means the bytes
+ *      are not valid UTF-8.
+ *   3. Pass the CFString to SecRequirementCreateWithString; failure means the
+ *      text is not a syntactically valid code-signing requirement.
+ *   4. Release all CF/Sec objects regardless of outcome.
+ *   5. Return 0 on success, -1 on any failure (caller returns UNAVAILABLE).
+ *
+ * No macOS version check is needed: CoreFoundation and Security have been
+ * present since macOS 10.0 and both APIs are always available on our
+ * minimum target (12.0).
+ * ---------------------------------------------------------------------- */
+static int validate_requirement(const char *req)
+{
+    /* 1. Bound length. strnlen with REQ_MAX_BYTES+1 tells us if the string
+     *    is strictly within the limit without scanning past the guard. */
+    if (strnlen(req, REQ_MAX_BYTES + 1u) > REQ_MAX_BYTES)
+        return -1;
+
+    /* 2. Validate UTF-8. */
+    CFStringRef cf_str = CFStringCreateWithCString(
+        kCFAllocatorDefault, req, kCFStringEncodingUTF8);
+    if (cf_str == NULL)
+        return -1;
+
+    /* 3. Validate requirement syntax. */
+    SecRequirementRef sec_req = NULL;
+    OSStatus status = SecRequirementCreateWithString(
+        cf_str, kSecCSDefaultFlags, &sec_req);
+
+    /* 4. Release in all cases. */
+    CFRelease(cf_str);
+    if (sec_req != NULL)
+        CFRelease(sec_req);
+
+    /* 5. Report outcome. */
+    return (status == errSecSuccess) ? 0 : -1;
+}
 
 /* -------------------------------------------------------------------------
  * Label allowlist guard
@@ -167,6 +222,12 @@ DH_EXPORT int dh_hub_list_devices(
         return DH_ERR_UNAVAILABLE;
 
     if (server_requirement == NULL || server_requirement[0] == '\0')
+        return DH_ERR_UNAVAILABLE;
+
+    /* Validate requirement length, UTF-8 and syntax before any XPC call.
+     * xpc_connection_set_peer_code_signing_requirement() may trap on a bad
+     * string even when its return value is checked; fail closed here. */
+    if (validate_requirement(server_requirement) != 0)
         return DH_ERR_UNAVAILABLE;
 
     /* --- Allocate per-call state ----------------------------------------- */
