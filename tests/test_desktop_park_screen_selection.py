@@ -181,6 +181,19 @@ class TestPlanScreenOpenInconsistentInputs(unittest.TestCase):
         self.assertEqual(plan.serials, ())
         self.assertIn("нет связи по USB", plan.feedback)
 
+    def test_missing_state_with_inconsistent_ready_usb(self) -> None:
+        """Устройство без записи в state_by_id не открывается, даже если
+        caller передал его в ready_usb_ids (несогласованный ввод)."""
+        plan = plan_screen_open(
+            ["GHOST"],
+            visible_ids=["GHOST"],
+            ready_usb_ids=["GHOST"],  # caller говорит «готов», но строки нет
+            state_by_id={},            # нет записи → должно блокироваться
+            names_by_id={},
+        )
+        self.assertEqual(plan.serials, ())
+        self.assertIn("нет связи по USB", plan.feedback)
+
 
 class TestPlanScreenOpenFourEligiblePreservingOrder(unittest.TestCase):
     """Четыре подходящих устройства — порядок visible сохраняется."""

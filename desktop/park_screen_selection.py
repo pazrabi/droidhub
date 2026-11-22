@@ -63,10 +63,6 @@ def _exclusion_reason(
         return _REASON_OFFLINE
 
     # Явно не готов по USB (caller считает авторитетным источником).
-    if not is_ready_usb:
-        return _REASON_USB_NOT_READY
-
-    # Не должно достигаться для eligibledevices, но безопасный fallback.
     return _REASON_USB_NOT_READY
 
 
@@ -118,12 +114,13 @@ def plan_screen_open(
     if not unique_selected:
         return ScreenOpenPlan(serials=(), feedback="")
 
-    visible_set: set[str] = set(visible_ids)
+    visible_list: list[str] = list(visible_ids)
+    visible_set: set[str] = set(visible_list)
     ready_usb_set: set[str] = set(ready_usb_ids)
 
     # Строим порядок видимых устройств для стабильной сортировки.
     visible_order: dict[str, int] = {}
-    for idx, vid in enumerate(visible_ids):
+    for idx, vid in enumerate(visible_list):
         if vid not in visible_order:
             visible_order[vid] = idx
 
@@ -142,7 +139,7 @@ def plan_screen_open(
         # 1. видимо в текущем фильтре,
         # 2. готово по USB (по авторитетному вводу caller-а),
         # 3. не имеет заблокированного состояния.
-        blocked_state = state in _BLOCKED_STATES if state is not None else False
+        blocked_state = state in _BLOCKED_STATES if state is not None else True
 
         if is_visible and is_ready_usb and not blocked_state:
             eligible.append(sid)
