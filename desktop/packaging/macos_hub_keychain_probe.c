@@ -52,10 +52,19 @@
  * Compile (macOS 12+, Xcode CLT)
  * --------------------------------
  *   clang -std=c17 -Wall -Wextra -Wpedantic -Werror \
+ *         -Wno-deprecated-declarations \
  *         -fblocks -mmacosx-version-min=12.0 \
  *         -framework Security \
  *         -o macos_hub_keychain_probe \
  *         macos_hub_keychain_probe.c
+ *
+ * Note: -Wno-deprecated-declarations suppresses the macOS 13 deprecation of
+ * SecKeychainOpen.  This is intentional: the throwaway file-keychain workflow
+ * has no equivalent in the data-protection keychain (which is not
+ * file-addressable).  The deprecated path is the only way to restrict
+ * SecItemCopyMatching to an explicit on-disk .keychain-db file and prevent
+ * any fallback to the user's login keychain.  This tool is test-only and will
+ * be removed before the deprecated API is withdrawn from the SDK.
  *
  * LINUX LIMITATION
  * ----------------
@@ -69,6 +78,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <errno.h>
+#include <limits.h>
 
 #include <dispatch/dispatch.h>
 #include <xpc/xpc.h>
@@ -123,10 +134,62 @@ static void enforce_label_prefix(const char *label)
 
 static void enforce_path_prefix(const char *path)
 {
-    if (strncmp(path, PATH_PREFIX, strlen(PATH_PREFIX)) != 0) {
+    /*
+     * BLOCKER-2 fix: resolve symlinks and dot-dot components first so that
+     * "/private/tmp/../etc/passwd" cannot pass the prefix check.  Then verify
+     * the resolved path falls inside /private/tmp/<process-name>/ as required
+     * by the goal ("inside the process's own explicit directory").
+     */
+    char resolved[PATH_MAX];
+    if (realpath(path, resolved) == NULL) {
+        /*
+         * realpath() fails when the file does not yet exist.  Accept ENOENT
+         * on the last component; resolve the directory and re-append the
+         * basename, then re-check.
+         */
+        char tmp[PATH_MAX];
+        if ((size_t)snprintf(tmp, sizeof(tmp), "%s", path) >= sizeof(tmp)) {
+            fprintf(stderr, "ERROR: keychain path too long.\n");
+            exit(EXIT_PATH_GUARD);
+        }
+        /* Split at last '/'. */
+        char *sep = strrchr(tmp, '/');
+        if (sep == NULL) {
+            fprintf(stderr, "ERROR: keychain path \"%s\" has no directory.\n", path);
+            exit(EXIT_PATH_GUARD);
+        }
+        *sep = '\0';
+        const char *basename_part = sep + 1;
+        char dir_resolved[PATH_MAX];
+        if (realpath(tmp, dir_resolved) == NULL) {
+            fprintf(stderr,
+                "ERROR: cannot resolve directory of keychain path \"%s\": %s\n",
+                path, strerror(errno));
+            exit(EXIT_PATH_GUARD);
+        }
+        if ((size_t)snprintf(resolved, sizeof(resolved), "%s/%s",
+                             dir_resolved, basename_part) >= sizeof(resolved)) {
+            fprintf(stderr, "ERROR: resolved keychain path too long.\n");
+            exit(EXIT_PATH_GUARD);
+        }
+    }
+
+    /* 1. Must be under /private/tmp/. */
+    if (strncmp(resolved, PATH_PREFIX, strlen(PATH_PREFIX)) != 0) {
         fprintf(stderr,
-            "ERROR: keychain path \"%s\" must be under \"%s\".\n",
-            path, PATH_PREFIX);
+            "ERROR: keychain path \"%s\" must resolve under \"%s\" (resolved: \"%s\").\n",
+            path, PATH_PREFIX, resolved);
+        exit(EXIT_PATH_GUARD);
+    }
+
+    /* 2. Must be inside a direct subdirectory of /private/tmp/ (process directory). */
+    const char *after_prefix = resolved + strlen(PATH_PREFIX);
+    /* There must be at least one more '/' after the prefix, meaning the file
+     * is inside a subdirectory, not directly in /private/tmp/. */
+    if (strchr(after_prefix, '/') == NULL) {
+        fprintf(stderr,
+            "ERROR: keychain path \"%s\" must be inside a subdirectory of \"%s\", "
+            "not directly in it.\n", path, PATH_PREFIX);
         exit(EXIT_PATH_GUARD);
     }
 }
@@ -166,41 +229,64 @@ static int keychain_probe(const char *kc_path)
     int ok = 0;
 
     if (svc && acct && expected_label) {
-        CFDictionaryRef query = (__bridge_retained CFDictionaryRef)@{
-            /* scope */
-            (__bridge id)kSecClass               : (__bridge id)kSecClassGenericPassword,
-            (__bridge id)kSecAttrService         : (__bridge id)svc,
-            (__bridge id)kSecAttrAccount         : (__bridge id)acct,
-            /* restrict to our throwaway keychain only */
-            (__bridge id)kSecMatchSearchList     : (__bridge id)search_list,
-            /* disable UI/agent interaction – fail closed */
-            (__bridge id)kSecUseAuthenticationUI : (__bridge id)kSecUseAuthenticationUIFail,
-            /* return attributes only; never return secret bytes */
-            (__bridge id)kSecReturnAttributes    : @YES,
-            (__bridge id)kSecMatchLimit          : (__bridge id)kSecMatchLimitOne,
+        /*
+         * BLOCKER-1 fix: replace ObjC ARC literal syntax (__bridge_retained,
+         * @{}, @YES) with pure CoreFoundation C API so the file compiles as
+         * plain C17 (clang -std=c17) without -x objective-c / -fobjc-arc.
+         * MEDIUM fix: add explicit kSecReturnData = kCFBooleanFalse as
+         * defence-in-depth; never return secret bytes even by API default.
+         */
+        const void *keys[] = {
+            kSecClass,
+            kSecAttrService,
+            kSecAttrAccount,
+            kSecMatchSearchList,          /* restrict to throwaway keychain */
+            kSecUseAuthenticationUI,      /* disable UI/agent – fail closed */
+            kSecReturnAttributes,         /* return attributes only */
+            kSecReturnData,               /* explicitly suppress secret bytes */
+            kSecMatchLimit,
         };
-
-        CFTypeRef result = NULL;
-        st = SecItemCopyMatching(query, &result);
-        CFRelease(query);
-
-        if (st == errSecSuccess && result != NULL &&
-            CFGetTypeID(result) == CFDictionaryGetTypeID()) {
-            CFStringRef label = CFDictionaryGetValue(
-                (CFDictionaryRef)result, kSecAttrLabel);
-            /* Compare label; never log item data. */
-            if (label != NULL &&
-                CFStringCompare(label, expected_label, 0) == kCFCompareEqualTo) {
-                ok = 1;
-            } else {
-                fprintf(stderr, "keychain_probe: label mismatch.\n");
-            }
+        const void *vals[] = {
+            kSecClassGenericPassword,
+            svc,
+            acct,
+            search_list,
+            kSecUseAuthenticationUIFail,
+            kCFBooleanTrue,               /* kSecReturnAttributes */
+            kCFBooleanFalse,              /* kSecReturnData – never secret bytes */
+            kSecMatchLimitOne,
+        };
+        CFDictionaryRef query = CFDictionaryCreate(
+            NULL, keys, vals,
+            (CFIndex)(sizeof(keys) / sizeof(keys[0])),
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks);
+        if (query == NULL) {
+            /* allocation failure – fail closed */
+            fprintf(stderr, "keychain_probe: CFDictionaryCreate failed.\n");
         } else {
-            fprintf(stderr, "keychain_probe: SecItemCopyMatching failed (%d).\n", (int)st);
-        }
+            CFTypeRef result = NULL;
+            st = SecItemCopyMatching(query, &result);
+            CFRelease(query);
 
-        if (result) CFRelease(result);
-    }
+            if (st == errSecSuccess && result != NULL &&
+                CFGetTypeID(result) == CFDictionaryGetTypeID()) {
+                CFStringRef label = CFDictionaryGetValue(
+                    (CFDictionaryRef)result, kSecAttrLabel);
+                /* Compare label; never log item data. */
+                if (label != NULL &&
+                    CFStringCompare(label, expected_label, 0) == kCFCompareEqualTo) {
+                    ok = 1;
+                } else {
+                    fprintf(stderr, "keychain_probe: label mismatch.\n");
+                }
+            } else {
+                fprintf(stderr, "keychain_probe: SecItemCopyMatching failed (%d).\n", (int)st);
+            }
+
+            if (result) CFRelease(result);
+        } /* end if (query) */
+    } /* end if (svc && acct && expected_label) */
 
     CFRelease(search_list);
     CFRelease(kc);
@@ -302,8 +388,18 @@ static void run_ping(const char *label, const char *peer_requirement)
 
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     _Atomic int *result    = malloc(sizeof(_Atomic int));
+    if (!result) {
+        perror("ping: malloc result");
+        xpc_release(conn);
+        exit(EXIT_XPC_SETUP);
+    }
     _Atomic int *signalled = malloc(sizeof(_Atomic int));
-    if (!result || !signalled) { perror("malloc"); exit(EXIT_XPC_SETUP); }
+    if (!signalled) {
+        perror("ping: malloc signalled");
+        free(result);           /* MEDIUM fix: release result on second-malloc failure */
+        xpc_release(conn);
+        exit(EXIT_XPC_SETUP);
+    }
     atomic_store(result,    EXIT_TIMEOUT);
     atomic_store(signalled, 0);
 
