@@ -1,13 +1,13 @@
 """Тесты модуля desktop.park_screen_selection.
 
 Покрывают следующие сценарии:
-- Смешанные видимые/скрытые/не готовые устройства.
+- Смешанные видимые/скрытые/не готовые устройства (точные имена, порядок, текст).
 - Дубликаты в выборке.
 - Нет подходящих устройств (пустой результат).
 - Пустой выбор.
 - Нет исключений (feedback пустой).
 - Несогласованные входные данные (ready_usb говорит «готово», state «нет»).
-- Четыре подходящих устройства — порядок сохраняется.
+- Четыре подходящих устройства — порядок visible сохраняется (публичный контракт).
 - Усечение отображаемых исключений с суммарным счётчиком.
 """
 
@@ -78,17 +78,15 @@ class TestPlanScreenOpenDuplicates(unittest.TestCase):
 
 
 class TestPlanScreenOpenMixedVisibleHiddenNotReady(unittest.TestCase):
-    """Смешанные видимые, скрытые и не готовые устройства."""
+    """Смешанные видимые, скрытые и не готовые устройства — точные имена и текст."""
 
     def test_mixed_scenario(self) -> None:
         # A — видим и готов → открывается
         # B — скрыт (не в visible_ids) → исключён («скрыт фильтром»)
-        # C — видим и готов по USB, но state=hub_only → исключён
-        # D — видим, готов, но state=hub_only → исключён
-        # Порядок исключённых: сначала видимые (C, D), потом скрытые (B).
-        # Показываются первые 2: C и D → содержат причину hub_only;
-        # B свёрнут в «и ещё 1».
-        # Проверяем, что B-исключение учтено в счётчике и что hub_only видна.
+        # C — видим, hub_only → исключён («доступен только через Hub»)
+        # D — видим, hub_only, не в ready_usb → исключён («доступен только через Hub»)
+        # Порядок исключённых: сначала видимые (C, D по visible_order), потом скрытые (B).
+        # Показываются первые 2: C (OnePlus) и D (Realme); B свёрнут в «и ещё 1».
         plan = plan_screen_open(
             ["A", "B", "C", "D"],
             visible_ids=["A", "C", "D"],
@@ -97,11 +95,11 @@ class TestPlanScreenOpenMixedVisibleHiddenNotReady(unittest.TestCase):
             names_by_id={"A": "Pixel", "B": "Redmi", "C": "OnePlus", "D": "Realme"},
         )
         self.assertEqual(plan.serials, ("A",))
-        self.assertIn("Пропущено 3", plan.feedback)
-        # B скрыт → свёрнут в «и ещё 1»
-        self.assertIn("и ещё 1", plan.feedback)
-        # C и D → 'доступен только через Hub' (оба видимы и идут первыми)
-        self.assertIn("доступен только через Hub", plan.feedback)
+        self.assertEqual(
+            plan.feedback,
+            "Пропущено 3: OnePlus (доступен только через Hub),"
+            " Realme (доступен только через Hub) и ещё 1",
+        )
 
 
 class TestPlanScreenOpenNoEligible(unittest.TestCase):
@@ -195,8 +193,8 @@ class TestPlanScreenOpenInconsistentInputs(unittest.TestCase):
         self.assertIn("нет связи по USB", plan.feedback)
 
 
-class TestPlanScreenOpenFourEligiblePreservingOrder(unittest.TestCase):
-    """Четыре подходящих устройства — порядок visible сохраняется."""
+class TestPlanScreenOpenVisibleOrderContract(unittest.TestCase):
+    """Публичный контракт: serials упорядочены строго по visible_ids."""
 
     def test_four_eligible_visible_order(self) -> None:
         # Видимый порядок: W X Y Z; выбор в другом порядке.
@@ -204,16 +202,23 @@ class TestPlanScreenOpenFourEligiblePreservingOrder(unittest.TestCase):
             ["Z", "X", "W", "Y"],
             visible_ids=["W", "X", "Y", "Z"],
             ready_usb_ids=["W", "X", "Y", "Z"],
-            state_by_id={
-                "W": "device",
-                "X": "device",
-                "Y": "device",
-                "Z": "device",
-            },
+            state_by_id={"W": "device", "X": "device", "Y": "device", "Z": "device"},
             names_by_id={},
         )
         # Все четыре открываются в visible-порядке.
         self.assertEqual(plan.serials, ("W", "X", "Y", "Z"))
+        self.assertEqual(plan.feedback, "")
+
+    def test_partial_selection_preserves_visible_order(self) -> None:
+        # Выбраны только Y и W; visible-порядок W < Y.
+        plan = plan_screen_open(
+            ["Y", "W"],
+            visible_ids=["W", "X", "Y", "Z"],
+            ready_usb_ids=["W", "Y"],
+            state_by_id={"W": "device", "Y": "device"},
+            names_by_id={},
+        )
+        self.assertEqual(plan.serials, ("W", "Y"))
         self.assertEqual(plan.feedback, "")
 
 
@@ -226,12 +231,7 @@ class TestPlanScreenOpenSummaryCap(unittest.TestCase):
             ["E1", "E2", "E3", "E4"],
             visible_ids=["E1", "E2", "E3", "E4"],
             ready_usb_ids=["E1"],
-            state_by_id={
-                "E1": "device",
-                "E2": "device",
-                "E3": "device",
-                "E4": "device",
-            },
+            state_by_id={"E1": "device", "E2": "device", "E3": "device", "E4": "device"},
             names_by_id={"E2": "Poco X5", "E3": "Mi 11", "E4": "Redmi 9"},
         )
         self.assertEqual(plan.serials, ("E1",))

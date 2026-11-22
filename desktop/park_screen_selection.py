@@ -1,8 +1,5 @@
 """Вспомогательный модуль: логика выбора экранов из парковки для DroidHub Desktop.
 
-Используется PreviewGrid для расчёта итогового набора устройств к открытию и
-формирования краткого локализованного сообщения об исключённых устройствах.
-
 Не содержит I/O, сетевого кода, зависимостей от Tk или ADB.
 """
 
@@ -27,42 +24,20 @@ _REASON_USB_NOT_READY = "USB не готов"
 _MAX_DISPLAYED = 2
 
 
-def _device_label(device_id: str, names_by_id: Mapping[str, str]) -> str:
-    """Возвращает отображаемое имя устройства или его ID."""
-    name = names_by_id.get(device_id)
-    return name if name else device_id
-
-
-def _exclusion_reason(
-    device_id: str,
-    *,
-    is_visible: bool,
-    state: str | None,
-    is_ready_usb: bool,
-) -> str:
-    """Определяет причину исключения устройства из набора к открытию.
+def _exclusion_reason(*, is_visible: bool, state: str | None) -> str:
+    """Возвращает причину исключения устройства из набора к открытию.
 
     Если устройство скрыто фильтром, причина фильтра имеет приоритет над
-    причиной состояния.  Однако проверка состояния выполняется всегда, чтобы
-    гарантировать, что заблокированные состояния никогда не преодолевают фильтр.
+    причиной состояния.
     """
-    # Если устройство скрыто фильтром — сообщаем об этом первым.
     if not is_visible:
         return _REASON_HIDDEN
-
-    # Явно заблокированные состояния (даже если is_ready_usb=True).
     if state == "hub_only":
         return _REASON_HUB_ONLY
     if state == "unauthorized":
         return _REASON_UNAUTHORIZED
-    if state in ("offline", "disconnected"):
+    if state in ("offline", "disconnected") or state is None:
         return _REASON_OFFLINE
-
-    # Строка состояния отсутствует → устройство не найдено в таблице.
-    if state is None:
-        return _REASON_OFFLINE
-
-    # Явно не готов по USB (caller считает авторитетным источником).
     return _REASON_USB_NOT_READY
 
 
@@ -124,24 +99,14 @@ def plan_screen_open(
         if vid not in visible_order:
             visible_order[vid] = idx
 
-    selected_set: set[str] = set(unique_selected)
-
     # Разбиваем выбранные устройства на eligible (к открытию) и excluded.
     eligible: list[str] = []
-    excluded: list[str] = []  # те, что не пройдут
+    excluded: list[str] = []
 
     for sid in unique_selected:
-        state = state_by_id.get(sid)  # None если нет записи
-        is_visible = sid in visible_set
-        is_ready_usb = sid in ready_usb_set
-
-        # Устройство открывается, только если оно:
-        # 1. видимо в текущем фильтре,
-        # 2. готово по USB (по авторитетному вводу caller-а),
-        # 3. не имеет заблокированного состояния.
+        state = state_by_id.get(sid)
         blocked_state = state in _BLOCKED_STATES if state is not None else True
-
-        if is_visible and is_ready_usb and not blocked_state:
+        if sid in visible_set and sid in ready_usb_set and not blocked_state:
             eligible.append(sid)
         else:
             excluded.append(sid)
@@ -152,24 +117,16 @@ def plan_screen_open(
         key=lambda s: visible_order.get(s, len(visible_order)),
     )
 
-    # Нет исключений или нет вообще никаких выбранных → пустой feedback.
     if not excluded:
         return ScreenOpenPlan(serials=tuple(eligible_ordered), feedback="")
 
-    # Если все устройства открываются (excluded пуст), мы уже вернулись выше.
-    # Если все исключены → eligible_ordered пуст, но feedback нужен.
-
     # Стабильный порядок исключённых:
     # сначала видимые (в порядке отображения), затем скрытые/отсутствующие (по ID).
-    visible_excluded = [s for s in excluded if s in visible_set]
-    hidden_excluded = [s for s in excluded if s not in visible_set]
-
     visible_excluded_sorted = sorted(
-        visible_excluded,
+        (s for s in excluded if s in visible_set),
         key=lambda s: visible_order.get(s, len(visible_order)),
     )
-    hidden_excluded_sorted = sorted(hidden_excluded)
-
+    hidden_excluded_sorted = sorted(s for s in excluded if s not in visible_set)
     ordered_excluded = visible_excluded_sorted + hidden_excluded_sorted
 
     n_excluded = len(ordered_excluded)
@@ -177,21 +134,19 @@ def plan_screen_open(
     # Строим список деталей для сообщения.
     detail_items: list[str] = []
     for sid in ordered_excluded[:_MAX_DISPLAYED]:
-        label = _device_label(sid, names_by_id)
+        label = names_by_id.get(sid) or sid
         reason = _exclusion_reason(
-            sid,
             is_visible=sid in visible_set,
             state=state_by_id.get(sid),
-            is_ready_usb=sid in ready_usb_set,
         )
         detail_items.append(f"{label} ({reason})")
 
-    rest = n_excluded - len(detail_items)
-
     details_str = ", ".join(detail_items)
+    rest = n_excluded - len(detail_items)
     if rest > 0:
         details_str += f" и ещё {rest}"
 
-    feedback = f"Пропущено {n_excluded}: {details_str}"
-
-    return ScreenOpenPlan(serials=tuple(eligible_ordered), feedback=feedback)
+    return ScreenOpenPlan(
+        serials=tuple(eligible_ordered),
+        feedback=f"Пропущено {n_excluded}: {details_str}",
+    )
