@@ -34,6 +34,19 @@
  *     allowed flag being consistent across concurrent calls.
  *
  * ==========================================================================
+ *
+ *   int dh_hub_read_keychain_token_interactive(void *out, size_t capacity,
+ *                                              size_t *written);
+ *
+ *   Identical ABI to dh_hub_read_keychain_token, except:
+ *   - User interaction (one macOS Keychain prompt) IS allowed for the
+ *     duration of this single call; the previous interaction state is
+ *     restored unconditionally before the function returns.
+ *   - Intended ONLY for explicit human invocation (e.g. --authorize CLI).
+ *   - MUST NOT be called from XPC provider paths or automated contexts.
+ *   - If enabling interaction fails the call returns 1 without reading.
+ *
+ * ==========================================================================
  * Keychain item identity (production)
  * ==========================================================================
  *
@@ -63,6 +76,11 @@
  *
  *   Production builds NEVER read the fixture item; there is no runtime
  *   override path.
+ *
+ *   WARNING: A binary compiled with DH_HUB_TEST_FIXTURE MUST NOT be used
+ *   in production.  The test fixture item coordinates differ intentionally
+ *   from production; mixing binaries will silently read the wrong item.
+ *   Test binaries must be clearly labelled and kept out of production paths.
  *
  * ==========================================================================
  * Build notes
@@ -127,6 +145,139 @@
 #endif
 
 /* -------------------------------------------------------------------------
+ * Internal helpers
+ * ------------------------------------------------------------------------- */
+
+/*
+ * dh_hub_build_query
+ *
+ * Builds a CFDictionary suitable for SecItemCopyMatching to fetch the raw
+ * data of the single Keychain item identified by DH_ACTIVE_SERVICE /
+ * DH_ACTIVE_ACCOUNT.
+ *
+ * Returns the query dictionary (caller must CFRelease) or NULL on allocation
+ * failure.  service_out and account_out receive the CFStringRef values used
+ * as dictionary values so the caller can release them together with the
+ * dictionary.  On failure both are set to NULL.
+ *
+ * The caller must release:
+ *   CFRelease(query)        -- the returned dictionary
+ *   CFRelease(*service_out) -- if non-NULL
+ *   CFRelease(*account_out) -- if non-NULL
+ */
+static CFDictionaryRef
+dh_hub_build_query(CFStringRef *service_out, CFStringRef *account_out)
+{
+    *service_out = NULL;
+    *account_out = NULL;
+
+    CFStringRef service_cf =
+        CFStringCreateWithCStringNoCopy(kCFAllocatorDefault,
+                                        DH_ACTIVE_SERVICE,
+                                        kCFStringEncodingUTF8,
+                                        kCFAllocatorNull);
+    CFStringRef account_cf =
+        CFStringCreateWithCStringNoCopy(kCFAllocatorDefault,
+                                        DH_ACTIVE_ACCOUNT,
+                                        kCFStringEncodingUTF8,
+                                        kCFAllocatorNull);
+
+    if (!service_cf || !account_cf) {
+        if (service_cf) { CFRelease(service_cf); }
+        if (account_cf) { CFRelease(account_cf); }
+        return NULL;
+    }
+
+    const void *query_keys[] = {
+        kSecClass,
+        kSecAttrService,
+        kSecAttrAccount,
+        kSecReturnData,
+        kSecMatchLimit
+    };
+    const void *query_vals[] = {
+        kSecClassGenericPassword,
+        service_cf,
+        account_cf,
+        kCFBooleanTrue,
+        kSecMatchLimitOne
+    };
+
+    CFDictionaryRef query = CFDictionaryCreate(
+        kCFAllocatorDefault,
+        query_keys,
+        query_vals,
+        (CFIndex)(sizeof(query_keys) / sizeof(query_keys[0])),
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+
+    if (!query) {
+        CFRelease(service_cf);
+        CFRelease(account_cf);
+        return NULL;
+    }
+
+    *service_out = service_cf;
+    *account_out = account_cf;
+    return query;
+}
+
+/*
+ * dh_hub_execute_query
+ *
+ * Executes a pre-built SecItemCopyMatching query and copies the resulting
+ * data into *out (up to DH_HUB_TOKEN_MAX and `capacity` bytes).
+ *
+ * Returns 0 on success (*written set to byte count), 1 on any failure
+ * (*written set to 0).  Does not modify the user-interaction flag.
+ */
+static int
+dh_hub_execute_query(CFDictionaryRef query,
+                     void *out, size_t capacity, size_t *written)
+{
+    int result = 1;
+    CFTypeRef raw_result = NULL;
+
+    OSStatus copy_status = SecItemCopyMatching(query, &raw_result);
+
+    if (copy_status != errSecSuccess || !raw_result) {
+        if (raw_result) { CFRelease(raw_result); }
+        return 1;
+    }
+
+    /* Type-check: SecItemCopyMatching with kSecReturnData must give CFData. */
+    if (CFGetTypeID(raw_result) != CFDataGetTypeID()) {
+        CFRelease(raw_result);
+        return 1;
+    }
+
+    CFDataRef data_ref = (CFDataRef)raw_result;
+    CFIndex data_len = CFDataGetLength(data_ref);
+
+    if (data_len < 0) {
+        CFRelease(data_ref);
+        return 1;
+    }
+
+    size_t token_len = (size_t)data_len;
+
+    if (token_len > DH_HUB_TOKEN_MAX || token_len > capacity) {
+        CFRelease(data_ref);
+        return 1;
+    }
+
+    if (token_len > 0) {
+        memcpy(out, CFDataGetBytePtr(data_ref), token_len);
+    }
+
+    *written = token_len;
+    result = 0;
+
+    CFRelease(data_ref);
+    return result;
+}
+
+/* -------------------------------------------------------------------------
  * Public ABI
  * ------------------------------------------------------------------------- */
 
@@ -144,6 +295,9 @@
  *
  * Returns:
  *   0 on success, 1 on any failure (see ABI contract above).
+ *
+ * This function NEVER shows a user-interaction prompt.  It is safe to call
+ * from XPC provider paths and automated contexts.
  */
 int dh_hub_read_keychain_token(void *out, size_t capacity, size_t *written)
 {
@@ -188,123 +342,110 @@ int dh_hub_read_keychain_token(void *out, size_t capacity, size_t *written)
     }
 
     /* -----------------------------------------------------------------------
-     * Step 2: Query the Keychain item.
-     * kSecMatchLimit defaults to kSecMatchLimitOne so we get at most one result.
-     * kSecReturnData = kCFBooleanTrue causes the data to be returned directly.
+     * Step 2: Build and execute the Keychain query.
      * ----------------------------------------------------------------------- */
     int result = 1; /* pessimistic default */
-    CFDataRef data_ref = NULL;
+    CFStringRef service_cf = NULL;
+    CFStringRef account_cf = NULL;
 
-    CFStringRef service_cf =
-        CFStringCreateWithCStringNoCopy(kCFAllocatorDefault,
-                                        DH_ACTIVE_SERVICE,
-                                        kCFStringEncodingUTF8,
-                                        kCFAllocatorNull);
-    CFStringRef account_cf =
-        CFStringCreateWithCStringNoCopy(kCFAllocatorDefault,
-                                        DH_ACTIVE_ACCOUNT,
-                                        kCFStringEncodingUTF8,
-                                        kCFAllocatorNull);
-
-    if (!service_cf || !account_cf) {
-        goto restore;
-    }
-
-    {
-        const void *query_keys[] = {
-            kSecClass,
-            kSecAttrService,
-            kSecAttrAccount,
-            kSecReturnData,
-            kSecMatchLimit
-        };
-        const void *query_vals[] = {
-            kSecClassGenericPassword,
-            service_cf,
-            account_cf,
-            kCFBooleanTrue,
-            kSecMatchLimitOne
-        };
-
-        CFDictionaryRef query = CFDictionaryCreate(
-            kCFAllocatorDefault,
-            query_keys,
-            query_vals,
-            (CFIndex)(sizeof(query_keys) / sizeof(query_keys[0])),
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks);
-
-        if (!query) {
-            goto restore;
-        }
-
-        CFTypeRef raw_result = NULL;
-        OSStatus copy_status = SecItemCopyMatching(query, &raw_result);
+    CFDictionaryRef query = dh_hub_build_query(&service_cf, &account_cf);
+    if (query) {
+        result = dh_hub_execute_query(query, out, capacity, written);
         CFRelease(query);
-
-        if (copy_status != errSecSuccess || !raw_result) {
-            /* Not found, auth failure, or any other error. */
-            if (raw_result) {
-                CFRelease(raw_result);
-            }
-            goto restore;
-        }
-
-        /* -----------------------------------------------------------------------
-         * Step 3: Type-check the result.
-         * SecItemCopyMatching with kSecReturnData must return CFDataRef.
-         * Reject anything else defensively.
-         * ----------------------------------------------------------------------- */
-        if (CFGetTypeID(raw_result) != CFDataGetTypeID()) {
-            CFRelease(raw_result);
-            goto restore;
-        }
-
-        data_ref = (CFDataRef)raw_result;
     }
+
+    if (service_cf) { CFRelease(service_cf); }
+    if (account_cf) { CFRelease(account_cf); }
 
     /* -----------------------------------------------------------------------
-     * Step 4: Bounds-check and copy.
-     * Enforce DH_HUB_TOKEN_MAX and the caller's capacity in one expression.
-     * No partial writes: if the token is larger than either limit, fail.
+     * Step 3: Release resources and restore interaction flag unconditionally.
      * ----------------------------------------------------------------------- */
-    {
-        CFIndex data_len = CFDataGetLength(data_ref);
-
-        if (data_len < 0) {
-            /* Unexpected; CFData length should never be negative. */
-            goto restore;
-        }
-
-        size_t token_len = (size_t)data_len;
-
-        if (token_len > DH_HUB_TOKEN_MAX || token_len > capacity) {
-            goto restore;
-        }
-
-        if (token_len > 0) {
-            memcpy(out, CFDataGetBytePtr(data_ref), token_len);
-        }
-
-        *written = token_len;
-        result = 0;
-    }
-
-restore:
-    /* -----------------------------------------------------------------------
-     * Step 5: Release resources and restore interaction flag unconditionally.
-     * ----------------------------------------------------------------------- */
-    if (data_ref) {
-        CFRelease(data_ref);
-    }
-    if (service_cf) {
-        CFRelease(service_cf);
-    }
-    if (account_cf) {
-        CFRelease(account_cf);
-    }
 
     /* Restore previous user-interaction state regardless of read outcome. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    (void)SecKeychainSetUserInteractionAllowed(prev_interaction);
+#pragma clang diagnostic pop
+
+    if (result != 0) {
+        *written = 0;
+    }
+
+    return result;
+}
+
+/*
+ * dh_hub_read_keychain_token_interactive
+ *
+ * Identical ABI to dh_hub_read_keychain_token, but allows one macOS Keychain
+ * UI prompt to appear during this call.  The previous user-interaction state
+ * is saved before the call and restored unconditionally afterward.
+ *
+ * MUST only be called from an explicit human CLI invocation (e.g. --authorize).
+ * MUST NOT be called from XPC provider paths or any automated context.
+ *
+ * Returns:
+ *   0 on success (token readable and non-empty), 1 on any failure.
+ *   *written is always 0 on return code 1.
+ */
+int dh_hub_read_keychain_token_interactive(void *out, size_t capacity,
+                                           size_t *written)
+{
+    /* Initialise *written unconditionally so callers never see garbage. */
+    if (written) {
+        *written = 0;
+    }
+
+    /* Reject obviously invalid arguments before touching the Keychain. */
+    if (!out || !written) {
+        return 1;
+    }
+
+    /* -----------------------------------------------------------------------
+     * Step 1: Save current user-interaction state, then enable interaction
+     * for the bounded duration of this single query.
+     * ----------------------------------------------------------------------- */
+    Boolean prev_interaction = TRUE; /* safe default: re-enable on restore */
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    OSStatus get_status = SecKeychainGetUserInteractionAllowed(&prev_interaction);
+#pragma clang diagnostic pop
+
+    if (get_status != errSecSuccess) {
+        /* Cannot determine current state; refuse to proceed. */
+        return 1;
+    }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    OSStatus set_status = SecKeychainSetUserInteractionAllowed(TRUE);
+#pragma clang diagnostic pop
+
+    if (set_status != errSecSuccess) {
+        /* Cannot enable interaction; refuse to read. */
+        return 1;
+    }
+
+    /* -----------------------------------------------------------------------
+     * Step 2: Build and execute the Keychain query (interaction now allowed).
+     * ----------------------------------------------------------------------- */
+    int result = 1; /* pessimistic default */
+    CFStringRef service_cf = NULL;
+    CFStringRef account_cf = NULL;
+
+    CFDictionaryRef query = dh_hub_build_query(&service_cf, &account_cf);
+    if (query) {
+        result = dh_hub_execute_query(query, out, capacity, written);
+        CFRelease(query);
+    }
+
+    if (service_cf) { CFRelease(service_cf); }
+    if (account_cf) { CFRelease(account_cf); }
+
+    /* -----------------------------------------------------------------------
+     * Step 3: Restore previous interaction state unconditionally.
+     * ----------------------------------------------------------------------- */
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     (void)SecKeychainSetUserInteractionAllowed(prev_interaction);
