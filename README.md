@@ -6,6 +6,8 @@
 ![Tailscale](https://img.shields.io/badge/Tailscale-242424?logo=tailscale&logoColor=white)
 ![Tests](https://img.shields.io/badge/pytest-400%2B_тестов-0A9EDC?logo=pytest&logoColor=white)
 
+Этот репозиторий содержит сервер DroidHub. Настольный DroidHub Desktop развивается отдельно и подключается к серверу по HTTPS.
+
 Сервер, который превращает обычные Android-телефоны на зарядке дома в удалённо управляемые устройства. Работать с ними можно тремя способами:
 
 - **человек** управляет через веб-панель в браузере: видит экран в реальном времени, тапает, свайпает, вводит текст;
