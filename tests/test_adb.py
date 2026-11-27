@@ -49,6 +49,7 @@ from hub.devices.adb import (
     DeviceOffline,
     adb_shell,
     connect,
+    disconnect,
     run_adb,
 )
 
@@ -223,6 +224,30 @@ async def test_connect_exception(monkeypatch):
 
     monkeypatch.setattr("hub.devices.adb.run_adb", _failing)
     assert await connect("100.64.0.1", 5555) is False
+
+
+async def test_disconnect_success(mock_exec):
+    setter, calls = mock_exec
+    setter(stdout=b"disconnected 100.64.0.1:5555\n", returncode=0)
+    assert await disconnect("100.64.0.1", 5555) is True
+    assert calls[0][0] == ("adb", "disconnect", "100.64.0.1:5555")
+
+
+async def test_disconnect_failure(mock_exec):
+    setter, _ = mock_exec
+    setter(stdout=b"error: no such device '100.64.0.1:5555'\n", returncode=1)
+    assert await disconnect("100.64.0.1", 5555) is False
+
+    setter(stdout=b"disconnected 0 devices\n", returncode=0)
+    assert await disconnect("100.64.0.1", 5555) is False
+
+
+async def test_disconnect_exception(monkeypatch):
+    async def _failing(*args, **kwargs):
+        raise AdbTimeout("Таймаут")
+
+    monkeypatch.setattr("hub.devices.adb.run_adb", _failing)
+    assert await disconnect("100.64.0.1", 5555) is False
 
 
 async def test_run_adb_cancelled(mock_exec):

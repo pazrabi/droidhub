@@ -152,6 +152,26 @@ async def connect(host: str, port: int | str = 5555, timeout: float = 10.0) -> b
         return False
 
 
+async def disconnect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+    """
+    Безопасно отключает устройство по TCP (adb disconnect host:port).
+    Возвращает True при успешном отключении, False при ошибке или отказе.
+    """
+    target = f"{host}:{port}" if ":" not in str(host) else str(host)
+    try:
+        out = await run_adb(["disconnect", target], timeout=timeout)
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
+        out_lower = out.lower()
+        if "disconnected" in out_lower:
+            if "0 devices" in out_lower:
+                return False
+            return not ("failed" in out_lower or "cannot" in out_lower or "unable" in out_lower or "error" in out_lower)
+        return False
+    except (AdbError, AdbTimeout):
+        return False
+
+
 __all__ = [
     "AdbError",
     "DeviceOffline",
@@ -159,4 +179,5 @@ __all__ = [
     "run_adb",
     "adb_shell",
     "connect",
+    "disconnect",
 ]

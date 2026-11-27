@@ -44,10 +44,11 @@ if "hub.config" not in sys.modules:
         setattr(hub, "config", _cfg_mod)
 
 from hub.config import DeviceConfig
-from hub.devices.adb import AdbError, AdbTimeout, DeviceOffline
+from hub.devices.adb import AdbError, AdbTimeout, DeviceOffline, disconnect
 from hub.devices.manager import (
     DeviceManager,
     DeviceStatus,
+    _is_stale_transport_error,
     parse_battery_dumpsys,
     parse_dumpsys_battery,
     parse_dumpsys_screen,
@@ -274,6 +275,7 @@ async def test_manager_auto_reconnect_success(monkeypatch):
 
     call_count = 0
     connect_called = False
+    disconnect_called = False
 
     async def _mock_shell(serial: str | None, cmd: str, timeout: float = 15.0) -> str:
         nonlocal call_count
@@ -286,16 +288,23 @@ async def test_manager_auto_reconnect_success(monkeypatch):
             return DUMPSYS_BATTERY_SAMPLE
         return DUMPSYS_POWER_SAMPLE_ON
 
+    async def _mock_disconnect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        nonlocal disconnect_called
+        disconnect_called = True
+        return True
+
     async def _mock_connect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
         nonlocal connect_called
         connect_called = True
         return True
 
     monkeypatch.setattr("hub.devices.manager.adb_shell", _mock_shell)
+    monkeypatch.setattr("hub.devices.manager.disconnect", _mock_disconnect)
     monkeypatch.setattr("hub.devices.manager.connect", _mock_connect)
 
     status = await mgr.check_device("realme")
 
+    assert disconnect_called is True
     assert connect_called is True
     assert status.online is True
     assert status.battery == 82
@@ -306,16 +315,25 @@ async def test_manager_auto_reconnect_failure(monkeypatch):
     dev = DeviceConfig(id="realme", name="Realme C21Y", host="100.64.0.1", port=5555)
     mgr = DeviceManager([dev])
 
+    disconnect_called = False
+
     async def _mock_shell(serial: str | None, cmd: str, timeout: float = 15.0) -> str:
         raise DeviceOffline("device offline")
+
+    async def _mock_disconnect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        nonlocal disconnect_called
+        disconnect_called = True
+        return False
 
     async def _mock_connect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
         return False
 
     monkeypatch.setattr("hub.devices.manager.adb_shell", _mock_shell)
+    monkeypatch.setattr("hub.devices.manager.disconnect", _mock_disconnect)
     monkeypatch.setattr("hub.devices.manager.connect", _mock_connect)
 
     status = await mgr.check_device("realme")
+    assert disconnect_called is True
     assert status.online is False
     assert "device offline" in str(status.error)
 
@@ -431,3 +449,228 @@ def test_parse_charging_dumpsys():
     assert parse_charging_dumpsys("AC powered: false\n  USB powered: true\n") is True
     assert parse_charging_dumpsys("AC powered: false\n  USB powered: false\n  Wireless powered: false\n") is False
     assert parse_charging_dumpsys("level: 50") is None
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    [
+        (DeviceOffline("device offline"), True),
+        (DeviceOffline("Устройство оффлайн или не найдено"), True),
+        (AdbError("error: device offline"), True),
+        (AdbError("error: device '100.64.0.1:5555' not found"), True),
+        (AdbError("error: device still authorizing"), True),
+        (AdbError("error: no devices/emulators found"), True),
+        (AdbTimeout("Превышено время ожидания команды ADB (15.0 с)"), False),
+        (AdbError("sh: dumpsys: Permission denied"), False),
+        (AdbError("unknown command foo"), False),
+    ],
+)
+def test_is_stale_transport_error(exc, expected):
+    assert _is_stale_transport_error(exc) is expected
+
+
+async def test_manager_reconnect_order(monkeypatch):
+    """Проверяет точный порядок вызовов: disconnect -> connect -> refresh."""
+    dev = DeviceConfig(id="realme", name="Realme C21Y", host="100.64.0.1", port=5555)
+    mgr = DeviceManager([dev])
+
+    call_order: list[str] = []
+
+    async def _mock_shell(serial: str | None, cmd: str, timeout: float = 15.0) -> str:
+        if not call_order:
+            call_order.append("refresh_fail")
+            raise DeviceOffline("device offline")
+        call_order.append(f"refresh_ok_{cmd}")
+        if cmd == "dumpsys battery":
+            return DUMPSYS_BATTERY_SAMPLE
+        return DUMPSYS_POWER_SAMPLE_ON
+
+    async def _mock_disconnect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        call_order.append(f"disconnect_{host}_{port}")
+        return True
+
+    async def _mock_connect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        call_order.append(f"connect_{host}_{port}")
+        return True
+
+    monkeypatch.setattr("hub.devices.manager.adb_shell", _mock_shell)
+    monkeypatch.setattr("hub.devices.manager.disconnect", _mock_disconnect)
+    monkeypatch.setattr("hub.devices.manager.connect", _mock_connect)
+
+    status = await mgr.check_device("realme")
+
+    assert status.online is True
+    assert status.battery == 82
+    assert status.error is None
+    assert call_order == [
+        "refresh_fail",
+        "disconnect_100.64.0.1_5555",
+        "connect_100.64.0.1_5555",
+        "refresh_ok_dumpsys battery",
+        "refresh_ok_dumpsys power",
+    ]
+
+
+async def test_manager_reconnect_still_authorizing(monkeypatch):
+    """Проверяет реакцию на 'device still authorizing': выполняется disconnect, затем connect и refresh."""
+    dev = DeviceConfig(id="realme", name="Realme C21Y", host="100.64.0.1", port=5555)
+    mgr = DeviceManager([dev])
+
+    disconnect_called = False
+    connect_called = False
+    call_count = 0
+
+    async def _mock_shell(serial: str | None, cmd: str, timeout: float = 15.0) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 1:
+            raise AdbError("error: device still authorizing")
+        if cmd == "dumpsys battery":
+            return DUMPSYS_BATTERY_SAMPLE
+        return DUMPSYS_POWER_SAMPLE_ON
+
+    async def _mock_disconnect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        nonlocal disconnect_called
+        disconnect_called = True
+        return True
+
+    async def _mock_connect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        nonlocal connect_called
+        connect_called = True
+        return True
+
+    monkeypatch.setattr("hub.devices.manager.adb_shell", _mock_shell)
+    monkeypatch.setattr("hub.devices.manager.disconnect", _mock_disconnect)
+    monkeypatch.setattr("hub.devices.manager.connect", _mock_connect)
+
+    status = await mgr.check_device("realme")
+
+    assert disconnect_called is True
+    assert connect_called is True
+    assert status.online is True
+    assert status.battery == 82
+    assert status.error is None
+
+
+async def test_manager_reconnect_disconnect_failure(monkeypatch):
+    """Проверяет, что ошибка в disconnect не мешает последующему connect и восстановлению статуса."""
+    dev = DeviceConfig(id="realme", name="Realme C21Y", host="100.64.0.1", port=5555)
+    mgr = DeviceManager([dev])
+
+    disconnect_called = False
+    connect_called = False
+    call_count = 0
+
+    async def _mock_shell(serial: str | None, cmd: str, timeout: float = 15.0) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 1:
+            raise DeviceOffline("device offline")
+        if cmd == "dumpsys battery":
+            return DUMPSYS_BATTERY_SAMPLE
+        return DUMPSYS_POWER_SAMPLE_ON
+
+    async def _mock_disconnect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        nonlocal disconnect_called
+        disconnect_called = True
+        raise AdbError("Сбой при adb disconnect")
+
+    async def _mock_connect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        nonlocal connect_called
+        connect_called = True
+        return True
+
+    monkeypatch.setattr("hub.devices.manager.adb_shell", _mock_shell)
+    monkeypatch.setattr("hub.devices.manager.disconnect", _mock_disconnect)
+    monkeypatch.setattr("hub.devices.manager.connect", _mock_connect)
+
+    status = await mgr.check_device("realme")
+
+    assert disconnect_called is True
+    assert connect_called is True
+    assert status.online is True
+    assert status.battery == 82
+    assert status.error is None
+
+
+async def test_manager_reconnect_no_disconnect_on_timeout(monkeypatch):
+    """Проверяет, что при обычном AdbTimeout disconnect не вызывается, а connect и повтор refresh выполняются."""
+    dev = DeviceConfig(id="realme", name="Realme C21Y", host="100.64.0.1", port=5555)
+    mgr = DeviceManager([dev])
+
+    disconnect_called = False
+    connect_called = False
+    call_count = 0
+
+    async def _mock_shell(serial: str | None, cmd: str, timeout: float = 15.0) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 1:
+            raise AdbTimeout("Превышено время ожидания команды ADB (15.0 с)")
+        if cmd == "dumpsys battery":
+            return DUMPSYS_BATTERY_SAMPLE
+        return DUMPSYS_POWER_SAMPLE_ON
+
+    async def _mock_disconnect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        nonlocal disconnect_called
+        disconnect_called = True
+        return True
+
+    async def _mock_connect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        nonlocal connect_called
+        connect_called = True
+        return True
+
+    monkeypatch.setattr("hub.devices.manager.adb_shell", _mock_shell)
+    monkeypatch.setattr("hub.devices.manager.disconnect", _mock_disconnect)
+    monkeypatch.setattr("hub.devices.manager.connect", _mock_connect)
+
+    status = await mgr.check_device("realme")
+
+    assert disconnect_called is False
+    assert connect_called is True
+    assert status.online is True
+    assert status.battery == 82
+    assert status.error is None
+
+
+async def test_manager_reconnect_no_disconnect_on_generic_adberror(monkeypatch):
+    """Проверяет, что при посторонней ошибке AdbError disconnect не вызывается, а connect и повтор refresh выполняются."""
+    dev = DeviceConfig(id="realme", name="Realme C21Y", host="100.64.0.1", port=5555)
+    mgr = DeviceManager([dev])
+
+    disconnect_called = False
+    connect_called = False
+    call_count = 0
+
+    async def _mock_shell(serial: str | None, cmd: str, timeout: float = 15.0) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 1:
+            raise AdbError("dumpsys: Permission denied")
+        if cmd == "dumpsys battery":
+            return DUMPSYS_BATTERY_SAMPLE
+        return DUMPSYS_POWER_SAMPLE_ON
+
+    async def _mock_disconnect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        nonlocal disconnect_called
+        disconnect_called = True
+        return True
+
+    async def _mock_connect(host: str, port: int | str = 5555, timeout: float = 10.0) -> bool:
+        nonlocal connect_called
+        connect_called = True
+        return True
+
+    monkeypatch.setattr("hub.devices.manager.adb_shell", _mock_shell)
+    monkeypatch.setattr("hub.devices.manager.disconnect", _mock_disconnect)
+    monkeypatch.setattr("hub.devices.manager.connect", _mock_connect)
+
+    status = await mgr.check_device("realme")
+
+    assert disconnect_called is False
+    assert connect_called is True
+    assert status.online is True
+    assert status.battery == 82
+    assert status.error is None
+

@@ -13,7 +13,29 @@ from hub.devices.adb import (
     DeviceOffline,
     adb_shell,
     connect,
+    disconnect,
 )
+
+_STALE_TRANSPORT_KEYWORDS = (
+    "offline",
+    "not found",
+    "still authorizing",
+    "no devices",
+)
+
+
+def _is_stale_transport_error(exc: Exception) -> bool:
+    """
+    Проверяет, является ли ошибка явной ошибкой устаревшего (stale) транспорта:
+    DeviceOffline или текст ошибки содержит offline / not found / still authorizing / no devices.
+    Обычные AdbTimeout и посторонние AdbError возвращают False.
+    """
+    if isinstance(exc, AdbTimeout):
+        return False
+    if isinstance(exc, DeviceOffline):
+        return True
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _STALE_TRANSPORT_KEYWORDS)
 
 
 @dataclass
@@ -168,6 +190,11 @@ class DeviceManager:
             )
         except (DeviceOffline, AdbError, AdbTimeout) as exc:
             if auto_reconnect:
+                if _is_stale_transport_error(exc):
+                    try:
+                        await disconnect(cfg.host, cfg.port)
+                    except Exception:
+                        pass
                 try:
                     if await connect(cfg.host, cfg.port):
                         return await self.refresh(device_id, auto_reconnect=False)
